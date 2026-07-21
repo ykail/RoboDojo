@@ -15,6 +15,7 @@ if [[ $# -lt 5 ]]; then
 fi
 
 root_dir=""
+bench_name=""
 task_name=""
 env_cfg_type=""
 device_id=""
@@ -30,7 +31,7 @@ extra_args=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --root_dir|--task_name|--env_cfg_type|--device_id|--policy_name|--port|--eval_batch|--additional_info|--seed|--host|--protocol|--policy_server_url)
+    --root_dir|--bench_name|--dataset_name|--task_name|--env_cfg_type|--device_id|--policy_name|--port|--eval_batch|--additional_info|--seed|--host|--protocol|--policy_server_url)
       if [[ $# -lt 2 || "$2" == --* ]]; then
         echo "[ERROR] Missing value for argument: $1"
         exit 1
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
 
       case "$1" in
         --root_dir)    root_dir="$2" ;;
+        --bench_name|--dataset_name) bench_name="$2" ;;
         --task_name)   task_name="$2" ;;
         --env_cfg_type)     env_cfg_type="$2" ;;
         --device_id)   device_id="$2" ;;
@@ -109,6 +111,9 @@ fi
 
 if [[ -n "${eval_batch}" ]]; then
   echo "[INFO] eval_batch     = ${eval_batch}"
+fi
+if [[ -n "${bench_name}" ]]; then
+  echo "[INFO] benchmark      = ${bench_name}"
 fi
 
 # Read render_interval / env.num_envs from yaml (fallback if missing)
