@@ -7,13 +7,12 @@ Python installation.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import threading
 import time
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
-
 
 _TRANSLATION_KEYS = {
     "W": np.array([1.0, 0.0, 0.0]),

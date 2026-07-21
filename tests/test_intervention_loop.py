@@ -1,5 +1,5 @@
-import unittest
 from types import SimpleNamespace
+import unittest
 
 import numpy as np
 
