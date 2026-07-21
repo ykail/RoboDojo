@@ -60,6 +60,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.policy_name = self.eval_cfg.get("policy_name", None)
             self.additional_info = self.eval_cfg.get("additional_info", "")
             self.eval_seed = self.eval_cfg.get("seed", 0)
+            self.control_mode = self.eval_cfg.get("control_mode", "policy")
             self.physx_monitor_enabled = bool(self.eval_cfg.get("physx_monitor_enabled", False))
             if self.physx_monitor_enabled:
                 from src.eval_client.physx_warning_monitor import (
@@ -283,6 +284,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             return data_list
 
         def eval_one_episode(self):
+            if self.control_mode == "keyboard_intervention":
+                from src.eval_client.intervention_loop import run_keyboard_intervention_episode
+
+                run_keyboard_intervention_episode(self, self.model_client)
+                return
             policy_name = self.deploy_cfg["policy_name"]
             try:
                 eval_module = __import__(
@@ -308,6 +314,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             eval_module.eval_one_episode(TASK_ENV=self, model_client=self.model_client)
 
         def eval_one_episode_batch(self):
+            if self.control_mode == "keyboard_intervention":
+                from src.eval_client.intervention_loop import run_keyboard_intervention_episode
+
+                run_keyboard_intervention_episode(self, self.model_client)
+                return
             policy_name = self.deploy_cfg["policy_name"]
             try:
                 eval_module = __import__(

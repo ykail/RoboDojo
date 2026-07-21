@@ -128,6 +128,7 @@ from omegaconf import OmegaConf
 
 from env.global_configs import *
 from src.eval_client.eval_env import create_eval_env
+from src.eval_client.intervention_loop import InterventionRejected
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
@@ -252,6 +253,23 @@ def main():
     """
     task_name = args_cli.task_name
     num_envs = args_cli.num_envs
+    control_mode = os.environ.get("ROBODOJO_CONTROL_MODE", "policy").strip().lower()
+    if control_mode not in {"policy", "keyboard_intervention"}:
+        raise ValueError(
+            "ROBODOJO_CONTROL_MODE must be 'policy' or 'keyboard_intervention', "
+            f"got {control_mode!r}."
+        )
+    if control_mode == "keyboard_intervention":
+        if args_cli.policy_name != "Pi_05":
+            raise ValueError("Keyboard intervention is currently validated only for policy_name=Pi_05.")
+        if getattr(args_cli, "headless", False):
+            raise ValueError(
+                "Keyboard intervention needs the Isaac Sim window. Set ROBODOJO_HEADLESS=0 "
+                "and keep that window focused while operating."
+            )
+        if num_envs != 1:
+            print(f"[main] keyboard intervention forces num_envs {num_envs} -> 1")
+            num_envs = 1
     eval_cfg_name = args_cli.env_cfg_type
     eval_cfg = load_yaml(os.path.join(ENV_CONFIG_PATH, eval_cfg_name + ".yml"))
     eval_cfg["task_name"] = task_name
@@ -263,6 +281,8 @@ def main():
     eval_cfg["additional_info"] = args_cli.additional_info
     eval_cfg["seed"] = args_cli.seed
     eval_cfg["physx_monitor_enabled"] = enable_monitor
+    eval_cfg["control_mode"] = control_mode
+    eval_cfg["record_dir"] = os.environ.get("ROBODOJO_RECORD_DIR", "")
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
@@ -370,6 +390,10 @@ def main():
 
         except UnStableError:
             env.seed_manager.eval_step()
+        except InterventionRejected:
+            print("[Intervention] rejected attempt does not count; retrying the same layout.")
+            env.close()
+            retry_round = True
         except Exception as e:
             import traceback
 

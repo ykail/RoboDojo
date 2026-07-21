@@ -22,6 +22,7 @@ MODELSCOPE_DATA_ROOT="${MODELSCOPE_DATA_ROOT:-data}"
 SOURCE="${1:-}"
 DATA_TYPE="${2:-}"
 DATA_ROOT="${ROBO_DOJO_DATA_ROOT:-${CURRENT_DIR}/data}"
+DATA_CACHE_OVERRIDE="${ROBO_DOJO_DATA_CACHE:-}"
 
 usage() {
   cat <<EOF
@@ -54,6 +55,7 @@ Environment overrides:
   MODELSCOPE_REPO_ID, MODELSCOPE_REPO_URL, MODELSCOPE_REVISION
   MODELSCOPE_DATA_ROOT (default: data)
   ROBO_DOJO_DATA_ROOT
+  ROBO_DOJO_DATA_CACHE (physical sparse-repository/cache directory)
 EOF
 }
 
@@ -136,7 +138,15 @@ resolve_data_type() {
     REMOTE_DIR="${DATA_DIR_NAME}"
   fi
   TARGET_DIR="${DATA_ROOT}/${DATA_DIR_NAME}"
-  DATA_CACHE_DIR="${CURRENT_DIR}/.cache/robodojo_data_${SOURCE}_${DATA_TYPE}_repo"
+  if [[ -n "${DATA_CACHE_OVERRIDE}" ]]; then
+    if [[ "${DATA_CACHE_OVERRIDE}" = /* ]]; then
+      DATA_CACHE_DIR="${DATA_CACHE_OVERRIDE}"
+    else
+      DATA_CACHE_DIR="${PWD}/${DATA_CACHE_OVERRIDE}"
+    fi
+  else
+    DATA_CACHE_DIR="${CURRENT_DIR}/.cache/robodojo_data_${SOURCE}_${DATA_TYPE}_repo"
+  fi
 }
 
 data_ready() {

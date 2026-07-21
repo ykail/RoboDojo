@@ -118,8 +118,6 @@ num_envs="$(python3 -c "import sys,yaml;print(yaml.safe_load(open(sys.argv[1])).
 echo "[INFO] render_interval = ${render_interval}"
 echo "[INFO] num_envs        = ${num_envs}"
 
-extra_args=()
-
 KIT_ENABLE_EXTS=(
   "isaacsim.replicator.behavior"
   "isaacsim.sensors.camera"
@@ -129,6 +127,13 @@ KIT_ARGS=""
 for ext in "${KIT_ENABLE_EXTS[@]}"; do
   KIT_ARGS+=" --enable ${ext}"
 done
+
+APP_MODE_ARGS=()
+if [[ "${ROBODOJO_HEADLESS:-1}" == "0" ]]; then
+  echo "[INFO] Isaac Sim window enabled for interactive control"
+else
+  APP_MODE_ARGS+=(--headless)
+fi
 
 # Generated once per eval invocation. Carries the same identity through
 # os.execv inside main.py and bash-level retries below. Append $$ to
@@ -157,7 +162,7 @@ while : ; do
     --additional_info "$additional_info" \
     --seed "$seed" \
     --host "$host" \
-    --headless \
+    "${APP_MODE_ARGS[@]}" \
     "${extra_args[@]}" \
     "$@"
   rc=$?
