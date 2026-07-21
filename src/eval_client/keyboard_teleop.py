@@ -238,9 +238,7 @@ class CartesianTeleopController:
         self.task_env = task_env
         self.max_joint_delta = float(max_joint_delta)
         self._robots = {
-            robot.arm_name.split("_")[0]: robot
-            for robot in task_env.robot_manager.robot_list
-            if robot.type == "target"
+            robot.arm_name.split("_")[0]: robot for robot in task_env.robot_manager.robot_list if robot.type == "target"
         }
         if set(self._robots) != {"left", "right"}:
             raise ValueError(
@@ -262,9 +260,7 @@ class CartesianTeleopController:
         self._was_deadman = False
 
     def _read_pose(self, arm: str) -> np.ndarray:
-        pose = self.task_env.robot_manager.get_real_endpose(
-            self._robots[arm], env_idx_list=[0], is_relative=True
-        )[0]
+        pose = self.task_env.robot_manager.get_real_endpose(self._robots[arm], env_idx_list=[0], is_relative=True)[0]
         pose = np.asarray(pose, dtype=np.float64).reshape(7)
         if not np.isfinite(pose).all():
             raise ValueError(f"Non-finite {arm} end-effector pose: {pose}")

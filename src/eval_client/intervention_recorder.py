@@ -84,9 +84,7 @@ class EpisodeRecorder:
             if image.ndim != 3 or image.shape[-1] != 3:
                 raise ValueError(f"Expected RGB HxWx3 for {camera_name}, got {image.shape}")
             image = np.ascontiguousarray(image.astype(np.uint8, copy=False))
-            ok, encoded = cv2.imencode(
-                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
-            )
+            ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
             if not ok:
                 raise ValueError(f"JPEG encoding failed for camera {camera_name}")
             encoded_vision[camera_name] = encoded.tobytes()

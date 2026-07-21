@@ -47,10 +47,7 @@ class InterventionRecorderTest(unittest.TestCase):
                     obs={
                         "instruction": "stack the bowls",
                         "state": action,
-                        "vision": {
-                            name: {"color": image}
-                            for name in ("cam_head", "cam_left_wrist", "cam_right_wrist")
-                        },
+                        "vision": {name: {"color": image} for name in ("cam_head", "cam_left_wrist", "cam_right_wrist")},
                     },
                     policy_action=action,
                     human_action=action if index else None,
