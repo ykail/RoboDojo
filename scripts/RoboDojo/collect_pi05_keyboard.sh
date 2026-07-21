@@ -15,7 +15,7 @@ Required:
 
 Options:
   --record-dir PATH       HDF5 root (default: /home/piper/data/RoboDojo_interventions)
-  --episodes NUM          Number of layouts/episodes (default: 1)
+  --episodes NUM          Requested layouts/episodes, capped by task config (default: 1)
   --seed NUM              Layout seed (default: 0)
   --env-cfg NAME          Robot config (default: arx_x5)
   --policy-gpu ID         Pi0.5 server GPU (default: 0)
@@ -91,6 +91,8 @@ fi
 
 export ROBODOJO_CONTROL_MODE="keyboard_intervention"
 export ROBODOJO_HEADLESS="0"
+export HEADLESS="0"
+export LIVESTREAM="0"
 export ROBODOJO_RECORD_DIR="${record_dir}"
 export ROBODOJO_REALTIME="1"
 export ROBODOJO_TELEOP_POS_STEP="${pos_step}"

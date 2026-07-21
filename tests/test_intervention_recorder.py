@@ -1,4 +1,6 @@
+from datetime import datetime
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -81,6 +83,35 @@ class InterventionRecorderTest(unittest.TestCase):
                 decoded = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
                 self.assertEqual(decoded.shape, image.shape)
                 self.assertTrue(episode.attrs["complete"])
+
+    @unittest.skipUnless(HAS_HDF5_STACK, "cv2/h5py are available in the RoboDojo runtime")
+    def test_finalize_never_overwrites_an_existing_episode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = EpisodeRecorder(
+                tmp,
+                {"task_name": "stack_bowls", "env_config": "arx_x5", "layout_id": 3},
+                frequency=25,
+            )
+            recorder._started_at = datetime(2025, 1, 2, 3, 4, 5, 6)
+            action = _action(0)
+            recorder.append(
+                obs={"instruction": "stack", "state": action, "vision": {}},
+                policy_action=action,
+                human_action=None,
+                executed_action=action,
+                control={},
+            )
+
+            output_dir = Path(tmp) / "stack_bowls" / "arx_x5" / "data"
+            output_dir.mkdir(parents=True)
+            collision = output_dir / f"episode_20250102_030405_000006_layout_3_pid_{os.getpid()}.hdf5"
+            collision.write_bytes(b"existing trajectory")
+
+            saved = Path(recorder.finalize(accepted=True, success=False, reason="test"))
+            self.assertNotEqual(saved, collision)
+            self.assertEqual(collision.read_bytes(), b"existing trajectory")
+            self.assertTrue(saved.is_file())
+            self.assertFalse(any(Path(tmp).rglob("*.partial")))
 
 
 if __name__ == "__main__":

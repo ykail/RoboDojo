@@ -18,6 +18,10 @@ bash scripts/RoboDojo/collect_pi05_keyboard.sh \
 
 The wrapper always uses `action_type=joint`, a visible Isaac Sim window and a
 single environment.  Keep the Isaac Sim window focused while operating.
+It explicitly sets `ROBODOJO_HEADLESS=0`, `HEADLESS=0`, and `LIVESTREAM=0`;
+launch it from a graphical Piper session with a valid display. `--episodes`
+is a requested count and remains capped by the task's configured number of
+evaluation layouts.
 
 ## Controls
 

@@ -143,11 +143,30 @@ class EpisodeRecorder:
         timestamp = self._started_at.strftime("%Y%m%d_%H%M%S_%f")
         output_dir = self.record_dir / task_name / env_config / "data"
         output_dir.mkdir(parents=True, exist_ok=True)
-        final_path = output_dir / f"episode_{timestamp}_layout_{layout_id}.hdf5"
+        base_name = f"episode_{timestamp}_layout_{layout_id}_pid_{os.getpid()}"
+        collision_index = 0
+
+        def candidate_path(index: int) -> Path:
+            suffix = "" if index == 0 else f"_{index}"
+            return output_dir / f"{base_name}{suffix}.hdf5"
+
+        final_path = candidate_path(collision_index)
         partial_path = Path(str(final_path) + ".partial")
 
+        # Exclusive creation prevents a stale/concurrent partial trajectory
+        # from being truncated. The PID plus collision suffix also makes
+        # simultaneous collectors safe even if their clocks coincide.
+        while True:
+            try:
+                root = h5py.File(partial_path, "x")
+                break
+            except FileExistsError:
+                collision_index += 1
+                final_path = candidate_path(collision_index)
+                partial_path = Path(str(final_path) + ".partial")
+
         try:
-            with h5py.File(partial_path, "w") as root:
+            with root:
                 root.create_dataset("data_format_version", data=np.bytes_("v1.0"))
                 root.create_dataset("instructions", data=np.bytes_(json.dumps([self._instruction or ""])))
                 additional_info = root.create_group("additional_info")
@@ -195,7 +214,16 @@ class EpisodeRecorder:
                         root.attrs[key] = json.dumps(value, default=str)
                 root.flush()
 
-            os.replace(partial_path, final_path)
+            # Publishing via a hard link is atomic and, unlike os.replace,
+            # cannot overwrite an existing accepted trajectory.
+            while True:
+                try:
+                    os.link(partial_path, final_path)
+                    break
+                except FileExistsError:
+                    collision_index += 1
+                    final_path = candidate_path(collision_index)
+            partial_path.unlink()
         except Exception:
             partial_path.unlink(missing_ok=True)
             raise

@@ -106,7 +106,7 @@ def _physx_monitor_needed(task_name) -> bool:
 # main.py directly we generate one here and propagate it via the
 # environment so subsequent execv calls see the same value.
 if not os.environ.get("ROBODOJO_RUN_ID"):
-    os.environ["ROBODOJO_RUN_ID"] = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    os.environ["ROBODOJO_RUN_ID"] = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{os.getpid()}"
 
 enable_monitor = _physx_monitor_needed(args_cli.task_name)
 print(f"[main] PhysX monitor enabled={enable_monitor} (task={args_cli.task_name})")
@@ -262,10 +262,11 @@ def main():
     if control_mode == "keyboard_intervention":
         if args_cli.policy_name != "Pi_05":
             raise ValueError("Keyboard intervention is currently validated only for policy_name=Pi_05.")
-        if getattr(args_cli, "headless", False):
+        launcher_headless = bool(getattr(app_launcher, "_headless", getattr(args_cli, "headless", False)))
+        if launcher_headless:
             raise ValueError(
-                "Keyboard intervention needs the Isaac Sim window. Set ROBODOJO_HEADLESS=0 "
-                "and keep that window focused while operating."
+                "Keyboard intervention needs the Isaac Sim window. Set ROBODOJO_HEADLESS=0, "
+                "HEADLESS=0, and LIVESTREAM=0, then keep that window focused while operating."
             )
         if num_envs != 1:
             print(f"[main] keyboard intervention forces num_envs {num_envs} -> 1")
