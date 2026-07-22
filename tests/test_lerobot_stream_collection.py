@@ -139,6 +139,25 @@ class _MutatingFailDataset(_FakeDataset):
         super().finalize()
 
 
+class _MutatingSuccessDataset(_MutatingFailDataset):
+    def save_episode(self, episode_data=None, parallel_encoding=True):
+        del episode_data, parallel_encoding
+        self.events.append("save")
+        (self.root / "meta" / "info.json").write_bytes(b"mutated-info")
+        (self.root / "meta" / "stats.json").write_bytes(b"mutated-stats")
+        (self.root / "meta" / "tasks.parquet").write_bytes(b"mutated-tasks")
+        for relative, payload in (
+            ("data/chunk-000/file-001.parquet", b"candidate-data"),
+            ("videos/cam_high/chunk-000/file-001.mp4", b"candidate-video"),
+            ("meta/episodes/chunk-000/file-001.parquet", b"candidate-episode"),
+        ):
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        self.meta.total_episodes += 1
+        self.frames.clear()
+
+
 def _packet_stream(messages):
     stream = io.BytesIO()
     for message in messages:
@@ -294,6 +313,7 @@ class LeRobotStreamWriterTest(unittest.TestCase):
                 [packet["status"] for packet in _all_packets(output)],
                 ["ready", "begun", "frame", "error"],
             )
+            self.assertTrue(_all_packets(output)[-1]["fatal"])
             for relative, payload in originals.items():
                 self.assertEqual((dataset_root / relative).read_bytes(), payload)
             self.assertFalse((dataset_root / "candidate-link").exists())
@@ -341,6 +361,103 @@ class LeRobotStreamWriterTest(unittest.TestCase):
 
             self.assertEqual(status, 1)
             self.assertFalse(dataset_root.exists())
+
+    def test_sidecar_failure_after_finalize_rolls_back_and_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dataset_root = base / "test"
+            originals = {
+                "meta/info.json": b'{"total_episodes":1,"total_frames":7}',
+                "meta/stats.json": b"original-stats",
+                "meta/tasks.parquet": b"original-tasks",
+                "data/chunk-000/file-000.parquet": b"accepted-data",
+                "videos/cam_high/chunk-000/file-000.mp4": b"accepted-video",
+                "meta/episodes/chunk-000/file-000.parquet": b"accepted-episode",
+            }
+            for relative, payload in originals.items():
+                path = dataset_root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+
+            events = []
+            dataset = _MutatingSuccessDataset(dataset_root, total_episodes=1, events=events)
+            config = writer.WriterConfig(
+                repo_id="test", root=base, fps=25, resume=True,
+                vcodec="h264", encoder_threads=1,
+            )
+            original_rollback = writer._CommitSnapshot.rollback
+
+            def tracked_rollback(snapshot):
+                events.append("rollback")
+                return original_rollback(snapshot)
+
+            output = io.BytesIO()
+            with (
+                mock.patch.object(writer._CommitSnapshot, "rollback", tracked_rollback),
+                mock.patch.object(
+                    writer,
+                    "_write_robodojo_episode_metadata",
+                    side_effect=OSError("injected sidecar failure"),
+                ),
+            ):
+                status = writer.serve(
+                    config,
+                    _packet_stream(
+                        [
+                            {"command": "begin", "metadata": {"task_name": "make_toast"}},
+                            _frame_message(),
+                            {"command": "finish", "accepted": True},
+                        ]
+                    ),
+                    output,
+                    dataset_opener=lambda _config: (dataset, False),
+                )
+
+            self.assertEqual(status, 1)
+            self.assertEqual(events, ["save", "finalize", "rollback"])
+            error = _all_packets(output)[-1]
+            self.assertTrue(error["fatal"])
+            self.assertIn("injected sidecar failure", error["error"])
+            for relative, payload in originals.items():
+                self.assertEqual((dataset_root / relative).read_bytes(), payload)
+            self.assertEqual(
+                writer._scan_tree(dataset_root),
+                {Path(relative): "file" for relative in originals}
+                | {
+                    Path("meta"): "directory",
+                    Path("data"): "directory",
+                    Path("data/chunk-000"): "directory",
+                    Path("videos"): "directory",
+                    Path("videos/cam_high"): "directory",
+                    Path("videos/cam_high/chunk-000"): "directory",
+                    Path("meta/episodes"): "directory",
+                    Path("meta/episodes/chunk-000"): "directory",
+                },
+            )
+
+    def test_robodojo_metadata_resume_index_and_stale_file_are_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "dataset"
+            (root / "meta").mkdir(parents=True)
+            first = writer._write_robodojo_episode_metadata(root, 0, {"value": "first"})
+            second = writer._write_robodojo_episode_metadata(root, 1, {"value": "second"})
+            self.assertEqual(json.loads(first.read_text(encoding="utf-8"))["episode_index"], 0)
+            self.assertEqual(json.loads(second.read_text(encoding="utf-8"))["episode_index"], 1)
+            with self.assertRaisesRegex(writer.EpisodeCommitError, "already exists"):
+                writer._write_robodojo_episode_metadata(root, 1, {"value": "stale"})
+            self.assertEqual(json.loads(second.read_text(encoding="utf-8"))["value"], "second")
+
+    def test_robodojo_metadata_refuses_symlink_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "dataset"
+            outside = base / "outside"
+            (root / "meta").mkdir(parents=True)
+            outside.mkdir()
+            (root / "meta" / "robodojo").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(writer.EpisodeCommitError, "real directory"):
+                writer._write_robodojo_episode_metadata(root, 0, {"value": "unsafe"})
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_incomplete_rollback_is_reported_as_fatal(self):
         with tempfile.TemporaryDirectory() as tmp:

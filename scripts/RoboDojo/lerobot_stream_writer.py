@@ -59,7 +59,11 @@ _ROLLBACK_FILE_PATHS = (
 )
 
 
-class CommitRollbackError(RuntimeError):
+class EpisodeCommitError(RuntimeError):
+    """An episode could not be committed and retrying the layout cannot fix it."""
+
+
+class CommitRollbackError(EpisodeCommitError):
     """An accepted commit failed and its on-disk rollback was incomplete."""
 
 
@@ -682,11 +686,29 @@ def _write_robodojo_episode_metadata(
     """
 
     root = Path(dataset_root).expanduser().resolve(strict=True)
-    metadata_dir = root / _ROBODOJO_EPISODE_METADATA_DIR
-    metadata_dir.mkdir(parents=True, exist_ok=True)
+    metadata_dir = root
+    for component in _ROBODOJO_EPISODE_METADATA_DIR.parts:
+        metadata_dir = metadata_dir / component
+        try:
+            path_stat = metadata_dir.lstat()
+        except FileNotFoundError:
+            try:
+                metadata_dir.mkdir(mode=0o755)
+            except FileExistsError:
+                # Another filesystem actor may have created the path between
+                # lstat and mkdir.  Validate exactly what appeared below.
+                pass
+            path_stat = metadata_dir.lstat()
+        if not stat.S_ISDIR(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode):
+            raise EpisodeCommitError(
+                f"RoboDojo metadata path must be a real directory, not a symlink or file: {metadata_dir}"
+            )
+    if metadata_dir.resolve(strict=True) != metadata_dir:
+        raise EpisodeCommitError(f"RoboDojo metadata path escapes the dataset: {metadata_dir}")
+
     target = metadata_dir / f"episode_{int(episode_index):07d}.json"
     if os.path.lexists(target):
-        raise FileExistsError(f"RoboDojo episode metadata already exists: {target}")
+        raise EpisodeCommitError(f"RoboDojo episode metadata already exists: {target}")
 
     payload = {
         "format_version": 1,
@@ -704,7 +726,16 @@ def _write_robodojo_episode_metadata(
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, target)
+        # A hard-link publish is atomic and, unlike os.replace, can never
+        # overwrite a stale episode file that appeared after the check above.
+        os.link(temporary, target, follow_symlinks=False)
+        temporary.unlink()
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(metadata_dir, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
     return target
@@ -814,6 +845,7 @@ def serve(
                     config.dataset_root,
                     transient_roots=_encoder_transient_roots(dataset, config.dataset_root),
                 )
+                dataset_finalized = False
                 try:
                     # Pi_05 pins LeRobot 0.4.4, whose public save_episode API
                     # does not accept ``extra_episode_metadata``.  Training
@@ -821,6 +853,8 @@ def serve(
                     # remaining RoboDojo provenance in a version-independent
                     # sidecar immediately after the LeRobot commit.
                     dataset.save_episode()
+                    _finalize_dataset(dataset)
+                    dataset_finalized = True
                     robodojo_metadata_path = _write_robodojo_episode_metadata(
                         config.dataset_root,
                         episode_index,
@@ -832,14 +866,13 @@ def serve(
                             frame_count=frame_count,
                         ),
                     )
-                    _finalize_dataset(dataset)
                     marker = config.dataset_root / _STAGING_MARKER
                     marker.unlink(missing_ok=True)
                 except BaseException as commit_exc:
                     # Writers must be closed before any Parquet, video, or
                     # metadata path is removed/restored.
                     active = False
-                    cleanup_errors = _quiesce_failed_commit(dataset)
+                    cleanup_errors = [] if dataset_finalized else _quiesce_failed_commit(dataset)
                     try:
                         commit_snapshot.rollback()
                     except Exception as rollback_exc:
@@ -860,7 +893,12 @@ def serve(
                             + "; ".join(cleanup_errors)
                             + ". Refusing to resume this dataset automatically."
                         ) from commit_exc
-                    raise
+                    if isinstance(commit_exc, EpisodeCommitError):
+                        raise commit_exc
+                    raise EpisodeCommitError(
+                        f"{type(commit_exc).__name__}: {commit_exc}; "
+                        "the candidate was rolled back. Refusing to retry the same layout automatically."
+                    ) from commit_exc
                 active = False
                 send_message(
                     output_stream,
@@ -905,7 +943,7 @@ def serve(
                 {
                     "status": "error",
                     "error": f"{type(exc).__name__}: {exc}",
-                    "fatal": isinstance(exc, CommitRollbackError),
+                    "fatal": isinstance(exc, EpisodeCommitError),
                 },
             )
         except Exception:
