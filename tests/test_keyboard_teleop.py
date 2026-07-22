@@ -133,6 +133,28 @@ class KeyboardStateTest(unittest.TestCase):
         self.assertFalse(snapshot.deadman)
         self.assertTrue(snapshot.takeover_released)
 
+    def test_l_blocks_rearming_until_emergency_key_is_released(self):
+        state = KeyboardState()
+        state.handle_key("I", True)
+        state.handle_key("L", True)
+
+        # A duplicate I press while the original press is still physically
+        # held must not undo the emergency exit.
+        state.handle_key("I", True)
+        snapshot = state.snapshot()
+        self.assertFalse(snapshot.deadman)
+        self.assertTrue(snapshot.takeover_released)
+
+        # Even after I is released, L remains an interlock until its release.
+        state.handle_key("I", False)
+        state.handle_key("I", True)
+        self.assertFalse(state.snapshot().deadman)
+        state.handle_key("I", False)
+
+        state.handle_key("L", False)
+        state.handle_key("I", True)
+        self.assertTrue(state.snapshot().deadman)
+
     @unittest.skipUnless(HAS_TRANSFORMS3D, "transforms3d is available in the RoboDojo runtime")
     def test_pose_delta_is_world_frame_and_quaternion_is_normalized(self):
         pose = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])

@@ -102,6 +102,10 @@ class KeyboardState:
             if pressed:
                 if key in self._held:
                     return
+                # L is an emergency-off interlock. Do not permit a fresh I
+                # edge until L has physically been released.
+                if key == "I" and "L" in self._held:
+                    return
                 self._held.add(key)
                 if key == "I":
                     # Requiring a release before another press makes the
@@ -127,8 +131,9 @@ class KeyboardState:
                 elif key == "L":
                     was_active = self._takeover_active
                     self._takeover_active = False
-                    self._held.clear()
-                    self._held.add("L")
+                    # Clear motion/command keys, but preserve a physically
+                    # held I so a duplicate KEY_PRESS cannot re-arm takeover.
+                    self._held.intersection_update({"I", "L"})
                     self._takeover_pressed = False
                     self._takeover_released = self._takeover_released or was_active
             else:
