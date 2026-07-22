@@ -4,6 +4,9 @@ This mode runs one visible RoboDojo simulation, lets Pi0.5 act normally, and
 allows an operator to preempt it at any 25 Hz action tick.  It is designed for
 collecting corrective HDF5 trajectories, not benchmark scoring.
 
+For installation, checkpoint and asset migration, and machine-specific
+preflight checks, see [the deployment guide](KEYBOARD_INTERVENTION_DEPLOYMENT.md).
+
 ## Start
 
 The Pi0.5 server and checkpoint must already be installed.  From the RoboDojo
