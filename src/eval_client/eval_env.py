@@ -61,6 +61,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.additional_info = self.eval_cfg.get("additional_info", "")
             self.eval_seed = self.eval_cfg.get("seed", 0)
             self.control_mode = self.eval_cfg.get("control_mode", "policy")
+            self.operator_driven = bool(
+                self.eval_cfg.get(
+                    "operator_driven",
+                    self.control_mode == "keyboard_intervention",
+                )
+            )
+            self.layout_cycle = 0
             self.physx_monitor_enabled = bool(self.eval_cfg.get("physx_monitor_enabled", False))
             if self.physx_monitor_enabled:
                 from src.eval_client.physx_warning_monitor import (
@@ -170,6 +177,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     f"completed={len(completed_layout_ids)} "
                     f"abandoned={len(abandoned_layout_ids)}"
                 )
+            # An operator session is not a finite benchmark.  Its accepted
+            # episodes are already durable in LeRobot, so a process restart
+            # must not permanently remove previously visited layouts from the
+            # cycle based on benchmark resume bookkeeping.
+            if self.operator_driven:
+                completed_layout_ids = []
+                abandoned_layout_ids = []
             self.seed_manager.init_eval(
                 completed_layout_ids=completed_layout_ids,
                 abandoned_layout_ids=abandoned_layout_ids,
@@ -221,6 +235,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             safe_seed = seed[real_indices[0]] if real_indices else 0
             # Fill None positions with safe_seed so scene_manager can still load
             self.env_seeds = [s if s is not None else safe_seed for s in seed]
+            self.layout_cycle = int(getattr(self.seed_manager, "cycle_index", 0))
 
             self.success = [True] * self.num_envs
             self.end_flag = [False] * self.num_envs
@@ -284,7 +299,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
             data_list = []
             for env_idx in env_idx_list:
-                if not self.end_flag[env_idx] or last_frame:
+                if not self.operator_driven and (not self.end_flag[env_idx] or last_frame):
                     self._stream_vision(env_idx, data[env_idx])
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
@@ -382,12 +397,15 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 action = actions_list[idx]
                 self.validate_action_dict(action)
                 action_type = self.get_action_type(action)
-                if self.take_action_cnt[env_idx] == self.step_lim or self.end_flag[env_idx]:
+                if self.end_flag[env_idx] or (
+                    not self.operator_driven and self.take_action_cnt[env_idx] >= self.step_lim
+                ):
                     continue
 
                 self.take_action_cnt[env_idx] += 1
+                step_limit_display = "unlimited" if self.operator_driven else str(self.step_lim)
                 print(
-                    f"env{env_idx} step: \033[92m{self.take_action_cnt[env_idx]} / {self.step_lim}\033[0m",
+                    f"env{env_idx} step: \033[92m{self.take_action_cnt[env_idx]} / {step_limit_display}\033[0m",
                     end="\r",
                 )
                 control_info = dict()
@@ -798,6 +816,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 self.eval_one_episode_batch()
             else:
                 self.eval_one_episode()
+            if self.operator_driven:
+                # The LeRobot recorder has already durably committed RIGHT at
+                # this point.  Benchmark scoring/video/result bookkeeping is
+                # both unnecessary for collection and, if it failed, could
+                # make main retry an episode that was already saved.
+                return
             success = 0
             process_scores = self.reward_manager.get_score() if hasattr(self, "get_score") else None
             # Envs flagged unstable during the episode (e.g. make_kong's
@@ -829,11 +853,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 # env_seeds[env_idx] directly.
                 self.eval_result["details"][index] = {
                     "layout_id": int(self.env_seeds[env_idx]),
+                    "layout_cycle": int(self.layout_cycle),
                     "success": bool(self.success[env_idx]),
                     "score": episode_score,
                 }
-                video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
-                self.save_video(env_idx, video_path, tag)
+                if not self.operator_driven:
+                    video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
+                    self.save_video(env_idx, video_path, tag)
 
             # Drop streams for envs not saved this batch (e.g. unstable ones).
             self._abort_video_writers()
@@ -856,6 +882,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 print(f"[EvalEnv] persist_resume_manifest after run_eval failed: {e}")
 
         def is_episode_end(self):
+            if self.operator_driven:
+                # RIGHT/LEFT/ESCAPE/BACKSPACE are the only episode boundaries
+                # in collection mode.  Do not run the normal reward-success or
+                # task-step-limit termination checks here.
+                return all(self.end_flag)
             pre_end_flag = deepcopy(self.end_flag)
             final_check = False
             for env_idx in range(self.num_envs):

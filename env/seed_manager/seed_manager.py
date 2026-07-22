@@ -23,6 +23,11 @@ class SeedManager:
         self.type: str
 
         self._current_batch_seeds: List[int] | None = None
+        # Operator-driven collection is intentionally unbounded.  Once every
+        # saved layout has been visited, it rewinds the finite evaluation list
+        # and increments this value so recorders can distinguish repeated
+        # passes over the same layout id.
+        self.cycle_index: int = 0
 
     def init_eval(
         self,
@@ -57,6 +62,7 @@ class SeedManager:
 
         self.type = "eval"
         self.idx = 0
+        self.cycle_index = 0
         self._current_batch_seeds = None
 
     def get_seeds(self, max_count: int | None = None) -> List[int] | None:
@@ -95,6 +101,23 @@ class SeedManager:
             raise ValueError(f"Scene layout file not found for seed {seed} at expected path {file_path}.")
         data = load_json(file_path)
         return data
+
+    def get_cyclic_seeds(self, max_count: int | None = None) -> List[int] | None:
+        """Return the next batch, rewinding after the last saved layout.
+
+        This is only for operator-driven data collection.  Benchmark
+        evaluation must continue to use :meth:`get_seeds`, whose ``None``
+        result is the normal finite-evaluation termination signal.
+        """
+
+        seeds = self.get_seeds(max_count=max_count)
+        if seeds is not None:
+            return seeds
+        if self.ed_idx <= 0:
+            return None
+        self.idx = 0
+        self.cycle_index += 1
+        return self.get_seeds(max_count=max_count)
 
     def eval_step(self):
         self._current_batch_seeds = None

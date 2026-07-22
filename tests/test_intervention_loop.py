@@ -4,6 +4,8 @@ import unittest
 import numpy as np
 
 from src.eval_client.intervention_loop import (
+    InterventionAcceptedAndExit,
+    InterventionDiscardedAndExit,
     InterventionRejected,
     InterventionSavedForRetry,
     run_keyboard_intervention_episode,
@@ -11,13 +13,27 @@ from src.eval_client.intervention_loop import (
 from src.eval_client.keyboard_teleop import KeyboardSnapshot
 
 
-def _snapshot(*, deadman=False, pressed=False, released=False, save_retry=False):
+def _snapshot(
+    *,
+    deadman=False,
+    pressed=False,
+    released=False,
+    accept_next=False,
+    discard_retry=False,
+    accept_exit=False,
+    discard_exit=False,
+    save_retry=False,
+):
     return KeyboardSnapshot(
         deadman=deadman,
         active_arm="left",
         delta_pose=np.zeros(6),
         takeover_pressed=pressed,
         takeover_released=released,
+        accept_next_requested=accept_next,
+        discard_retry_requested=discard_retry,
+        accept_exit_requested=accept_exit,
+        discard_exit_requested=discard_exit,
         save_retry_requested=save_retry,
     )
 
@@ -59,6 +75,10 @@ class FakeRecorder:
 
     def append(self, **kwargs):
         self.rows.append(kwargs)
+
+    @property
+    def frame_count(self):
+        return len(self.rows)
 
     def finalize(self, **kwargs):
         self.finalized = kwargs
@@ -102,6 +122,25 @@ class FakeEnv:
 
 
 class InterventionLoopTest(unittest.TestCase):
+    def test_setup_failure_discards_started_recorder(self):
+        class BrokenInitialObservationEnv(FakeEnv):
+            def get_obs(self):
+                raise RuntimeError("camera failed")
+
+        recorder = FakeRecorder()
+        with self.assertRaisesRegex(RuntimeError, "camera failed"):
+            run_keyboard_intervention_episode(
+                BrokenInitialObservationEnv(),
+                FakeModel(),
+                keyboard=FakeKeyboard([]),
+                controller=FakeController(),
+                recorder=recorder,
+                pace_realtime=False,
+            )
+
+        self.assertFalse(recorder.finalized["accepted"])
+        self.assertEqual(recorder.finalized["reason"], "setup_exception")
+
     def test_takeover_discards_remainder_and_replans_after_release(self):
         env = FakeEnv()
         model = FakeModel()
@@ -114,6 +153,7 @@ class InterventionLoopTest(unittest.TestCase):
                 _snapshot(released=True),
                 _snapshot(),
                 _snapshot(),
+                _snapshot(accept_next=True),
             ]
         )
 
@@ -131,17 +171,13 @@ class InterventionLoopTest(unittest.TestCase):
         self.assertEqual(recorder.rows[1]["control"]["takeover_edge"], 1)
         self.assertEqual(recorder.rows[2]["control"]["takeover_edge"], -1)
         self.assertTrue(recorder.finalized["accepted"])
+        self.assertEqual(recorder.finalized["reason"], "operator_accept_next")
 
-    def test_operator_abort_rejects_without_executing_an_action(self):
+    def test_left_discards_and_retries_without_executing_an_action(self):
         env = FakeEnv()
         model = FakeModel()
         recorder = FakeRecorder()
-        abort = KeyboardSnapshot(
-            deadman=False,
-            active_arm="left",
-            delta_pose=np.zeros(6),
-            abort_requested=True,
-        )
+        abort = _snapshot(discard_retry=True)
         with self.assertRaises(InterventionRejected):
             run_keyboard_intervention_episode(
                 env,
@@ -154,6 +190,77 @@ class InterventionLoopTest(unittest.TestCase):
         self.assertEqual(env.actions, [])
         self.assertEqual(model.chunk_number, 0)
         self.assertFalse(recorder.finalized["accepted"])
+        self.assertEqual(recorder.finalized["reason"], "operator_discard_retry")
+
+    def test_escape_accepts_and_exits(self):
+        env = FakeEnv()
+        recorder = FakeRecorder()
+        with self.assertRaises(InterventionAcceptedAndExit) as raised:
+            run_keyboard_intervention_episode(
+                env,
+                FakeModel(),
+                keyboard=FakeKeyboard([_snapshot(accept_exit=True)]),
+                controller=FakeController(),
+                recorder=recorder,
+                pace_realtime=False,
+            )
+        self.assertEqual(raised.exception.saved_path, "fake.hdf5")
+        self.assertTrue(recorder.finalized["accepted"])
+        self.assertEqual(recorder.finalized["reason"], "operator_accept_exit")
+
+    def test_escape_before_first_frame_exits_without_an_empty_episode(self):
+        class EmptyAwareRecorder(FakeRecorder):
+            def finalize(self, **kwargs):
+                self.finalized = kwargs
+                return None
+
+        recorder = EmptyAwareRecorder()
+        with self.assertRaises(InterventionAcceptedAndExit) as raised:
+            run_keyboard_intervention_episode(
+                FakeEnv(),
+                FakeModel(),
+                keyboard=FakeKeyboard([_snapshot(accept_exit=True)]),
+                controller=FakeController(),
+                recorder=recorder,
+                pace_realtime=False,
+            )
+        self.assertIsNone(raised.exception.saved_path)
+        self.assertTrue(recorder.finalized["accepted"])
+
+    def test_backspace_discards_and_exits(self):
+        env = FakeEnv()
+        recorder = FakeRecorder()
+        with self.assertRaises(InterventionDiscardedAndExit):
+            run_keyboard_intervention_episode(
+                env,
+                FakeModel(),
+                keyboard=FakeKeyboard([_snapshot(discard_exit=True)]),
+                controller=FakeController(),
+                recorder=recorder,
+                pace_realtime=False,
+            )
+        self.assertFalse(recorder.finalized["accepted"])
+        self.assertEqual(recorder.finalized["reason"], "operator_discard_exit")
+
+    def test_runtime_exception_discards_staged_candidate(self):
+        class BrokenEnv(FakeEnv):
+            def take_action(self, action):
+                self.actions.append(action)
+                raise RuntimeError("simulator fault")
+
+        recorder = FakeRecorder()
+        with self.assertRaisesRegex(RuntimeError, "simulator fault"):
+            run_keyboard_intervention_episode(
+                BrokenEnv(),
+                FakeModel(),
+                keyboard=FakeKeyboard([_snapshot(), _snapshot()]),
+                controller=FakeController(),
+                recorder=recorder,
+                pace_realtime=False,
+            )
+        self.assertEqual(len(recorder.rows), 1)
+        self.assertFalse(recorder.finalized["accepted"])
+        self.assertEqual(recorder.finalized["reason"], "exception")
 
     def test_save_retry_keeps_episode_and_requests_same_layout(self):
         env = FakeEnv()
@@ -174,7 +281,7 @@ class InterventionLoopTest(unittest.TestCase):
         self.assertEqual(env.actions, [{"id": 0}])
         self.assertEqual(raised.exception.saved_path, "fake.hdf5")
         self.assertTrue(recorder.finalized["accepted"])
-        self.assertEqual(recorder.finalized["reason"], "operator_save_retry")
+        self.assertEqual(recorder.finalized["reason"], "operator_accept_retry")
 
 
 if __name__ == "__main__":

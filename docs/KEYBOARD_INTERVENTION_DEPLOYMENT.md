@@ -1,8 +1,8 @@
 # Pi0.5 keyboard intervention deployment
 
 This guide reproduces the visible RoboDojo simulation, Pi0.5 inference server,
-keyboard intervention recorder, and optional LeRobot v3 exporter on another
-Ubuntu workstation. For operator controls and output semantics, see
+and direct LeRobot v3 keyboard-intervention recorder on another Ubuntu
+workstation. For operator controls and output semantics, see
 [`KEYBOARD_INTERVENTION.md`](KEYBOARD_INTERVENTION.md).
 
 The validated target in this guide is `OneMoreCupofCoffee`:
@@ -33,8 +33,8 @@ Only the RoboDojo superproject is required. It pins these submodules:
 | `third_party/curobo` | `895c6517243f8cb091c73c018c8167192d39599a` |
 
 OpenPI is already vendored under `XPolicyLab/policy/Pi_05/openpi`. Do not clone
-another OpenPI repository. Kai0 and ROS are not required for inference,
-intervention recording, or LeRobot export. Kai0 is only needed later if it is
+another OpenPI repository. Kai0 and ROS are not required for inference or
+intervention recording. Kai0 is only needed later if it is
 chosen as the training stack.
 
 This branch reads `XPolicyLab` from `https://github.com/ykail/XPolicyLab.git`,
@@ -288,8 +288,8 @@ ln -sfnT \
 ```
 
 The target currently has about 400 GiB free. Minimal inference deployment has
-comfortable headroom. Copying the full dataset, all training states, raw HDF5,
-and exported videos leaves much less room for long collection sessions; mount
+comfortable headroom. Copying the full dataset, all training states, and
+collected LeRobot videos leaves much less room for long collection sessions; mount
 an additional data disk before committing to that layout.
 
 ## 8. Run a no-GPU preflight
@@ -346,7 +346,7 @@ xdpyinfo >/dev/null || {
 }
 ```
 
-Start one collection episode:
+Start an operator-driven collection session:
 
 ```bash
 source /home/ykail/miniconda3/etc/profile.d/conda.sh
@@ -357,18 +357,18 @@ cd /home/ykail/vibe_code/RoboDojo
 bash scripts/RoboDojo/collect_pi05_keyboard.sh \
   --task stack_bowls \
   --ckpt RoboDojo-sim-arx_x5-joint-0 \
-  --record-dir /home/ykail/data/RoboDojo_interventions \
-  --episodes 1 \
+  --lerobot-repo-id robodojo_interventions_stack_bowls \
+  --lerobot-root /home/ykail/data/lerobot \
   --rendering-mode quality \
   --policy-gpu 0 \
   --env-gpu 0
 ```
 
-With `--episodes 1`, a natural task success, the task step limit, or
-`N`/`Enter` completes the one requested rollout, after which the evaluator
-closes Isaac Sim normally. Use a larger value to keep the same process open;
-`stack_bowls` supports up to 25 layouts. `R` saves and reloads the same layout
-without consuming that count, while `Backspace` rejects and reloads it.
+Natural task success and the configured task step limit do not end an attempt.
+Use the keyboard right arrow to accept the complete candidate and advance, or
+the left arrow to discard it and retry the same layout. After the last saved
+layout, collection cycles to the first one. `Escape` accepts the final
+candidate and exits; `Backspace` discards the final candidate and exits.
 
 The wrapper starts both the Pi0.5 policy server and Isaac Sim. Do not start a
 second policy server manually. Keep the Isaac Sim window focused for keyboard
@@ -380,16 +380,10 @@ change the camera rendering preset and may shift images away from the training
 distribution.
 
 Press plain `I` once to enter manual control and again to return to Pi0.5. Do
-not use `Space`: Isaac Sim binds it to Play/Pause.
-
-To rebuild a Kai0-compatible LeRobot v3 dataset after collection, add:
-
-```text
---lerobot-repo-id robodojo_interventions_stack_bowls
---lerobot-root /home/ykail/data/lerobot
-```
-
-The exporter runs on CPU with CUDA hidden after the simulator session exits.
+not use `Space`: Isaac Sim binds it to Play/Pause. Frames are written directly
+to the LeRobot dataset by a CPU-only child process while Isaac runs. To append
+after a later restart, run the same command with `--resume`; without that flag,
+the wrapper refuses an existing dataset rather than overwriting it.
 
 ## Troubleshooting
 

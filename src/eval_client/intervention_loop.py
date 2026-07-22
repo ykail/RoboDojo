@@ -9,7 +9,7 @@ from src.eval_client.keyboard_teleop import CartesianTeleopController, KitKeyboa
 
 
 class InterventionRejected(Exception):
-    """The operator rejected this attempt; the layout should be retried."""
+    """The operator discarded this attempt; the same layout should be retried."""
 
 
 class InterventionSavedForRetry(Exception):
@@ -18,6 +18,18 @@ class InterventionSavedForRetry(Exception):
     def __init__(self, saved_path: str):
         self.saved_path = saved_path
         super().__init__(f"Saved {saved_path}; retry the same layout.")
+
+
+class InterventionAcceptedAndExit(Exception):
+    """The operator accepted the current attempt and requested a clean exit."""
+
+    def __init__(self, saved_path: str | None):
+        self.saved_path = saved_path
+        super().__init__(f"Saved {saved_path}; stop interactive collection.")
+
+
+class InterventionDiscardedAndExit(Exception):
+    """The operator discarded the current attempt and requested a clean exit."""
 
 
 class RealtimePacer:
@@ -72,6 +84,27 @@ def _mark_operator_end(task_env, rejected: bool = False) -> None:
     task_env.end_flag[0] = True
 
 
+def _operator_request(snapshot) -> str | None:
+    """Return one unambiguous terminal request for this keyboard tick.
+
+    Backspace is intentionally checked before the legacy ``abort_requested``
+    field because the real keyboard adapter sets both for compatibility.
+    Multiple physically simultaneous terminal keys are resolved in the most
+    conservative order: discard/exit, accept/exit, discard/retry, then accept.
+    """
+    if getattr(snapshot, "discard_exit_requested", False) or getattr(snapshot, "abort_requested", False):
+        return "discard_exit"
+    if getattr(snapshot, "accept_exit_requested", False):
+        return "accept_exit"
+    if getattr(snapshot, "discard_retry_requested", False):
+        return "discard_retry"
+    if getattr(snapshot, "save_retry_requested", False):
+        return "accept_retry"
+    if getattr(snapshot, "accept_next_requested", False) or getattr(snapshot, "accept_requested", False):
+        return "accept_next"
+    return None
+
+
 def run_keyboard_intervention_episode(
     task_env,
     model_client,
@@ -91,40 +124,56 @@ def run_keyboard_intervention_episode(
         raise ValueError("Keyboard intervention supports exactly one simulation environment.")
 
     owned_keyboard = keyboard is None
-    if keyboard is None:
-        keyboard = KitKeyboardDevice(
-            pos_step=float(os.environ.get("ROBODOJO_TELEOP_POS_STEP", "0.005")),
-            rot_step=float(os.environ.get("ROBODOJO_TELEOP_ROT_STEP", "0.02")),
-            deadman_timeout=float(os.environ.get("ROBODOJO_TELEOP_INPUT_TIMEOUT", "2.0")),
-        )
-    if controller is None:
-        controller = CartesianTeleopController(
-            task_env,
-            max_joint_delta=float(os.environ.get("ROBODOJO_TELEOP_MAX_JOINT_DELTA", "0.35")),
-        )
-    if recorder is None:
-        from src.eval_client.intervention_recorder import recorder_for_env
+    try:
+        if keyboard is None:
+            keyboard = KitKeyboardDevice(
+                pos_step=float(os.environ.get("ROBODOJO_TELEOP_POS_STEP", "0.005")),
+                rot_step=float(os.environ.get("ROBODOJO_TELEOP_ROT_STEP", "0.02")),
+                deadman_timeout=float(os.environ.get("ROBODOJO_TELEOP_INPUT_TIMEOUT", "2.0")),
+            )
+        if controller is None:
+            controller = CartesianTeleopController(
+                task_env,
+                max_joint_delta=float(os.environ.get("ROBODOJO_TELEOP_MAX_JOINT_DELTA", "0.35")),
+            )
+        if recorder is None:
+            from src.eval_client.lerobot_stream_recorder import recorder_for_env
 
-        recorder = recorder_for_env(
-            task_env, os.environ.get("ROBODOJO_RECORD_DIR", os.path.join(task_env.save_dir, "interventions"))
+            recorder = recorder_for_env(task_env)
+
+        pacer = RealtimePacer(
+            frequency=float(task_env.obs_manager.collect_freq),
+            enabled=pace_realtime and os.environ.get("ROBODOJO_REALTIME", "1") != "0",
         )
+        print(f"[Intervention] {keyboard.help_text()}")
+        print(f"[Intervention] Recording under {recorder.record_dir}")
 
-    pacer = RealtimePacer(
-        frequency=float(task_env.obs_manager.collect_freq),
-        enabled=pace_realtime and os.environ.get("ROBODOJO_REALTIME", "1") != "0",
-    )
-    print(f"[Intervention] {keyboard.help_text()}")
-    print(f"[Intervention] Recording under {recorder.record_dir}")
-
-    obs = task_env.get_obs()
-    controller.reset(obs)
-    _send_observation(task_env, model_client, obs)
+        obs = task_env.get_obs()
+        controller.reset(obs)
+        _send_observation(task_env, model_client, obs)
+    except Exception:
+        # Setup can fail after the writer has already staged an episode (for
+        # example on the first observation or controller reset).  Discard it
+        # and release an owned Kit subscription before main decides whether
+        # the environment can be retried.
+        if recorder is not None:
+            try:
+                recorder.finalize(accepted=False, success=False, reason="setup_exception")
+            except Exception:
+                pass
+        if owned_keyboard and keyboard is not None:
+            try:
+                keyboard.close()
+            except Exception:
+                pass
+        raise
     chunk_id = -1
     pending_release_edge = 0
-    accepted = True
-    retry_same_layout = False
-    finish_reason = "environment_end"
+    accepted = False
+    terminal_request: str | None = None
+    finish_reason = "operator_pending"
     saved_path = None
+    recorder_finalized = False
 
     def read_keyboard():
         # Kit dispatches GUI input while the app updates.  Pump one render here
@@ -148,26 +197,24 @@ def run_keyboard_intervention_episode(
         )
         task_env.take_action(action)
         pacer.wait()
-        if not task_env.is_episode_end():
-            obs = task_env.get_obs()
-            _send_observation(task_env, model_client, obs)
+        # Operator-driven collection deliberately ignores benchmark success
+        # and step-limit termination.  The enclosing environment disables its
+        # own step-limit guard in this mode; here we always stage the next
+        # observation until the operator labels the full trajectory.
+        obs = task_env.get_obs()
+        _send_observation(task_env, model_client, obs)
 
     try:
-        while not task_env.is_episode_end():
+        while True:
             snapshot = read_keyboard()
-            if snapshot.abort_requested:
-                accepted = False
-                finish_reason = "operator_abort"
-                _mark_operator_end(task_env, rejected=True)
-                break
-            if snapshot.save_retry_requested:
-                retry_same_layout = True
-                finish_reason = "operator_save_retry"
-                _mark_operator_end(task_env)
-                break
-            if snapshot.accept_requested:
-                finish_reason = "operator_accept"
-                _mark_operator_end(task_env)
+            terminal_request = _operator_request(snapshot)
+            if terminal_request in {"accept_next", "accept_retry"} and recorder.frame_count == 0:
+                print("\n[Intervention] No frames have been staged yet; ignoring the accept request.")
+                terminal_request = None
+            if terminal_request is not None:
+                accepted = terminal_request in {"accept_next", "accept_retry", "accept_exit"}
+                finish_reason = f"operator_{terminal_request}"
+                _mark_operator_end(task_env, rejected=not accepted)
                 break
 
             if snapshot.deadman:
@@ -193,21 +240,14 @@ def run_keyboard_intervention_episode(
             stale_chunk = False
             for chunk_index, policy_action in enumerate(chunk):
                 snapshot = read_keyboard()
-                if snapshot.abort_requested:
-                    accepted = False
-                    finish_reason = "operator_abort"
-                    _mark_operator_end(task_env, rejected=True)
-                    stale_chunk = True
-                    break
-                if snapshot.save_retry_requested:
-                    retry_same_layout = True
-                    finish_reason = "operator_save_retry"
-                    _mark_operator_end(task_env)
-                    stale_chunk = True
-                    break
-                if snapshot.accept_requested:
-                    finish_reason = "operator_accept"
-                    _mark_operator_end(task_env)
+                terminal_request = _operator_request(snapshot)
+                if terminal_request in {"accept_next", "accept_retry"} and recorder.frame_count == 0:
+                    print("\n[Intervention] No frames have been staged yet; ignoring the accept request.")
+                    terminal_request = None
+                if terminal_request is not None:
+                    accepted = terminal_request in {"accept_next", "accept_retry", "accept_exit"}
+                    finish_reason = f"operator_{terminal_request}"
+                    _mark_operator_end(task_env, rejected=not accepted)
                     stale_chunk = True
                     break
                 if snapshot.deadman:
@@ -247,10 +287,10 @@ def run_keyboard_intervention_episode(
                     },
                 )
                 pending_release_edge = 0
-                if task_env.is_episode_end():
-                    break
 
             if stale_chunk:
+                if terminal_request is not None:
+                    break
                 continue
 
         saved_path = recorder.finalize(
@@ -258,18 +298,35 @@ def run_keyboard_intervention_episode(
             success=bool(task_env.success[0]),
             reason=finish_reason,
         )
+        recorder_finalized = True
         if saved_path:
             print(f"\n[Intervention] Saved trajectory: {saved_path}")
+        elif accepted and terminal_request != "accept_exit":
+            raise RuntimeError("The recorder did not return a saved dataset path for an accepted episode.")
+        elif not accepted:
+            print("\n[Intervention] Episode discarded; no candidate data were kept.")
         else:
-            print("\n[Intervention] Episode rejected; no HDF5 file was kept.")
+            print("\n[Intervention] No frames were staged; exiting without creating an empty episode.")
+
+        if terminal_request == "discard_retry":
             raise InterventionRejected("Operator rejected the intervention episode.")
-        if retry_same_layout:
+        if terminal_request == "discard_exit":
+            raise InterventionDiscardedAndExit("Operator discarded the final episode and requested exit.")
+        if terminal_request == "accept_retry":
             raise InterventionSavedForRetry(saved_path)
+        if terminal_request == "accept_exit":
+            raise InterventionAcceptedAndExit(saved_path)
         return saved_path
-    except (InterventionRejected, InterventionSavedForRetry):
+    except (
+        InterventionRejected,
+        InterventionSavedForRetry,
+        InterventionAcceptedAndExit,
+        InterventionDiscardedAndExit,
+    ):
         raise
     except Exception:
-        recorder.finalize(accepted=False, success=False, reason="exception")
+        if not recorder_finalized:
+            recorder.finalize(accepted=False, success=False, reason="exception")
         raise
     finally:
         if owned_keyboard:

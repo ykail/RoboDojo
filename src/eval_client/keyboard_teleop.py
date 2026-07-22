@@ -43,6 +43,15 @@ def _normalise_key_name(name: str) -> str:
         "NUM_1": "1",
         "KEY_2": "2",
         "NUM_2": "2",
+        "ARROW_RIGHT": "RIGHT",
+        "RIGHT_ARROW": "RIGHT",
+        "KEY_RIGHT": "RIGHT",
+        "ARROW_LEFT": "LEFT",
+        "LEFT_ARROW": "LEFT",
+        "KEY_LEFT": "LEFT",
+        "ESC": "ESCAPE",
+        "KEY_ESCAPE": "ESCAPE",
+        "KEY_BACKSPACE": "BACKSPACE",
     }
     return aliases.get(name, name)
 
@@ -58,6 +67,13 @@ class KeyboardSnapshot:
     takeover_pressed: bool = False
     takeover_released: bool = False
     arm_changed: bool = False
+    accept_next_requested: bool = False
+    discard_retry_requested: bool = False
+    accept_exit_requested: bool = False
+    discard_exit_requested: bool = False
+    # Compatibility fields for recordings/tests created by the first
+    # keyboard-intervention implementation.  N/Enter mirrors RIGHT, R keeps
+    # its old "accept and retry" behavior, and Backspace also raises abort.
     accept_requested: bool = False
     save_retry_requested: bool = False
     abort_requested: bool = False
@@ -91,6 +107,10 @@ class KeyboardState:
         self._takeover_pressed = False
         self._takeover_released = False
         self._arm_changed = False
+        self._accept_next_requested = False
+        self._discard_retry_requested = False
+        self._accept_exit_requested = False
+        self._discard_exit_requested = False
         self._accept_requested = False
         self._save_retry_requested = False
         self._abort_requested = False
@@ -123,12 +143,20 @@ class KeyboardState:
                     self._arm_changed = True
                 elif key == "K" and self._takeover_active:
                     self._gripper_toggles.append(self._active_arm)
+                elif key == "RIGHT":
+                    self._accept_next_requested = True
+                elif key == "LEFT":
+                    self._discard_retry_requested = True
+                elif key == "ESCAPE":
+                    self._accept_exit_requested = True
+                elif key == "BACKSPACE":
+                    self._discard_exit_requested = True
+                    self._abort_requested = True
                 elif key in {"N", "ENTER"}:
+                    self._accept_next_requested = True
                     self._accept_requested = True
                 elif key == "R":
                     self._save_retry_requested = True
-                elif key == "BACKSPACE":
-                    self._abort_requested = True
                 elif key == "L":
                     was_active = self._takeover_active
                     self._takeover_active = False
@@ -173,6 +201,10 @@ class KeyboardState:
                 takeover_pressed=self._takeover_pressed,
                 takeover_released=self._takeover_released,
                 arm_changed=self._arm_changed,
+                accept_next_requested=self._accept_next_requested,
+                discard_retry_requested=self._discard_retry_requested,
+                accept_exit_requested=self._accept_exit_requested,
+                discard_exit_requested=self._discard_exit_requested,
                 accept_requested=self._accept_requested,
                 save_retry_requested=self._save_retry_requested,
                 abort_requested=self._abort_requested,
@@ -181,6 +213,10 @@ class KeyboardState:
             self._takeover_pressed = False
             self._takeover_released = False
             self._arm_changed = False
+            self._accept_next_requested = False
+            self._discard_retry_requested = False
+            self._accept_exit_requested = False
+            self._discard_exit_requested = False
             self._accept_requested = False
             self._save_retry_requested = False
             self._abort_requested = False
@@ -238,8 +274,9 @@ class KitKeyboardDevice:
         return (
             "I=toggle manual control on/off | 1/2=left/right arm | "
             "W/S x, A/D y, Q/E z | Z/X roll, T/G pitch, C/V yaw | "
-            "K=toggle selected gripper while manual | N or Enter=save/finish | "
-            "R=save/retry same layout | Backspace=reject/retry same layout | "
+            "K=toggle selected gripper while manual | Right=accept/next | "
+            "Left=discard/retry | Escape=accept/exit | Backspace=discard/exit | "
+            "N/Enter=legacy accept/next | R=legacy accept/retry | "
             "L=emergency manual-off/clear held keys"
         )
 

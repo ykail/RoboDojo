@@ -128,7 +128,16 @@ from omegaconf import OmegaConf
 
 from env.global_configs import *
 from src.eval_client.eval_env import create_eval_env
-from src.eval_client.intervention_loop import InterventionRejected, InterventionSavedForRetry
+from src.eval_client.intervention_loop import (
+    InterventionAcceptedAndExit,
+    InterventionDiscardedAndExit,
+    InterventionRejected,
+    InterventionSavedForRetry,
+)
+from src.eval_client.lerobot_stream_recorder import (
+    LeRobotStreamStartupError,
+    close_lerobot_stream_session,
+)
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
@@ -258,6 +267,7 @@ def main():
             "ROBODOJO_CONTROL_MODE must be 'policy' or 'keyboard_intervention', "
             f"got {control_mode!r}."
         )
+    operator_driven = control_mode == "keyboard_intervention"
     if control_mode == "keyboard_intervention":
         if args_cli.policy_name != "Pi_05":
             raise ValueError("Keyboard intervention is currently validated only for policy_name=Pi_05.")
@@ -283,7 +293,7 @@ def main():
     eval_cfg["seed"] = args_cli.seed
     eval_cfg["physx_monitor_enabled"] = enable_monitor
     eval_cfg["control_mode"] = control_mode
-    eval_cfg["record_dir"] = os.environ.get("ROBODOJO_RECORD_DIR", "")
+    eval_cfg["operator_driven"] = operator_driven
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
@@ -346,7 +356,7 @@ def main():
     env_cfg = process_randomization(env_cfg)
     env_cfg, eval_num = process_config(env_cfg, task_name=task_name)
 
-    if os.environ.get("EVAL_NUM"):
+    if os.environ.get("EVAL_NUM") and not operator_driven:
         _env_eval_num = os.environ.get("EVAL_NUM")
         if str(_env_eval_num).lower() != "native":
             eval_num = min(int(_env_eval_num), int(eval_num))
@@ -364,11 +374,15 @@ def main():
     resume_state = _load_resume_manifest(eval_cfg, run_id)
     env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
     eval_time = env.success_nums + env.fail_nums
-    if eval_time >= eval_num:
+    if operator_driven:
+        env.env_seeds = env.seed_manager.get_cyclic_seeds(max_count=1)
+    elif eval_time >= eval_num:
         # Already complete on resume - nothing left to do.
         env.env_seeds = None
     else:
         env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
+    operator_stop_requested = False
+    operator_fatal_error = None
     while env.env_seeds is not None:
         retry_round = False
         if enable_monitor:
@@ -393,6 +407,8 @@ def main():
             bad_envs = sorted(e.broken_envs)
 
         except UnStableError:
+            if operator_driven:
+                print("[Intervention] unstable reset has no candidate data; advancing to the next layout.")
             env.seed_manager.eval_step()
         except InterventionRejected:
             print("[Intervention] rejected attempt does not count; retrying the same layout.")
@@ -405,6 +421,24 @@ def main():
             )
             env.close()
             retry_round = True
+        except InterventionAcceptedAndExit as request:
+            print(
+                "[Intervention] accepted final episode; closing collection session. "
+                f"episode={getattr(request, 'saved_path', '')}"
+            )
+            env.seed_manager.eval_step()
+            operator_stop_requested = True
+        except InterventionDiscardedAndExit:
+            print("[Intervention] discarded final attempt; closing collection session.")
+            operator_stop_requested = True
+        except LeRobotStreamStartupError as e:
+            # Retrying cannot repair a bad codec, incompatible existing
+            # dataset, missing environment, or a second writer holding the
+            # dataset lock.  Stop cleanly instead of reloading Isaac forever.
+            print(f"[Intervention][FATAL] {e}", flush=True)
+            env.close()
+            operator_fatal_error = e
+            operator_stop_requested = True
         except Exception as e:
             import traceback
 
@@ -426,7 +460,18 @@ def main():
                 )
                 bad_envs = sorted(bad)
             else:
-                env.seed_manager.eval_step()
+                if operator_driven:
+                    print(
+                        "[Intervention] current candidate was discarded after an error; "
+                        "retrying the same layout."
+                    )
+                    env.close()
+                    retry_round = True
+                else:
+                    env.seed_manager.eval_step()
+
+        if operator_stop_requested:
+            break
 
         if bad_envs is not None:
             # Abandon broken-env seeds, refill from the seed queue, and
@@ -463,20 +508,31 @@ def main():
 
         print(f"Success nums: {env.success_nums}, Fail nums: {env.fail_nums}, Unstable nums: {env.unstable_nums}")
         eval_time = env.success_nums + env.fail_nums
-        if eval_time >= eval_num:
+        if not operator_driven and eval_time >= eval_num:
             break
 
-        env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
+        if operator_driven:
+            env.env_seeds = env.seed_manager.get_cyclic_seeds(max_count=1)
+        else:
+            env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
         if env.env_seeds is None:
-            print("No more seeds to run, exiting.")
+            print("No saved layouts are available; exiting.")
             break
+        if operator_driven:
+            print(
+                "[Intervention] loading "
+                f"layout={env.env_seeds[0]} cycle={env.seed_manager.cycle_index}"
+            )
 
         env.close()
 
     _delete_resume_manifest(env)
+    close_lerobot_stream_session()
     _close_model_client(env)
     env.close()
     simulation_app.close()
+    if operator_fatal_error is not None:
+        raise operator_fatal_error
 
 
 if __name__ == "__main__":

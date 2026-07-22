@@ -89,6 +89,37 @@ class KeyboardStateTest(unittest.TestCase):
         state.handle_key("R", True)
         self.assertTrue(state.snapshot().save_retry_requested)
 
+    def test_operator_episode_keys_are_distinct_one_shot_events(self):
+        state = KeyboardState()
+        cases = (
+            ("RIGHT_ARROW", "accept_next_requested"),
+            ("ARROW_LEFT", "discard_retry_requested"),
+            ("ESC", "accept_exit_requested"),
+            ("KEY_BACKSPACE", "discard_exit_requested"),
+        )
+        for key, field in cases:
+            state.handle_key(key, True)
+            state.handle_key(key, True)
+            self.assertTrue(getattr(state.snapshot(), field))
+            self.assertFalse(getattr(state.snapshot(), field))
+            state.handle_key(key, False)
+
+        # Backspace mirrors the old abort field, but its explicit meaning is
+        # now discard-and-exit rather than discard-and-retry.
+        state.handle_key("BACKSPACE", True)
+        snapshot = state.snapshot()
+        self.assertTrue(snapshot.discard_exit_requested)
+        self.assertTrue(snapshot.abort_requested)
+
+    def test_legacy_accept_aliases_also_request_next_layout(self):
+        state = KeyboardState()
+        for key in ("N", "ENTER"):
+            state.handle_key(key, True)
+            snapshot = state.snapshot()
+            self.assertTrue(snapshot.accept_next_requested)
+            self.assertTrue(snapshot.accept_requested)
+            state.handle_key(key, False)
+
     def test_gripper_requires_takeover_and_timeout_only_stops_motion(self):
         now = [0.0]
         state = KeyboardState(deadman_timeout=2.0, clock=lambda: now[0])
