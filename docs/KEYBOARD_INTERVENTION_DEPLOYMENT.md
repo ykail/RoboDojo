@@ -28,7 +28,7 @@ Only the RoboDojo superproject is required. It pins these submodules:
 
 | Repository | Pinned revision |
 | --- | --- |
-| `XPolicyLab` | `3e6b42cda67ad6c02aaef2fec16815490c328751` |
+| `XPolicyLab` | `8d6d392fd358ba65bf2382e84657ff27902f58a1` |
 | `third_party/IsaacLab` | `afca7b09d60d8beb9c1cb28b43066499940b969b` |
 | `third_party/curobo` | `895c6517243f8cb091c73c018c8167192d39599a` |
 
@@ -36,6 +36,10 @@ OpenPI is already vendored under `XPolicyLab/policy/Pi_05/openpi`. Do not clone
 another OpenPI repository. Kai0 and ROS are not required for inference,
 intervention recording, or LeRobot export. Kai0 is only needed later if it is
 chosen as the training stack.
+
+This branch reads `XPolicyLab` from `https://github.com/ykail/XPolicyLab.git`,
+branch `feat/robodojo-pi05-runtime`, so fresh clones can fetch the pinned
+Pi0.5 environment-isolation and WebSocket cold-start fixes.
 
 Runtime storage has three separate parts:
 
@@ -378,6 +382,7 @@ bash scripts/RoboDojo/collect_pi05_keyboard.sh \
   --ckpt RoboDojo-sim-arx_x5-joint-0 \
   --record-dir /home/ykail/data/RoboDojo_interventions \
   --episodes 1 \
+  --rendering-mode quality \
   --policy-gpu 0 \
   --env-gpu 0
 ```
@@ -391,6 +396,11 @@ without consuming that count, while `Backspace` rejects and reloads it.
 The wrapper starts both the Pi0.5 policy server and Isaac Sim. Do not start a
 second policy server manually. Keep the Isaac Sim window focused for keyboard
 events.
+
+Keep `--rendering-mode quality` for normal inference and correction-data
+collection. `balanced` and `performance` can improve interactivity, but they
+change the camera rendering preset and may shift images away from the training
+distribution.
 
 Press plain `I` once to enter manual control and again to return to Pi0.5. Do
 not use `Space`: Isaac Sim binds it to Play/Pause.

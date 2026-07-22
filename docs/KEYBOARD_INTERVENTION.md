@@ -17,7 +17,8 @@ bash scripts/RoboDojo/collect_pi05_keyboard.sh \
   --task stack_bowls \
   --ckpt RoboDojo-sim-arx_x5-joint-0 \
   --record-dir /home/piper/data/RoboDojo_interventions \
-  --episodes 20
+  --episodes 20 \
+  --rendering-mode quality
 ```
 
 The wrapper always uses `action_type=joint`, a visible Isaac Sim window and a
@@ -29,6 +30,11 @@ evaluation layouts. Reaching that count closes Isaac Sim normally; natural
 success, the task step limit, and `N`/`Enter` each complete one rollout. For
 example, `stack_bowls` supports up to 25 layouts, while `R` and `Backspace`
 retry the same layout without consuming that count.
+
+`--rendering-mode quality` preserves the benchmark camera preset and is the
+recommended default for policy inference and training data. Use `balanced` or
+`performance` only when interactive responsiveness is more important than
+matching the training image distribution.
 
 ## Controls
 
