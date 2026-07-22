@@ -161,6 +161,19 @@ if [[ ! -x "${lerobot_python}" ]]; then
   echo "[collect_pi05_keyboard] Run: bash ${ROOT_DIR}/XPolicyLab/policy/Pi_05/install.sh" >&2
   exit 1
 fi
+if ! env \
+  -u PYTHONHOME \
+  -u VIRTUAL_ENV \
+  -u CONDA_PREFIX \
+  -u CONDA_DEFAULT_ENV \
+  CUDA_VISIBLE_DEVICES="" \
+  PYTHONPATH="${ROOT_DIR}" \
+  PYTHONNOUSERSITE="1" \
+  "${lerobot_python}" -c 'import numpy; import lerobot' >/dev/null; then
+  echo "[collect_pi05_keyboard] Pi0.5 writer environment is incomplete: ${lerobot_python}" >&2
+  echo "[collect_pi05_keyboard] numpy/lerobot import failed; rerun: bash ${ROOT_DIR}/XPolicyLab/policy/Pi_05/install.sh" >&2
+  exit 1
+fi
 
 if [[ -n "${deprecated_episodes}" ]]; then
   echo "[collect_pi05_keyboard] NOTE: --episodes=${deprecated_episodes} is ignored; use ESCAPE/BACKSPACE to exit."

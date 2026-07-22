@@ -453,6 +453,25 @@ class _FakeSidecar:
 
 
 class LeRobotStreamRecorderTest(unittest.TestCase):
+    def test_config_preserves_virtualenv_python_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv_python = root / "openpi" / ".venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.symlink_to(Path(sys.executable).resolve())
+            environment = {
+                "ROBODOJO_LEROBOT_PYTHON": str(venv_python),
+                "ROBODOJO_LEROBOT_ROOT": str(root / "data"),
+                "ROBODOJO_LEROBOT_REPO_ID": "repo",
+                "ROBODOJO_LEROBOT_STREAMING_ENCODING": "1",
+            }
+
+            with mock.patch.dict(os.environ, environment, clear=False):
+                config = config_from_environment(fps=25)
+
+            self.assertEqual(config.python, venv_python.absolute())
+            self.assertNotEqual(config.python, config.python.resolve())
+
     def test_same_run_marker_enables_resume_after_process_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

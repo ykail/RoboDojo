@@ -150,7 +150,13 @@ def _remove_collection_marker(dataset_root: Path, run_id: str) -> None:
 def config_from_environment(*, fps: int) -> StreamConfig:
     project_root = Path(__file__).resolve().parents[2]
     default_python = project_root / "XPolicyLab" / "policy" / "Pi_05" / "openpi" / ".venv" / "bin" / "python"
-    python = Path(os.environ.get("ROBODOJO_LEROBOT_PYTHON", str(default_python))).expanduser().resolve()
+    python = Path(os.environ.get("ROBODOJO_LEROBOT_PYTHON", str(default_python))).expanduser()
+    if not python.is_absolute():
+        python = Path.cwd() / python
+    # Do not call Path.resolve() here.  uv/venv commonly makes ``bin/python``
+    # a symlink to the system interpreter; executing the lexical venv path is
+    # what makes CPython discover pyvenv.cfg and the venv's site-packages.
+    python = Path(os.path.abspath(python))
     root_value = os.environ.get("ROBODOJO_LEROBOT_ROOT")
     repo_id = os.environ.get("ROBODOJO_LEROBOT_REPO_ID", "").strip()
     if not root_value:
