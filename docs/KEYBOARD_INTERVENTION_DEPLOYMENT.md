@@ -104,48 +104,32 @@ have been verified.
 
 ## 2. Obtain the feature branch
 
-The keyboard-intervention branch is currently local to `Piper`; it is not on
-the public RoboDojo origin. Until it is pushed to an accessible fork, copy the
-Git working tree, including `.git` and its submodule metadata, from `Piper`.
-
-The transfer examples assume that the target can authenticate to `Piper`.
-When both SSH keys exist only on an operator workstation, connect with agent
-forwarding and test the second hop; do not copy a private key onto either
-server:
+The feature branch is published on the `ykail/RoboDojo` fork. On a workstation
+that does not already have the repository, clone it once:
 
 ```bash
-# Run on the operator workstation.
-ssh -A OneMoreCupofCoffee
-
-# Now running on the target workstation. Verify the presented ED25519
-# fingerprint is SHA256:Cs/dX6LVxscI3GLRRDAic1Qq9SpNCnXOFCHB6p4FFkg.
-ssh piper@10.19.127.120 hostname
+git clone --recurse-submodules \
+  --branch feat/keyboard-intervention-teleop \
+  https://github.com/ykail/RoboDojo.git \
+  /home/ykail/vibe_code/RoboDojo
 ```
 
-Run on the target workstation:
+If `/home/ykail/vibe_code/RoboDojo` is already a Git worktree, do not clone or
+rsync the code over it again. With a clean worktree, update the existing copy:
 
 ```bash
-SOURCE_HOST=piper@10.19.127.120
-ROBO_ROOT=/home/ykail/vibe_code/RoboDojo
-DATA_ROOT=/home/ykail/data
-
-mkdir -p "${ROBO_ROOT}" "${DATA_ROOT}"
-
-rsync -aH --partial --info=progress2 \
-  --exclude='/.cache/' \
-  --exclude='/Assets' \
-  --exclude='/data/' \
-  --exclude='/eval_result/' \
-  --exclude='/XPolicyLab/policy/Pi_05/openpi/.venv/' \
-  --exclude='/XPolicyLab/policy/Pi_05/checkpoints/' \
-  "${SOURCE_HOST}:/home/piper/vibe_code/RoboDojo/" \
-  "${ROBO_ROOT}/"
+cd /home/ykail/vibe_code/RoboDojo
+git fetch origin feat/keyboard-intervention-teleop
+git switch feat/keyboard-intervention-teleop
+git pull --ff-only origin feat/keyboard-intervention-teleop
+git submodule sync --recursive
+git submodule update --init --recursive
 ```
 
 Verify the branch and pinned submodules:
 
 ```bash
-cd "${ROBO_ROOT}"
+cd /home/ykail/vibe_code/RoboDojo
 git branch --show-current
 git status --short
 git submodule status
@@ -156,15 +140,8 @@ clean, and the three submodule hashes must match the table above. The installer
 checks out the revisions recorded by the superproject; it does not update them
 to the current remote `main`.
 
-After this branch is pushed to an accessible Git remote, the equivalent clean
-installation is:
-
-```bash
-git clone --recurse-submodules \
-  --branch feat/keyboard-intervention-teleop \
-  YOUR_FORK_URL \
-  /home/ykail/vibe_code/RoboDojo
-```
+Use `rsync` later for Assets, checkpoints, and datasets only. Conda and uv
+environments are rebuilt locally and are not copied between machines.
 
 ## 3. Install the simulator environment
 
