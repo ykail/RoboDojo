@@ -124,8 +124,11 @@ Every committed episode contains the normal Pi0.5 training fields:
   IK action and `0` for policy or safety-hold control;
 - the policy proposal and control-state metadata needed to distinguish policy,
   takeover, and hold frames;
-- episode metadata including task, checkpoint, layout id/cycle, collection run
-  id, success-at-decision, and repository revisions.
+- RoboDojo episode metadata including task, checkpoint, layout id/cycle,
+  collection run id, success-at-decision, and repository revisions.  Because
+  Pi0.5 pins LeRobot 0.4.4, these extra fields live in
+  `meta/robodojo/episodes/episode_XXXXXXX.json`; all training fields remain
+  normal LeRobot frame columns.
 
 Kai0 can select only the corrective frames with the same column filter used by
 its HIL datasets:

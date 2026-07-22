@@ -50,6 +50,7 @@ _JOINT_PARTS = (
 )
 _STAGING_MARKER = ".robodojo_lerobot_staging.json"
 _COLLECTION_SESSION_MARKER = ".robodojo_collection_session.json"
+_ROBODOJO_EPISODE_METADATA_DIR = Path("meta/robodojo/episodes")
 _ROLLBACK_FILE_PATHS = (
     Path("meta/info.json"),
     Path("meta/stats.json"),
@@ -665,6 +666,50 @@ def _episode_metadata(
     }
 
 
+def _write_robodojo_episode_metadata(
+    dataset_root: str | Path,
+    episode_index: int,
+    metadata: dict[str, Any],
+) -> Path:
+    """Persist RoboDojo-only fields without relying on a LeRobot-version API.
+
+    LeRobot 0.4.4, which is pinned by Pi_05/openpi, accepts only
+    ``episode_data`` and ``parallel_encoding`` in ``save_episode``.  Newer
+    versions added an ``extra_episode_metadata`` keyword.  Keep the dataset
+    writer on the public 0.4.4 API and store our additional, non-training
+    fields under ``meta/robodojo`` instead.  The file is written after
+    ``save_episode`` but inside the same rollback boundary.
+    """
+
+    root = Path(dataset_root).expanduser().resolve(strict=True)
+    metadata_dir = root / _ROBODOJO_EPISODE_METADATA_DIR
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    target = metadata_dir / f"episode_{int(episode_index):07d}.json"
+    if os.path.lexists(target):
+        raise FileExistsError(f"RoboDojo episode metadata already exists: {target}")
+
+    payload = {
+        "format_version": 1,
+        "episode_index": int(episode_index),
+        **dict(metadata),
+    }
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.tmp-",
+        dir=metadata_dir,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 def _clear_episode(dataset: Any) -> None:
     clear = getattr(dataset, "clear_episode_buffer", None)
     if callable(clear):
@@ -770,14 +815,22 @@ def serve(
                     transient_roots=_encoder_transient_roots(dataset, config.dataset_root),
                 )
                 try:
-                    dataset.save_episode(
-                        extra_episode_metadata=_episode_metadata(
+                    # Pi_05 pins LeRobot 0.4.4, whose public save_episode API
+                    # does not accept ``extra_episode_metadata``.  Training
+                    # fields are already regular frame features; persist the
+                    # remaining RoboDojo provenance in a version-independent
+                    # sidecar immediately after the LeRobot commit.
+                    dataset.save_episode()
+                    robodojo_metadata_path = _write_robodojo_episode_metadata(
+                        config.dataset_root,
+                        episode_index,
+                        _episode_metadata(
                             metadata,
                             success=success,
                             reason=reason,
                             has_intervention=has_intervention,
                             frame_count=frame_count,
-                        )
+                        ),
                     )
                     _finalize_dataset(dataset)
                     marker = config.dataset_root / _STAGING_MARKER
@@ -816,6 +869,7 @@ def serve(
                         "dataset_root": str(config.dataset_root),
                         "episode_index": episode_index,
                         "frame_count": frame_count,
+                        "robodojo_metadata_path": str(robodojo_metadata_path),
                     },
                 )
                 return 0

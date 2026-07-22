@@ -84,8 +84,16 @@ class _FakeDataset:
         self.frames.clear()
         self._streaming_encoder._dropped_frames.clear()
 
-    def save_episode(self, extra_episode_metadata=None):
-        self.saves.append(dict(extra_episode_metadata or {}))
+    # Match the LeRobot 0.4.4 API pinned by Pi_05/openpi.  In particular this
+    # fake must reject the newer ``extra_episode_metadata`` keyword so the
+    # production incompatibility cannot slip through the test again.
+    def save_episode(self, episode_data=None, parallel_encoding=True):
+        self.saves.append(
+            {
+                "episode_data": episode_data,
+                "parallel_encoding": parallel_encoding,
+            }
+        )
         self.meta.total_episodes += 1
         self.frames.clear()
 
@@ -103,7 +111,8 @@ class _MutatingFailDataset(_FakeDataset):
         self.outside_target = outside_target
         self.events = events if events is not None else []
 
-    def save_episode(self, extra_episode_metadata=None):
+    def save_episode(self, episode_data=None, parallel_encoding=True):
+        del episode_data, parallel_encoding
         self.events.append("save")
         (self.root / "meta" / "info.json").write_bytes(b"mutated-info")
         (self.root / "meta" / "stats.json").write_bytes(b"mutated-stats")
@@ -214,8 +223,17 @@ class LeRobotStreamWriterTest(unittest.TestCase):
             )
             self.assertEqual(dataset.clears, 1)
             self.assertEqual(len(dataset.saves), 1)
-            self.assertEqual(dataset.saves[0]["robodojo_layout_cycle"], 2)
-            self.assertTrue(dataset.saves[0]["robodojo_success"])
+            self.assertIsNone(dataset.saves[0]["episode_data"])
+            metadata_path = (
+                dataset_root
+                / writer._ROBODOJO_EPISODE_METADATA_DIR
+                / "episode_0000000.json"
+            )
+            self.assertTrue(metadata_path.is_file())
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["episode_index"], 0)
+            self.assertEqual(metadata["robodojo_layout_cycle"], 2)
+            self.assertTrue(metadata["robodojo_success"])
             self.assertEqual(dataset.finalized, 1)
 
     def test_failed_later_commit_restores_exact_tree_and_metadata(self):
