@@ -27,6 +27,8 @@ Options:
   --policy-env PATH       Pi0.5 uv environment or 'uv' (default: uv)
   --pos-step METERS       Translation per 25 Hz tick (default: 0.005)
   --rot-step RADIANS      Rotation per 25 Hz tick (default: 0.02)
+  --rendering-mode MODE   Camera render preset: quality/balanced/performance
+                          (default: quality; use performance only when needed)
   -h, --help              Show this help
 
 The Isaac Sim window must be visible and focused for keyboard events.
@@ -51,6 +53,7 @@ env_gpu="0"
 policy_env="uv"
 pos_step="0.005"
 rot_step="0.02"
+rendering_mode="quality"
 lerobot_repo_id=""
 lerobot_root="/home/piper/data/lerobot"
 lerobot_max="1000000"
@@ -73,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --policy-env) need_value "$@"; policy_env="$2"; shift 2 ;;
     --pos-step) need_value "$@"; pos_step="$2"; shift 2 ;;
     --rot-step) need_value "$@"; rot_step="$2"; shift 2 ;;
+    --rendering-mode) need_value "$@"; rendering_mode="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[collect_pi05_keyboard] Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -83,6 +87,13 @@ if [[ -z "${task}" || -z "${ckpt}" ]]; then
   usage >&2
   exit 2
 fi
+case "${rendering_mode}" in
+  quality|balanced|performance) ;;
+  *)
+    echo "[collect_pi05_keyboard] --rendering-mode must be quality, balanced, or performance" >&2
+    exit 2
+    ;;
+esac
 if [[ "${record_dir}" != /* ]]; then
   record_dir="${ROOT_DIR}/${record_dir}"
 fi
@@ -109,9 +120,12 @@ export ROBODOJO_RECORD_DIR="${record_dir}"
 export ROBODOJO_REALTIME="1"
 export ROBODOJO_TELEOP_POS_STEP="${pos_step}"
 export ROBODOJO_TELEOP_ROT_STEP="${rot_step}"
+export ROBODOJO_RENDERING_MODE="${rendering_mode}"
+export ROBODOJO_HIDE_ISAACLAB_WINDOW="1"
 
 echo "[collect_pi05_keyboard] task=${task} ckpt=${ckpt} episodes=${episodes}"
 echo "[collect_pi05_keyboard] record_dir=${record_dir}"
+echo "[collect_pi05_keyboard] rendering_mode=${rendering_mode}"
 
 bash "${ROOT_DIR}/scripts/robodojo.sh" eval \
   --policy-dir "${ROOT_DIR}/XPolicyLab/policy/Pi_05" \

@@ -1,4 +1,5 @@
 from collections.abc import Sequence, Sequence as SequenceABC
+import os
 from typing import Any
 
 import gymnasium as gym
@@ -59,6 +60,8 @@ DEFAULT_RENDER_CONFIG = {
 DEFAULT_FREQUENCY_SETTINGS = {
     "/app/runLoops/main/rateLimitFrequency": 125,
 }
+
+_RENDERING_MODES = {"performance", "balanced", "quality"}
 
 _RENDER_KEYS = tuple(k for k in DEFAULT_RENDER_CONFIG if k != "carb_settings")
 
@@ -151,6 +154,11 @@ class BaseEnv(gym.Env):
         except Exception:
             traceback.print_exc()
             raise
+        if os.environ.get("ROBODOJO_HIDE_ISAACLAB_WINDOW") == "1":
+            window = getattr(self.sim.unwrapped, "_window", None)
+            if window is not None and window.ui_window is not None:
+                window.ui_window.visible = False
+                print("[INFO] IsaacLab control panel hidden for keyboard collection.")
         self.env_spacing = config.scene.env_spacing
         self.sim.env_spacing = self.env_spacing
         self.env_origins = self.sim.scene.env_origins
@@ -173,6 +181,14 @@ class BaseEnv(gym.Env):
         """
         physx_config = _resolve_sim_section(DEFAULT_PHYSX_CONFIG, self.config.get("physx"))
         render_config = _resolve_sim_section(DEFAULT_RENDER_CONFIG, self.config.get("render"))
+        rendering_mode_override = os.environ.get("ROBODOJO_RENDERING_MODE")
+        if rendering_mode_override:
+            if rendering_mode_override not in _RENDERING_MODES:
+                raise ValueError(
+                    f"ROBODOJO_RENDERING_MODE must be one of {sorted(_RENDERING_MODES)}, "
+                    f"got {rendering_mode_override!r}"
+                )
+            render_config["rendering_mode"] = rendering_mode_override
         frequency_settings = _resolve_sim_section(
             DEFAULT_FREQUENCY_SETTINGS,
             self.config.get("frequency_settings"),
