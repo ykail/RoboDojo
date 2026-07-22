@@ -18,9 +18,9 @@ except ImportError:
 
 
 class KeyboardStateTest(unittest.TestCase):
-    def test_deadman_axes_arm_and_one_shot_commands(self):
+    def test_i_toggle_axes_arm_and_one_shot_commands(self):
         state = KeyboardState(pos_step=0.005, rot_step=0.02)
-        state.handle_key("SPACE", True)
+        state.handle_key("KEY_I", True)
         state.handle_key("W", True)
         state.handle_key("A", True)
         state.handle_key("KEY_2", True)
@@ -40,21 +40,44 @@ class KeyboardStateTest(unittest.TestCase):
 
         state.handle_key("W", False)
         state.handle_key("A", False)
-        state.handle_key("SPACE", False)
-        released = state.snapshot()
-        self.assertFalse(released.deadman)
-        self.assertTrue(released.takeover_released)
-        np.testing.assert_allclose(released.delta_pose, np.zeros(6))
+        state.handle_key("KEY_I", False)
+        key_released = state.snapshot()
+        self.assertTrue(key_released.deadman)
+        self.assertFalse(key_released.takeover_released)
+
+        state.handle_key("I", True)
+        toggled_off = state.snapshot()
+        self.assertFalse(toggled_off.deadman)
+        self.assertTrue(toggled_off.takeover_released)
+        np.testing.assert_allclose(toggled_off.delta_pose, np.zeros(6))
 
     def test_repeat_press_does_not_toggle_twice(self):
         state = KeyboardState()
-        state.handle_key("SPACE", True)
+        state.handle_key("I", True)
+        state.handle_key("I", True)
+        first = state.snapshot()
+        self.assertTrue(first.deadman)
+        self.assertTrue(first.takeover_pressed)
+        self.assertFalse(state.snapshot().takeover_pressed)
+
+        # I is a latch: releasing it leaves manual gripper control active.
+        state.handle_key("I", False)
         state.handle_key("K", True)
         state.handle_key("K", True)
         self.assertEqual(state.snapshot().gripper_toggles, ("left",))
         state.handle_key("K", False)
         state.handle_key("K", True)
         self.assertEqual(state.snapshot().gripper_toggles, ("left",))
+
+        state.handle_key("I", True)
+        self.assertFalse(state.snapshot().deadman)
+
+    def test_space_does_not_enable_takeover(self):
+        state = KeyboardState()
+        state.handle_key("SPACE", True)
+        snapshot = state.snapshot()
+        self.assertFalse(snapshot.deadman)
+        self.assertFalse(snapshot.takeover_pressed)
 
     def test_save_retry_is_one_shot_and_repeat_resistant(self):
         state = KeyboardState()
@@ -66,19 +89,49 @@ class KeyboardStateTest(unittest.TestCase):
         state.handle_key("R", True)
         self.assertTrue(state.snapshot().save_retry_requested)
 
-    def test_gripper_toggle_requires_deadman_and_timeout_releases(self):
+    def test_gripper_requires_takeover_and_timeout_only_stops_motion(self):
         now = [0.0]
         state = KeyboardState(deadman_timeout=2.0, clock=lambda: now[0])
         state.handle_key("K", True)
         self.assertEqual(state.snapshot().gripper_toggles, ())
         state.handle_key("K", False)
-        state.handle_key("SPACE", True)
+        state.handle_key("I", True)
         state.handle_key("W", True)
         now[0] = 2.1
+        snapshot = state.snapshot()
+        self.assertTrue(snapshot.deadman)
+        self.assertFalse(snapshot.takeover_released)
+        np.testing.assert_allclose(snapshot.delta_pose, np.zeros(6))
+
+        # Clearing stale held keys makes a subsequent I press a real edge.
+        state.handle_key("I", True)
+        toggled_off = state.snapshot()
+        self.assertFalse(toggled_off.deadman)
+        self.assertTrue(toggled_off.takeover_released)
+
+    def test_l_emergency_exits_takeover(self):
+        state = KeyboardState()
+        state.handle_key("I", True)
+        state.handle_key("I", False)
+        state.snapshot()
+        state.handle_key("W", True)
+        state.handle_key("L", True)
+        state.handle_key("L", True)
         snapshot = state.snapshot()
         self.assertFalse(snapshot.deadman)
         self.assertTrue(snapshot.takeover_released)
         np.testing.assert_allclose(snapshot.delta_pose, np.zeros(6))
+
+    def test_l_preserves_an_i_toggle_off_release_edge(self):
+        state = KeyboardState()
+        state.handle_key("I", True)
+        state.handle_key("I", False)
+        state.snapshot()
+        state.handle_key("I", True)
+        state.handle_key("L", True)
+        snapshot = state.snapshot()
+        self.assertFalse(snapshot.deadman)
+        self.assertTrue(snapshot.takeover_released)
 
     @unittest.skipUnless(HAS_TRANSFORMS3D, "transforms3d is available in the RoboDojo runtime")
     def test_pose_delta_is_world_frame_and_quaternion_is_normalized(self):

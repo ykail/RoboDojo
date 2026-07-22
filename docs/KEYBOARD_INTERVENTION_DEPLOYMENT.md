@@ -382,9 +382,18 @@ bash scripts/RoboDojo/collect_pi05_keyboard.sh \
   --env-gpu 0
 ```
 
+With `--episodes 1`, a natural task success, the task step limit, or
+`N`/`Enter` completes the one requested rollout, after which the evaluator
+closes Isaac Sim normally. Use a larger value to keep the same process open;
+`stack_bowls` supports up to 25 layouts. `R` saves and reloads the same layout
+without consuming that count, while `Backspace` rejects and reloads it.
+
 The wrapper starts both the Pi0.5 policy server and Isaac Sim. Do not start a
 second policy server manually. Keep the Isaac Sim window focused for keyboard
 events.
+
+Press plain `I` once to enter manual control and again to return to Pi0.5. Do
+not use `Space`: Isaac Sim binds it to Play/Pause.
 
 To rebuild a Kai0-compatible LeRobot v3 dataset after collection, add:
 

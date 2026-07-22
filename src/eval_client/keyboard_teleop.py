@@ -30,6 +30,7 @@ _ROTATION_KEYS = {
     "C": np.array([0.0, 0.0, 1.0]),
     "V": np.array([0.0, 0.0, -1.0]),
 }
+_MOTION_KEYS = frozenset(_TRANSLATION_KEYS) | frozenset(_ROTATION_KEYS)
 
 
 def _normalise_key_name(name: str) -> str:
@@ -37,6 +38,7 @@ def _normalise_key_name(name: str) -> str:
     aliases = {
         " ": "SPACE",
         "RETURN": "ENTER",
+        "KEY_I": "I",
         "KEY_1": "1",
         "NUM_1": "1",
         "KEY_2": "2",
@@ -62,7 +64,7 @@ class KeyboardSnapshot:
 
 
 class KeyboardState:
-    """Thread-safe, repeat-resistant state machine used by the Kit callback."""
+    """Thread-safe, repeat-resistant toggle state machine used by Kit."""
 
     def __init__(
         self,
@@ -83,6 +85,7 @@ class KeyboardState:
         self._lock = threading.Lock()
         self._held: set[str] = set()
         self._active_arm = "left"
+        self._takeover_active = False
         self._gripper_toggles: list[str] = []
         self._takeover_pressed = False
         self._takeover_released = False
@@ -100,15 +103,20 @@ class KeyboardState:
                 if key in self._held:
                     return
                 self._held.add(key)
-                if key == "SPACE":
-                    self._takeover_pressed = True
+                if key == "I":
+                    # Requiring a release before another press makes the
+                    # toggle immune to duplicate KEY_PRESS and KEY_REPEAT.
+                    self._held.difference_update(_MOTION_KEYS)
+                    self._takeover_active = not self._takeover_active
+                    self._takeover_pressed = self._takeover_active
+                    self._takeover_released = not self._takeover_active
                 elif key == "1" and self._active_arm != "left":
                     self._active_arm = "left"
                     self._arm_changed = True
                 elif key == "2" and self._active_arm != "right":
                     self._active_arm = "right"
                     self._arm_changed = True
-                elif key == "K" and "SPACE" in self._held:
+                elif key == "K" and self._takeover_active:
                     self._gripper_toggles.append(self._active_arm)
                 elif key in {"N", "ENTER"}:
                     self._accept_requested = True
@@ -117,12 +125,14 @@ class KeyboardState:
                 elif key == "BACKSPACE":
                     self._abort_requested = True
                 elif key == "L":
+                    was_active = self._takeover_active
+                    self._takeover_active = False
                     self._held.clear()
-                    self._takeover_released = True
+                    self._held.add("L")
+                    self._takeover_pressed = False
+                    self._takeover_released = self._takeover_released or was_active
             else:
                 self._held.discard(key)
-                if key == "SPACE":
-                    self._takeover_released = True
 
     def touch(self) -> None:
         """Refresh the input heartbeat for a held key-repeat event."""
@@ -132,9 +142,10 @@ class KeyboardState:
     def snapshot(self) -> KeyboardSnapshot:
         """Read current held keys and consume one-shot operator commands."""
         with self._lock:
-            if "SPACE" in self._held and self._clock() - self._last_input_time > self.deadman_timeout:
+            # A lost release must stop Cartesian motion, but a timeout must
+            # never silently hand control back to the policy in toggle mode.
+            if self._held and self._clock() - self._last_input_time > self.deadman_timeout:
                 self._held.clear()
-                self._takeover_released = True
             translation = sum(
                 (_TRANSLATION_KEYS[key] for key in self._held if key in _TRANSLATION_KEYS),
                 start=np.zeros(3),
@@ -144,7 +155,9 @@ class KeyboardState:
                 start=np.zeros(3),
             )
             snapshot = KeyboardSnapshot(
-                deadman="SPACE" in self._held,
+                # The field name is kept for compatibility; it now represents
+                # the latched intervention-active state.
+                deadman=self._takeover_active,
                 active_arm=self._active_arm,
                 delta_pose=np.concatenate([translation * self.pos_step, rotation * self.rot_step]),
                 gripper_toggles=tuple(self._gripper_toggles),
@@ -214,11 +227,11 @@ class KitKeyboardDevice:
     @staticmethod
     def help_text() -> str:
         return (
-            "Space(hold)=take over | 1/2=left/right arm | "
+            "I=toggle manual control on/off | 1/2=left/right arm | "
             "W/S x, A/D y, Q/E z | Z/X roll, T/G pitch, C/V yaw | "
-            "Space+K=toggle selected gripper | N or Enter=save/finish | "
+            "K=toggle selected gripper while manual | N or Enter=save/finish | "
             "R=save/retry same layout | Backspace=reject/retry same layout | "
-            "L=clear held keys"
+            "L=emergency manual-off/clear held keys"
         )
 
 
