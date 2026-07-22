@@ -8,5 +8,5 @@
 	branch = main
 [submodule "XPolicyLab"]
 	path = XPolicyLab
-	url = https://github.com/XPolicyLab/XPolicyLab.git
-	branch = main
+	url = https://github.com/ykail/XPolicyLab.git
+	branch = feat/robodojo-pi05-runtime
