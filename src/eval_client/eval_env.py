@@ -186,12 +186,20 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             evaluation_id = self.deploy_cfg.get("evaluation_id", self.run_id)
             trial_id = self.deploy_cfg.get("trial_id", f"{self.task_name}-{self.run_id}")
             action_case_id = self.deploy_cfg.get("action_case_id", f"{self.task_name}_case")
+            ws_request_timeout_s = self.deploy_cfg.get("ws_request_timeout_s")
+            ws_ping_interval_s = self.deploy_cfg.get("ws_ping_interval_s")
+            ws_ping_timeout_s = self.deploy_cfg.get("ws_ping_timeout_s")
+            ws_keepalive = self.deploy_cfg.get("ws_keepalive")
             self.model_client = WsModelClient(
                 url=policy_server_url,
                 evaluation_id=evaluation_id,
                 trial_id=trial_id,
                 action_case_id=action_case_id,
                 repeat_index=self.deploy_cfg.get("repeat_index"),
+                request_timeout_s=ws_request_timeout_s,
+                ws_ping_interval_s=ws_ping_interval_s,
+                ws_ping_timeout_s=ws_ping_timeout_s,
+                ws_keepalive=ws_keepalive,
             )
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
 

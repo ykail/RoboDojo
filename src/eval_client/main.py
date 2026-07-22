@@ -136,10 +136,9 @@ from utils.pipeline_utils import *
 BENCHMARK_PATH = os.path.join(ROOT_DIR, "task", BENCHMARK)
 
 
-def _eval_batch_from_deploy(policy_name):
+def _load_policy_deploy(policy_name):
     deploy_yml_path = os.path.join(ROOT_DIR, "XPolicyLab", "policy", policy_name, "deploy.yml")
-    deploy_yml = load_yaml(deploy_yml_path) if os.path.isfile(deploy_yml_path) else {}
-    return bool(deploy_yml.get("eval_batch", False))
+    return load_yaml(deploy_yml_path) if os.path.isfile(deploy_yml_path) else {}
 
 
 def _resume_manifest_path(eval_cfg, run_id):
@@ -276,7 +275,8 @@ def main():
     eval_cfg["task_name"] = task_name
     eval_cfg["num_envs"] = num_envs
     eval_cfg["device_id"] = args_cli.device_id
-    eval_batch = _eval_batch_from_deploy(args_cli.policy_name)
+    policy_deploy_cfg = _load_policy_deploy(args_cli.policy_name)
+    eval_batch = bool(policy_deploy_cfg.get("eval_batch", False))
     eval_cfg["eval_batch"] = eval_batch
     eval_cfg["policy_name"] = args_cli.policy_name
     eval_cfg["additional_info"] = args_cli.additional_info
@@ -295,6 +295,9 @@ def main():
     deploy_cfg["trial_id"] = f"{task_name}-{os.environ['ROBODOJO_RUN_ID']}"
     deploy_cfg["action_case_id"] = f"{task_name}_case"
     deploy_cfg["repeat_index"] = None
+    for key in ("ws_keepalive", "ws_ping_interval_s", "ws_ping_timeout_s", "ws_request_timeout_s"):
+        if key in policy_deploy_cfg:
+            deploy_cfg[key] = policy_deploy_cfg[key]
     env_cfg = OmegaConf.create(
         {
             "sim": load_yaml(os.path.join(ENV_CONFIG_PATH, "sim", eval_cfg["config"]["sim"] + ".yml")),
