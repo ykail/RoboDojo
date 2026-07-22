@@ -83,8 +83,8 @@ def run_keyboard_intervention_episode(
 ):
     """Run one single-env episode with immediate human preemption.
 
-    A Space press replaces the *current* policy target with a human target and
-    discards the rest of that policy chunk.  Releasing Space causes the next
+    Toggling I on replaces the *current* policy target with a human target and
+    discards the rest of that policy chunk. Toggling I off causes the next
     policy inference to use the latest post-intervention observation.
     """
     if task_env.num_envs != 1:
@@ -128,7 +128,7 @@ def run_keyboard_intervention_episode(
 
     def read_keyboard():
         # Kit dispatches GUI input while the app updates.  Pump one render here
-        # so a Space press made during a slow policy inference is observed
+        # so an I toggle made during a slow policy inference is observed
         # before the first target from that new chunk can execute.
         render = getattr(task_env, "render", None)
         if callable(render):
@@ -171,6 +171,8 @@ def run_keyboard_intervention_episode(
                 break
 
             if snapshot.deadman:
+                if snapshot.takeover_pressed:
+                    print("\n[Intervention] manual control ON (I toggled).")
                 action, control = controller.build_action(obs, snapshot)
                 control.update(
                     {
@@ -184,6 +186,7 @@ def run_keyboard_intervention_episode(
 
             if snapshot.takeover_released:
                 pending_release_edge = -1
+                print("\n[Intervention] manual control OFF; requesting a fresh policy chunk.")
 
             chunk = _get_action_chunk(task_env, model_client)
             chunk_id += 1
@@ -224,7 +227,7 @@ def run_keyboard_intervention_episode(
                     )
                     stale_chunk = True
                     print(
-                        f"\n[Intervention] takeover at chunk={chunk_id} index={chunk_index}; "
+                        f"\n[Intervention] manual control ON at chunk={chunk_id} index={chunk_index}; "
                         f"discarded {len(chunk) - chunk_index} stale target(s)."
                     )
                     break

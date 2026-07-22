@@ -15,7 +15,7 @@ Required:
 
 Options:
   --record-dir PATH       HDF5 root (default: /home/piper/data/RoboDojo_interventions)
-  --episodes NUM          Requested layouts/episodes, capped by task config (default: 1)
+  --episodes NUM          Counted rollouts before normal exit (success/fail), task-capped (default: 1)
   --lerobot-repo-id ID    Also rebuild a Kai0-compatible LeRobot v3 dataset after collection
   --lerobot-root PATH     LeRobot base directory (default: /home/piper/data/lerobot)
   --lerobot-max NUM       Maximum HDF5 episodes to export (default: 1000000)
@@ -112,6 +112,8 @@ export ROBODOJO_TELEOP_ROT_STEP="${rot_step}"
 
 echo "[collect_pi05_keyboard] task=${task} ckpt=${ckpt} episodes=${episodes}"
 echo "[collect_pi05_keyboard] record_dir=${record_dir}"
+echo "[collect_pi05_keyboard] On normal completion, Isaac Sim exits at the requested task-capped rollout count;"
+echo "[collect_pi05_keyboard] R saves/retries the same layout without consuming that count."
 
 bash "${ROOT_DIR}/scripts/robodojo.sh" eval \
   --policy-dir "${ROOT_DIR}/XPolicyLab/policy/Pi_05" \

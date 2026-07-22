@@ -25,13 +25,16 @@ single environment.  Keep the Isaac Sim window focused while operating.
 It explicitly sets `ROBODOJO_HEADLESS=0`, `HEADLESS=0`, and `LIVESTREAM=0`;
 launch it from a graphical Piper session with a valid display. `--episodes`
 is a requested count and remains capped by the task's configured number of
-evaluation layouts.
+evaluation layouts. Reaching that count closes Isaac Sim normally; natural
+success, the task step limit, and `N`/`Enter` each complete one rollout. For
+example, `stack_bowls` supports up to 25 layouts, while `R` and `Backspace`
+retry the same layout without consuming that count.
 
 ## Controls
 
 | Key | Effect |
 | --- | --- |
-| Hold `Space` | Take control. Releasing it returns to Pi0.5. |
+| `I` | Toggle manual control: first press takes over; second press returns to Pi0.5. |
 | `1` / `2` | Select left / right arm. |
 | `W` / `S` | End-effector +x / -x in the environment frame. |
 | `A` / `D` | End-effector +y / -y. |
@@ -39,25 +42,29 @@ evaluation layouts.
 | `Z` / `X` | Roll + / -. |
 | `T` / `G` | Pitch + / -. |
 | `C` / `V` | Yaw + / -. |
-| `Space` + `K` | Toggle the selected gripper while in control. |
-| `N` or `Enter` | Save, then advance to the next layout. |
+| `K` | Toggle the selected gripper while manual control is active. |
+| `N` or `Enter` | Save and finish this rollout; advance only if another requested layout remains. |
 | `R` | Save, then restore the same layout for another correction. |
 | `Backspace` | Reject the attempt; keep no HDF5 and retry the same layout. |
-| `L` | Clear held-key state if window focus was lost. |
+| `L` | Emergency manual-control exit and clear held keys. |
 
-`Space` is a deadman/clutch key; it does not enable mouse dragging.  On the
-press edge, the selected Cartesian target is anchored to the arm's measured
-end-effector pose.  The inactive arm explicitly holds its measured joints.
-The deadman state also expires after two seconds without any keyboard event;
-normal OS key-repeat refreshes this heartbeat. This limits sustained motion if
-the window loses focus and a release event is missed.
+Use the plain `I` key, without Ctrl or Shift. It is a latched mode switch, not a
+mouse-drag command: releasing `I` does not end manual control. On the first
+press, the selected Cartesian target is anchored to the arm's measured
+end-effector pose. The inactive arm explicitly holds its measured joints. A
+second press returns control to Pi0.5. `Space` is deliberately unused because
+Isaac Sim binds it to Play/Pause.
+
+If window focus is lost, two seconds without keyboard events clears potentially
+stuck motion keys but keeps manual control active and the robot holding. Press
+`I` to return to Pi0.5, or `L` for an emergency manual-control exit.
 
 ## Chunk and safety behavior
 
-Pi0.5 normally returns 50 joint targets (about two seconds at 25 Hz).  If the
-operator presses `Space` at target `k`, target `k` and every later target in
-that chunk are discarded.  After release, a fresh chunk is inferred from the
-latest post-correction observation; the old chunk is never resumed.
+Pi0.5 normally returns 50 joint targets (about two seconds at 25 Hz). If the
+operator toggles `I` on at target `k`, target `k` and every later target in
+that chunk are discarded. After `I` is toggled off, a fresh chunk is inferred
+from the latest post-correction observation; the old chunk is never resumed.
 
 Each Cartesian keyboard delta is solved to a complete 14-dimensional dual-arm
 joint target.  A non-finite, failed, or excessively discontinuous IK result
