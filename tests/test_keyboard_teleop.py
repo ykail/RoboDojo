@@ -155,6 +155,25 @@ class KeyboardStateTest(unittest.TestCase):
         state.handle_key("I", True)
         self.assertTrue(state.snapshot().deadman)
 
+    def test_l_interlock_survives_held_key_timeout(self):
+        now = [0.0]
+        state = KeyboardState(deadman_timeout=2.0, clock=lambda: now[0])
+        state.handle_key("I", True)
+        state.handle_key("L", True)
+
+        now[0] = 2.1
+        timed_out = state.snapshot()
+        self.assertFalse(timed_out.deadman)
+        self.assertTrue(timed_out.takeover_released)
+
+        # Timeout clears held motion keys, but cannot clear an emergency latch.
+        state.handle_key("I", True)
+        self.assertFalse(state.snapshot().deadman)
+
+        state.handle_key("L", False)
+        state.handle_key("I", True)
+        self.assertTrue(state.snapshot().deadman)
+
     @unittest.skipUnless(HAS_TRANSFORMS3D, "transforms3d is available in the RoboDojo runtime")
     def test_pose_delta_is_world_frame_and_quaternion_is_normalized(self):
         pose = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])

@@ -86,6 +86,7 @@ class KeyboardState:
         self._held: set[str] = set()
         self._active_arm = "left"
         self._takeover_active = False
+        self._emergency_interlock = False
         self._gripper_toggles: list[str] = []
         self._takeover_pressed = False
         self._takeover_released = False
@@ -104,7 +105,7 @@ class KeyboardState:
                     return
                 # L is an emergency-off interlock. Do not permit a fresh I
                 # edge until L has physically been released.
-                if key == "I" and "L" in self._held:
+                if key == "I" and self._emergency_interlock:
                     return
                 self._held.add(key)
                 if key == "I":
@@ -131,6 +132,7 @@ class KeyboardState:
                 elif key == "L":
                     was_active = self._takeover_active
                     self._takeover_active = False
+                    self._emergency_interlock = True
                     # Clear motion/command keys, but preserve a physically
                     # held I so a duplicate KEY_PRESS cannot re-arm takeover.
                     self._held.intersection_update({"I", "L"})
@@ -138,6 +140,8 @@ class KeyboardState:
                     self._takeover_released = self._takeover_released or was_active
             else:
                 self._held.discard(key)
+                if key == "L":
+                    self._emergency_interlock = False
 
     def touch(self) -> None:
         """Refresh the input heartbeat for a held key-repeat event."""
