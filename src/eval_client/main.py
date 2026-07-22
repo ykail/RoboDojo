@@ -128,7 +128,7 @@ from omegaconf import OmegaConf
 
 from env.global_configs import *
 from src.eval_client.eval_env import create_eval_env
-from src.eval_client.intervention_loop import InterventionRejected
+from src.eval_client.intervention_loop import InterventionRejected, InterventionSavedForRetry
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
@@ -393,6 +393,13 @@ def main():
             env.seed_manager.eval_step()
         except InterventionRejected:
             print("[Intervention] rejected attempt does not count; retrying the same layout.")
+            env.close()
+            retry_round = True
+        except InterventionSavedForRetry as request:
+            print(
+                "[Intervention] saved attempt does not consume the layout; "
+                f"resetting the same layout. file={request.saved_path}"
+            )
             env.close()
             retry_round = True
         except Exception as e:

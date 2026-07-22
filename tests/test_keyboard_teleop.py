@@ -56,6 +56,16 @@ class KeyboardStateTest(unittest.TestCase):
         state.handle_key("K", True)
         self.assertEqual(state.snapshot().gripper_toggles, ("left",))
 
+    def test_save_retry_is_one_shot_and_repeat_resistant(self):
+        state = KeyboardState()
+        state.handle_key("R", True)
+        state.handle_key("R", True)
+        self.assertTrue(state.snapshot().save_retry_requested)
+        self.assertFalse(state.snapshot().save_retry_requested)
+        state.handle_key("R", False)
+        state.handle_key("R", True)
+        self.assertTrue(state.snapshot().save_retry_requested)
+
     def test_gripper_toggle_requires_deadman_and_timeout_releases(self):
         now = [0.0]
         state = KeyboardState(deadman_timeout=2.0, clock=lambda: now[0])

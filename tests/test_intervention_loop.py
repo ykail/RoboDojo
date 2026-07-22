@@ -3,17 +3,22 @@ import unittest
 
 import numpy as np
 
-from src.eval_client.intervention_loop import InterventionRejected, run_keyboard_intervention_episode
+from src.eval_client.intervention_loop import (
+    InterventionRejected,
+    InterventionSavedForRetry,
+    run_keyboard_intervention_episode,
+)
 from src.eval_client.keyboard_teleop import KeyboardSnapshot
 
 
-def _snapshot(*, deadman=False, pressed=False, released=False):
+def _snapshot(*, deadman=False, pressed=False, released=False, save_retry=False):
     return KeyboardSnapshot(
         deadman=deadman,
         active_arm="left",
         delta_pose=np.zeros(6),
         takeover_pressed=pressed,
         takeover_released=released,
+        save_retry_requested=save_retry,
     )
 
 
@@ -149,6 +154,27 @@ class InterventionLoopTest(unittest.TestCase):
         self.assertEqual(env.actions, [])
         self.assertEqual(model.chunk_number, 0)
         self.assertFalse(recorder.finalized["accepted"])
+
+    def test_save_retry_keeps_episode_and_requests_same_layout(self):
+        env = FakeEnv()
+        model = FakeModel()
+        recorder = FakeRecorder()
+        keyboard = FakeKeyboard([_snapshot(), _snapshot(), _snapshot(save_retry=True)])
+
+        with self.assertRaises(InterventionSavedForRetry) as raised:
+            run_keyboard_intervention_episode(
+                env,
+                model,
+                keyboard=keyboard,
+                controller=FakeController(),
+                recorder=recorder,
+                pace_realtime=False,
+            )
+
+        self.assertEqual(env.actions, [{"id": 0}])
+        self.assertEqual(raised.exception.saved_path, "fake.hdf5")
+        self.assertTrue(recorder.finalized["accepted"])
+        self.assertEqual(recorder.finalized["reason"], "operator_save_retry")
 
 
 if __name__ == "__main__":

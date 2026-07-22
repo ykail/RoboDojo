@@ -12,6 +12,14 @@ class InterventionRejected(Exception):
     """The operator rejected this attempt; the layout should be retried."""
 
 
+class InterventionSavedForRetry(Exception):
+    """The operator saved this attempt and requested the same layout again."""
+
+    def __init__(self, saved_path: str):
+        self.saved_path = saved_path
+        super().__init__(f"Saved {saved_path}; retry the same layout.")
+
+
 class RealtimePacer:
     """Prevent policy targets from being applied faster than their nominal rate."""
 
@@ -114,6 +122,7 @@ def run_keyboard_intervention_episode(
     chunk_id = -1
     pending_release_edge = 0
     accepted = True
+    retry_same_layout = False
     finish_reason = "environment_end"
     saved_path = None
 
@@ -151,6 +160,11 @@ def run_keyboard_intervention_episode(
                 finish_reason = "operator_abort"
                 _mark_operator_end(task_env, rejected=True)
                 break
+            if snapshot.save_retry_requested:
+                retry_same_layout = True
+                finish_reason = "operator_save_retry"
+                _mark_operator_end(task_env)
+                break
             if snapshot.accept_requested:
                 finish_reason = "operator_accept"
                 _mark_operator_end(task_env)
@@ -180,6 +194,12 @@ def run_keyboard_intervention_episode(
                     accepted = False
                     finish_reason = "operator_abort"
                     _mark_operator_end(task_env, rejected=True)
+                    stale_chunk = True
+                    break
+                if snapshot.save_retry_requested:
+                    retry_same_layout = True
+                    finish_reason = "operator_save_retry"
+                    _mark_operator_end(task_env)
                     stale_chunk = True
                     break
                 if snapshot.accept_requested:
@@ -240,7 +260,11 @@ def run_keyboard_intervention_episode(
         else:
             print("\n[Intervention] Episode rejected; no HDF5 file was kept.")
             raise InterventionRejected("Operator rejected the intervention episode.")
+        if retry_same_layout:
+            raise InterventionSavedForRetry(saved_path)
         return saved_path
+    except (InterventionRejected, InterventionSavedForRetry):
+        raise
     except Exception:
         recorder.finalize(accepted=False, success=False, reason="exception")
         raise

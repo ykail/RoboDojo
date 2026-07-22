@@ -57,6 +57,7 @@ class KeyboardSnapshot:
     takeover_released: bool = False
     arm_changed: bool = False
     accept_requested: bool = False
+    save_retry_requested: bool = False
     abort_requested: bool = False
 
 
@@ -87,6 +88,7 @@ class KeyboardState:
         self._takeover_released = False
         self._arm_changed = False
         self._accept_requested = False
+        self._save_retry_requested = False
         self._abort_requested = False
 
     def handle_key(self, key_name: str, pressed: bool) -> None:
@@ -110,6 +112,8 @@ class KeyboardState:
                     self._gripper_toggles.append(self._active_arm)
                 elif key in {"N", "ENTER"}:
                     self._accept_requested = True
+                elif key == "R":
+                    self._save_retry_requested = True
                 elif key == "BACKSPACE":
                     self._abort_requested = True
                 elif key == "L":
@@ -148,6 +152,7 @@ class KeyboardState:
                 takeover_released=self._takeover_released,
                 arm_changed=self._arm_changed,
                 accept_requested=self._accept_requested,
+                save_retry_requested=self._save_retry_requested,
                 abort_requested=self._abort_requested,
             )
             self._gripper_toggles.clear()
@@ -155,6 +160,7 @@ class KeyboardState:
             self._takeover_released = False
             self._arm_changed = False
             self._accept_requested = False
+            self._save_retry_requested = False
             self._abort_requested = False
             return snapshot
 
@@ -211,7 +217,8 @@ class KitKeyboardDevice:
             "Space(hold)=take over | 1/2=left/right arm | "
             "W/S x, A/D y, Q/E z | Z/X roll, T/G pitch, C/V yaw | "
             "Space+K=toggle selected gripper | N or Enter=save/finish | "
-            "Backspace=reject/abort | L=clear held keys"
+            "R=save/retry same layout | Backspace=reject/retry same layout | "
+            "L=clear held keys"
         )
 
 

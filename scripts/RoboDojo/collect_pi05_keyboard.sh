@@ -16,6 +16,10 @@ Required:
 Options:
   --record-dir PATH       HDF5 root (default: /home/piper/data/RoboDojo_interventions)
   --episodes NUM          Requested layouts/episodes, capped by task config (default: 1)
+  --lerobot-repo-id ID    Also rebuild a Kai0-compatible LeRobot v3 dataset after collection
+  --lerobot-root PATH     LeRobot base directory (default: /home/piper/data/lerobot)
+  --lerobot-max NUM       Maximum HDF5 episodes to export (default: 1000000)
+  --lerobot-vcodec NAME   CPU video codec: h264/hevc/libsvtav1 (default: h264)
   --seed NUM              Layout seed (default: 0)
   --env-cfg NAME          Robot config (default: arx_x5)
   --policy-gpu ID         Pi0.5 server GPU (default: 0)
@@ -47,6 +51,10 @@ env_gpu="0"
 policy_env="uv"
 pos_step="0.005"
 rot_step="0.02"
+lerobot_repo_id=""
+lerobot_root="/home/piper/data/lerobot"
+lerobot_max="1000000"
+lerobot_vcodec="h264"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,6 +62,10 @@ while [[ $# -gt 0 ]]; do
     --ckpt) need_value "$@"; ckpt="$2"; shift 2 ;;
     --record-dir) need_value "$@"; record_dir="$2"; shift 2 ;;
     --episodes) need_value "$@"; episodes="$2"; shift 2 ;;
+    --lerobot-repo-id) need_value "$@"; lerobot_repo_id="$2"; shift 2 ;;
+    --lerobot-root) need_value "$@"; lerobot_root="$2"; shift 2 ;;
+    --lerobot-max) need_value "$@"; lerobot_max="$2"; shift 2 ;;
+    --lerobot-vcodec) need_value "$@"; lerobot_vcodec="$2"; shift 2 ;;
     --seed) need_value "$@"; seed="$2"; shift 2 ;;
     --env-cfg) need_value "$@"; env_cfg="$2"; shift 2 ;;
     --policy-gpu) need_value "$@"; policy_gpu="$2"; shift 2 ;;
@@ -113,3 +125,27 @@ bash "${ROOT_DIR}/scripts/robodojo.sh" eval \
   --policy-env "${policy_env}" \
   --eval-env RoboDojo \
   --eval-num "${episodes}"
+
+if [[ -n "${lerobot_repo_id}" ]]; then
+  lerobot_python="${ROOT_DIR}/XPolicyLab/policy/Pi_05/openpi/.venv/bin/python"
+  if [[ ! -x "${lerobot_python}" ]]; then
+    echo "[collect_pi05_keyboard] LeRobot exporter environment not found: ${lerobot_python}" >&2
+    echo "[collect_pi05_keyboard] HDF5 trajectories are safe; run Pi_05/install.sh before exporting." >&2
+    exit 1
+  fi
+  if [[ "${lerobot_root}" != /* ]]; then
+    lerobot_root="${ROOT_DIR}/${lerobot_root}"
+  fi
+  mkdir -p "${lerobot_root}"
+  lerobot_root="$(cd "${lerobot_root}" && pwd)"
+  echo "[collect_pi05_keyboard] exporting LeRobot v3 (CPU ${lerobot_vcodec})"
+  echo "[collect_pi05_keyboard] lerobot_root=${lerobot_root}/${lerobot_repo_id}"
+  env -u PYTHONPATH CUDA_VISIBLE_DEVICES="" "${lerobot_python}" \
+    "${ROOT_DIR}/scripts/RoboDojo/export_interventions_lerobot_v30.py" \
+    "${dataset_name}.${task}.${env_cfg}" \
+    --repo-id "${lerobot_repo_id}" \
+    --root "${lerobot_root}" \
+    --max-episodes "${lerobot_max}" \
+    --vcodec "${lerobot_vcodec}" \
+    --overwrite
+fi
