@@ -138,6 +138,7 @@ from src.eval_client.lerobot_stream_recorder import (
     LeRobotStreamStartupError,
     close_lerobot_stream_session,
 )
+from src.eval_client.observation_loop import ObservationAdvance, ObservationExit
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
@@ -262,23 +263,25 @@ def main():
     task_name = args_cli.task_name
     num_envs = args_cli.num_envs
     control_mode = os.environ.get("ROBODOJO_CONTROL_MODE", "policy").strip().lower()
-    if control_mode not in {"policy", "keyboard_intervention"}:
+    if control_mode not in {"policy", "keyboard_intervention", "keyboard_observe"}:
         raise ValueError(
-            "ROBODOJO_CONTROL_MODE must be 'policy' or 'keyboard_intervention', "
+            "ROBODOJO_CONTROL_MODE must be 'policy', 'keyboard_intervention', "
+            "or 'keyboard_observe', "
             f"got {control_mode!r}."
         )
     operator_driven = control_mode == "keyboard_intervention"
-    if control_mode == "keyboard_intervention":
+    observation_mode = control_mode == "keyboard_observe"
+    if control_mode in {"keyboard_intervention", "keyboard_observe"}:
         if args_cli.policy_name != "Pi_05":
-            raise ValueError("Keyboard intervention is currently validated only for policy_name=Pi_05.")
+            raise ValueError("Interactive keyboard modes are currently validated only for policy_name=Pi_05.")
         launcher_headless = bool(getattr(app_launcher, "_headless", getattr(args_cli, "headless", False)))
         if launcher_headless:
             raise ValueError(
-                "Keyboard intervention needs the Isaac Sim window. Set ROBODOJO_HEADLESS=0, "
+                "Interactive keyboard mode needs the Isaac Sim window. Set ROBODOJO_HEADLESS=0, "
                 "HEADLESS=0, and LIVESTREAM=0, then keep that window focused while operating."
             )
         if num_envs != 1:
-            print(f"[main] keyboard intervention forces num_envs {num_envs} -> 1")
+            print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
             num_envs = 1
     eval_cfg_name = args_cli.env_cfg_type
     eval_cfg = load_yaml(os.path.join(ENV_CONFIG_PATH, eval_cfg_name + ".yml"))
@@ -294,6 +297,7 @@ def main():
     eval_cfg["physx_monitor_enabled"] = enable_monitor
     eval_cfg["control_mode"] = control_mode
     eval_cfg["operator_driven"] = operator_driven
+    eval_cfg["observation_mode"] = observation_mode
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
@@ -383,6 +387,7 @@ def main():
         env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
     operator_stop_requested = False
     operator_fatal_error = None
+    observed_count = 0
     while env.env_seeds is not None:
         retry_round = False
         if enable_monitor:
@@ -392,6 +397,8 @@ def main():
             env.reset(seed=env.env_seeds)
             env.run_eval()
             env.seed_manager.eval_step()
+            if observation_mode:
+                observed_count += 1
 
         except PhysXFatalError as e:
             # Unrecoverable: GPU/CUDA context is dead. Persist progress
@@ -430,6 +437,13 @@ def main():
             operator_stop_requested = True
         except InterventionDiscardedAndExit:
             print("[Intervention] discarded final attempt; closing collection session.")
+            operator_stop_requested = True
+        except ObservationAdvance:
+            env.seed_manager.eval_step()
+            observed_count += 1
+            print(f"[Observer] observed {observed_count}/{eval_num}; loading the next layout.")
+        except ObservationExit:
+            print(f"[Observer] exit requested after {observed_count}/{eval_num} completed layout(s).")
             operator_stop_requested = True
         except LeRobotStreamStartupError as e:
             # Retrying cannot repair a bad codec, incompatible existing
@@ -506,13 +520,21 @@ def main():
         if retry_round:
             continue
 
-        print(f"Success nums: {env.success_nums}, Fail nums: {env.fail_nums}, Unstable nums: {env.unstable_nums}")
+        if observation_mode:
+            print(f"[Observer] progress: {observed_count}/{eval_num}")
+            if observed_count >= eval_num:
+                print(f"[Observer] completed requested {eval_num} layout(s); exiting.")
+                break
+        else:
+            print(f"Success nums: {env.success_nums}, Fail nums: {env.fail_nums}, Unstable nums: {env.unstable_nums}")
         eval_time = env.success_nums + env.fail_nums
         if not operator_driven and eval_time >= eval_num:
             break
 
         if operator_driven:
             env.env_seeds = env.seed_manager.get_cyclic_seeds(max_count=1)
+        elif observation_mode:
+            env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - observed_count)
         else:
             env.env_seeds = env.seed_manager.get_seeds(max_count=eval_num - eval_time)
         if env.env_seeds is None:

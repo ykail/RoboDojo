@@ -61,6 +61,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.additional_info = self.eval_cfg.get("additional_info", "")
             self.eval_seed = self.eval_cfg.get("seed", 0)
             self.control_mode = self.eval_cfg.get("control_mode", "policy")
+            self.observation_mode = self.control_mode == "keyboard_observe"
             self.operator_driven = bool(
                 self.eval_cfg.get(
                     "operator_driven",
@@ -299,7 +300,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
             data_list = []
             for env_idx in env_idx_list:
-                if not self.operator_driven and (not self.end_flag[env_idx] or last_frame):
+                if not self.operator_driven and not self.observation_mode and (not self.end_flag[env_idx] or last_frame):
                     self._stream_vision(env_idx, data[env_idx])
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
@@ -307,6 +308,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             return data_list
 
         def eval_one_episode(self):
+            if self.control_mode == "keyboard_observe":
+                from src.eval_client.observation_loop import run_keyboard_observation_episode
+
+                run_keyboard_observation_episode(self, self.model_client)
+                return
             if self.control_mode == "keyboard_intervention":
                 from src.eval_client.intervention_loop import run_keyboard_intervention_episode
 
@@ -337,6 +343,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             eval_module.eval_one_episode(TASK_ENV=self, model_client=self.model_client)
 
         def eval_one_episode_batch(self):
+            if self.control_mode == "keyboard_observe":
+                from src.eval_client.observation_loop import run_keyboard_observation_episode
+
+                run_keyboard_observation_episode(self, self.model_client)
+                return
             if self.control_mode == "keyboard_intervention":
                 from src.eval_client.intervention_loop import run_keyboard_intervention_episode
 
@@ -816,11 +827,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 self.eval_one_episode_batch()
             else:
                 self.eval_one_episode()
-            if self.operator_driven:
+            if self.operator_driven or self.observation_mode:
                 # The LeRobot recorder has already durably committed RIGHT at
-                # this point.  Benchmark scoring/video/result bookkeeping is
-                # both unnecessary for collection and, if it failed, could
-                # make main retry an episode that was already saved.
+                # this point in collection mode. Observation mode likewise
+                # needs no benchmark scoring, video, or result bookkeeping.
                 return
             success = 0
             process_scores = self.reward_manager.get_score() if hasattr(self, "get_score") else None
