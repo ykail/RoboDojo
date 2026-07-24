@@ -20,8 +20,12 @@ robodojo-policy-v1
 - One binary msgpack map per WebSocket message.
 - Encoded frames are limited to 64 MiB. The WebSocket transport and decoder
   must enforce the same limit.
-- WebSocket ping/pong provides transport keepalive; there is no application
-  heartbeat message.
+- There is no application heartbeat. The baseline synchronous RoboDojo client
+  disables automatic WebSocket ping because its event loop is intentionally
+  idle while Isaac executes an action chunk or waits for an operator. It
+  detects a lost peer on the next bounded request. A future continuously
+  running transport may enable ping on both ends without changing lifecycle
+  semantics.
 - NumPy arrays use the same marker representation as
   `openpi_client.msgpack_numpy`.
 - Object, structured/void, and complex NumPy dtypes are rejected.
@@ -132,6 +136,10 @@ Rules:
 The client may retry only before the WebSocket/HELLO session is established
 while a cold policy server is starting. It may not silently reconnect and
 continue an established session or trajectory.
+
+The request timeout bounds one WebSocket request/response round trip. It is not
+an episode duration, simulator step limit, action-chunk deadline, or operator
+intervention timeout.
 
 ### Reference session state machine
 
