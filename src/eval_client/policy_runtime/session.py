@@ -287,6 +287,35 @@ class PolicySession:
                 episode_lost=self._episode_lost,
             )
 
+    def reject(self, token: OperationToken) -> OperationResult:
+        """Reject a payload before any backend side effect.
+
+        The request and candidate episode IDs remain burned, but RESET, INFER,
+        and TRIAL_END may be corrected with a new request ID without advancing
+        lifecycle state. A rejected HELLO ends the unestablished connection
+        after its correlated error reply.
+
+        This method must never be used after invoking the model or another
+        stateful backend operation; use :meth:`fail` in that case.
+        """
+
+        with self._lock:
+            self._require_pending(token)
+            if self._phase == SessionPhase.DRAINING:
+                return self._finish_draining()
+
+            self._pending = None
+            close_after_reply = token.message_type == MessageType.HELLO
+            if close_after_reply:
+                self._phase = SessionPhase.TERMINATING
+            return OperationResult(
+                phase=self._phase,
+                reply_allowed=True,
+                close_after_reply=close_after_reply,
+                operation_obsolete=False,
+                episode_lost=False,
+            )
+
     def disconnect(self) -> DisconnectResult:
         """Invalidate the session after transport loss.
 

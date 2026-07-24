@@ -10,6 +10,7 @@ class ErrorCode(StrEnum):
     INVALID_FRAME = "invalid_frame"
     UNSUPPORTED_VERSION = "unsupported_version"
     UNKNOWN_MESSAGE_TYPE = "unknown_message_type"
+    INVALID_PAYLOAD = "invalid_payload"
     INVALID_STATE = "invalid_state"
     SESSION_BUSY = "session_busy"
     EPISODE_MISMATCH = "episode_mismatch"

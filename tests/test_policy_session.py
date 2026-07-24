@@ -440,5 +440,59 @@ class PolicySessionDisconnectTest(unittest.TestCase):
             session.complete(hello)
 
 
+class PolicySessionRejectTest(unittest.TestCase):
+    def test_rejected_hello_replies_once_then_closes(self):
+        session = PolicySession()
+        hello = session.begin(_request(MessageType.HELLO, "hello-1"))
+
+        rejected = session.reject(hello)
+        self.assertEqual(rejected.phase, SessionPhase.TERMINATING)
+        self.assertTrue(rejected.reply_allowed)
+        self.assertTrue(rejected.close_after_reply)
+        self.assertFalse(rejected.episode_lost)
+        self.assertEqual(session.disconnect().phase, SessionPhase.CLOSED)
+
+    def test_rejected_reset_preserves_ready_but_burns_episode_id(self):
+        session = PolicySession()
+        session.complete(session.begin(_request(MessageType.HELLO, "hello-1")))
+        reset = session.begin(_request(MessageType.RESET, "reset-invalid"))
+
+        rejected = session.reject(reset)
+        self.assertEqual(rejected.phase, SessionPhase.READY)
+        self.assertFalse(rejected.close_after_reply)
+        self.assertEqual(session.snapshot.seen_episode_count, 1)
+
+        with self.assertRaises(ProtocolError) as raised:
+            session.begin(_request(MessageType.RESET, "reset-reuse"))
+        self.assertEqual(raised.exception.code, ErrorCode.INVALID_STATE)
+
+        corrected = session.begin(
+            _request(
+                MessageType.RESET,
+                "reset-corrected",
+                episode_id="episode-2",
+            )
+        )
+        session.complete(corrected)
+        self.assertEqual(session.snapshot.active_episode_id, "episode-2")
+
+    def test_rejected_infer_and_trial_end_do_not_advance_lifecycle(self):
+        session = _start_active_session()
+
+        infer = session.begin(_request(MessageType.INFER, "infer-invalid"))
+        rejected = session.reject(infer)
+        self.assertEqual(rejected.phase, SessionPhase.ACTIVE)
+        self.assertEqual(session.snapshot.next_inference_index, 0)
+
+        trial_end = session.begin(_request(MessageType.TRIAL_END, "end-invalid"))
+        rejected = session.reject(trial_end)
+        self.assertEqual(rejected.phase, SessionPhase.ACTIVE)
+        self.assertEqual(session.snapshot.active_episode_id, "episode-1")
+
+        corrected = session.begin(_request(MessageType.INFER, "infer-corrected"))
+        session.complete(corrected)
+        self.assertEqual(session.snapshot.next_inference_index, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

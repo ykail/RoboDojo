@@ -76,6 +76,7 @@ class PolicyMessageTest(unittest.TestCase):
                 "invalid_frame",
                 "unsupported_version",
                 "unknown_message_type",
+                "invalid_payload",
                 "invalid_state",
                 "session_busy",
                 "episode_mismatch",

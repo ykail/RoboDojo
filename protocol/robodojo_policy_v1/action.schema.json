@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "robodojo-arx-x5-dual-absolute-joint-position-v1",
+  "title": "RoboDojo ARX X5 dual-arm absolute joint-position action v1",
+  "description": "Structural documentation for the logical msgpack payload. T and NumPy constraints are enforced by the Python runtime validator and negotiated session spec.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["control_mode", "control_dt_s", "commands"],
+  "properties": {
+    "control_mode": {"const": "absolute_joint_position"},
+    "control_dt_s": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Simulated time between consecutive action targets."
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "left_arm_joint_position",
+        "left_gripper_open_fraction",
+        "right_arm_joint_position",
+        "right_gripper_open_fraction"
+      ],
+      "properties": {
+        "left_arm_joint_position": {"$ref": "#/$defs/armJointPositionChunk"},
+        "left_gripper_open_fraction": {"$ref": "#/$defs/gripperChunk"},
+        "right_arm_joint_position": {"$ref": "#/$defs/armJointPositionChunk"},
+        "right_gripper_open_fraction": {"$ref": "#/$defs/gripperChunk"}
+      },
+      "x-shared-dimension": {
+        "name": "T",
+        "minimum": 1,
+        "maximum": 1024,
+        "equals_negotiated_action_horizon": true
+      }
+    }
+  },
+  "$defs": {
+    "armJointPositionChunk": {
+      "description": "Absolute ARX X5 joint1..joint6 position targets.",
+      "x-robodojo-numpy": {
+        "dtype": "float32",
+        "shape": ["T", 6],
+        "finite": true,
+        "unit": "rad"
+      }
+    },
+    "gripperChunk": {
+      "description": "Absolute gripper open-fraction targets; 0 is closed and 1 is open.",
+      "x-robodojo-numpy": {
+        "dtype": "float32",
+        "shape": ["T", 1],
+        "finite": true,
+        "range": [0.0, 1.0],
+        "unit": "normalized_open_fraction"
+      }
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "robodojo-arx-x5-dual-rgb-joint-v1",
+  "title": "RoboDojo ARX X5 dual-arm RGB joint observation v1",
+  "description": "Structural documentation for the logical msgpack payload. Python runtime validation enforces NumPy annotations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["instruction", "images", "proprio"],
+  "properties": {
+    "instruction": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "x-maxUtf8Bytes": 4096
+    },
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["head", "left_wrist", "right_wrist"],
+      "x-totalImageBytesMaximum": 66060288,
+      "properties": {
+        "head": {"$ref": "#/$defs/rgbImage"},
+        "left_wrist": {"$ref": "#/$defs/rgbImage"},
+        "right_wrist": {"$ref": "#/$defs/rgbImage"}
+      }
+    },
+    "proprio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "robot_schema",
+        "left_arm_joint_position",
+        "left_gripper_open_fraction_commanded",
+        "right_arm_joint_position",
+        "right_gripper_open_fraction_commanded"
+      ],
+      "properties": {
+        "robot_schema": {"const": "arx_x5_dual_v1"},
+        "left_arm_joint_position": {"$ref": "#/$defs/armJointPosition"},
+        "left_gripper_open_fraction_commanded": {"$ref": "#/$defs/gripperCommand"},
+        "right_arm_joint_position": {"$ref": "#/$defs/armJointPosition"},
+        "right_gripper_open_fraction_commanded": {"$ref": "#/$defs/gripperCommand"}
+      }
+    }
+  },
+  "$defs": {
+    "rgbImage": {
+      "description": "Uncompressed RGB image. H and W may differ between cameras.",
+      "x-robodojo-numpy": {
+        "dtype": "uint8",
+        "shape": ["H", "W", 3],
+        "layout": "HWC",
+        "channel_order": "RGB",
+        "dimension_range": {"H": [1, 4096], "W": [1, 4096]},
+        "shape_owned_by": "RoboDojo ObservationValidationSpec"
+      }
+    },
+    "armJointPosition": {
+      "description": "Measured ARX X5 joint1..joint6 positions.",
+      "x-robodojo-numpy": {
+        "dtype": "float32",
+        "shape": [6],
+        "finite": true,
+        "unit": "rad"
+      }
+    },
+    "gripperCommand": {
+      "description": "Previous commanded gripper open fraction; 0 is closed and 1 is open.",
+      "x-robodojo-numpy": {
+        "dtype": "float32",
+        "shape": [1],
+        "finite": true,
+        "range": [0.0, 1.0],
+        "unit": "normalized_open_fraction"
+      }
+    }
+  }
+}

@@ -155,16 +155,21 @@ cleanup may start; it never means the lease is already safe to release.
 Dispatcher ordering for one connection is:
 
 1. `begin(frame)` before any backend side effect.
-2. Start and retain the real backend future; shield it from outer-task
+2. Parse the request payload. If it is invalid, call `reject(token)`: the
+   request ID stays burned, but RESET/INFER/TRIAL_END state does not advance
+   and the client may correct it with a new request ID.
+3. Start and retain the real backend future; shield it from outer-task
    cancellation.
-3. Call `complete(token)` or `fail(token)` only when that future truly settles.
-4. If `reply_allowed`, attempt the one correlated encode-and-send before
+4. Validate backend output, then call `complete(token)` only for valid output.
+   Backend failure or invalid output calls `fail(token)` because policy RNG or
+   state may already have advanced.
+5. If `reply_allowed`, attempt the one correlated encode-and-send before
    submitting the next frame from that connection. Do not spawn detached
    per-frame dispatch tasks and do not retry the same reply.
-5. Send failure, send cancellation, or handler cancellation must call
+6. Send failure, send cancellation, or handler cancellation must call
    `disconnect()` in `finally`. If `close_after_reply`, close the WebSocket and
    call `disconnect()` whether the reply succeeded or failed.
-6. On earlier transport loss, call `disconnect()` immediately, continue
+7. On earlier transport loss, call `disconnect()` immediately, continue
    draining the retained worker, settle its token, run adapter cleanup, and
    finally release the global lease.
 
@@ -182,24 +187,137 @@ Error-code categories:
 
 - Protocol-close errors: `invalid_frame`, `unsupported_version`,
   `unknown_message_type`.
-- Correlated server errors: `invalid_state`, `session_busy`,
+- Correlated server errors: `invalid_payload`, `invalid_state`, `session_busy`,
   `episode_mismatch`, `inference_index_mismatch`, `infer_failed`,
   `reset_failed`, `internal`.
 - Client-local failures: `episode_lost`, `timeout`.
+
+`PayloadValidationError` is deliberately direction-neutral rather than a
+`ProtocolError`. The dispatcher maps an invalid inbound observation to
+`invalid_payload` plus `reject(token)`, but maps an invalid policy action to
+`infer_failed` plus `fail(token)`. A RoboDojo client receiving an invalid
+`INFER_RESULT` closes the session and marks the episode lost. This distinction
+prevents an already-advanced policy from being treated as if no backend work
+occurred.
 
 ## Payload direction
 
 - `HELLO`: requested observation/action schema IDs and client capabilities.
 - `HELLO_ACK`: policy/config/checkpoint provenance and supported schemas.
 - `RESET`: task, seed, reset reason, and episode metadata.
-- `INFER`: one canonical observation.
-- `INFER_RESULT`: one canonical action chunk and optional diagnostics/latency.
+- `INFER`: exactly `{"observation": <canonical observation>}`.
+- `INFER_RESULT`: exactly `{"action": <canonical action chunk>}`.
 - `TRIAL_END`: success/failure/aborted/error status and optional metrics.
 - `ERROR`: stable error code, message, details, and `retryable: false` by
   default.
 
-Canonical observation/action schemas and the stateful session implementation
-are separate milestones.
+The `INFER` and `INFER_RESULT` wrappers are exact maps: v1 has no sibling
+diagnostics or latency field. A later protocol version may add a typed
+diagnostics object without making v1 implementations guess which fields to
+ignore.
+
+## Canonical ARX X5 joint schemas
+
+The first negotiated schema pair is:
+
+```text
+observation: robodojo-arx-x5-dual-rgb-joint-v1
+action:      robodojo-arx-x5-dual-absolute-joint-position-v1
+robot:       arx_x5_dual_v1
+```
+
+One logical observation is:
+
+```python
+{
+    "instruction": str,
+    "images": {
+        "head": uint8[H, W, 3],         # RGB, HWC
+        "left_wrist": uint8[H, W, 3],
+        "right_wrist": uint8[H, W, 3],
+    },
+    "proprio": {
+        "robot_schema": "arx_x5_dual_v1",
+        "left_arm_joint_position": float32[6],   # joint1..joint6, rad
+        "left_gripper_open_fraction_commanded": float32[1],
+        "right_arm_joint_position": float32[6],
+        "right_gripper_open_fraction_commanded": float32[1],
+    },
+}
+```
+
+The current released ARX X5 simulation profile requires all three images to be
+exactly `uint8[480, 640, 3]`. The general schema annotation names symbolic
+`H/W` so future profiles can select another exact size, but the
+RoboDojo-owned `ObservationValidationSpec` always supplies and enforces the
+three concrete shapes for a connection. Kai0 confirms the selected profile in
+`HELLO_ACK`; it does not choose the simulator camera shape.
+The three uncompressed images together must fit a 63 MiB canonical image
+budget, leaving at least 1 MiB inside the 64 MiB frame limit for the envelope,
+instruction, proprioception, and msgpack metadata.
+
+The arm positions are measured. RoboDojo's current raw gripper observation is
+the previous normalized, post-rate-limited target sent by its control manager,
+not a measured gripper joint or necessarily the raw policy prediction, so v1
+names it explicitly. Gripper fraction is dimensionless: zero is closed and one
+is open.
+
+RoboDojo maps its raw observation to canonical fields as follows:
+
+| RoboDojo raw field | Canonical field |
+|---|---|
+| `vision.cam_head.color` | `images.head` |
+| `vision.cam_left_wrist.color` | `images.left_wrist` |
+| `vision.cam_right_wrist.color` | `images.right_wrist` |
+| `state.left_arm_joint_state` | `proprio.left_arm_joint_position` |
+| `state.left_ee_joint_state` | `proprio.left_gripper_open_fraction_commanded` |
+| `state.right_arm_joint_state` | `proprio.right_arm_joint_position` |
+| `state.right_ee_joint_state` | `proprio.right_gripper_open_fraction_commanded` |
+
+Raw `action`, EE pose, depth, `env_idx`, camera `shape`,
+`data_format_version`, `additional_info.frequency`, and simulator object truth
+are deliberately not part of this visual-policy observation.
+
+One logical action chunk is:
+
+```python
+{
+    "control_mode": "absolute_joint_position",
+    "control_dt_s": 0.04,
+    "commands": {
+        "left_arm_joint_position": float32[T, 6],  # rad
+        "left_gripper_open_fraction": float32[T, 1],
+        "right_arm_joint_position": float32[T, 6],
+        "right_gripper_open_fraction": float32[T, 1],
+    },
+}
+```
+
+All four command arrays share horizon `T`; every floating value is finite.
+Gripper commands are strictly in `[0, 1]`. Active RoboDojo robot limits, not
+policy metadata, constrain arm commands. The RoboDojo execution profile owns
+the concrete horizon, control period, camera shapes, and arm limits. The server
+may only confirm an exact match during HELLO; it cannot weaken these execution
+constraints. For the released Pi0.5 profile, `T=50` and
+`control_dt_s=0.04` (25 Hz simulated targets), so one full chunk represents
+2.0 seconds of simulated targets.
+
+The existing Pi0.5/Aloha output adapter packs one target as
+`left_arm[0:6], left_gripper[6], right_arm[7:13], right_gripper[13]`.
+That model-side packing is not exposed on the wire. The Kai0 adapter unpacks it
+into the structured fields above. The legacy execution path clips every finite
+model gripper prediction inside RoboDojo's executor. In the new architecture,
+Kai0 deliberately performs an equivalent compatibility clip to `[0, 1]`
+before constructing the strict canonical action, and records the clip count
+and maximum overshoot in server logs. Non-finite predictions are rejected. The
+canonical parser itself never clips.
+
+The JSON schema files document exact maps and NumPy annotations. Standard JSON
+Schema cannot enforce ndarray dtype, layout, symbolic dimensions, or negotiated
+client-profile constraints, so
+`src/eval_client/policy_runtime/canonical.py` is the executable runtime
+boundary. Its parsers make immutable, C-contiguous snapshots; they do not
+transpose, cast, resize, normalize, fill missing cameras, or clip values.
 
 ## Cross-end codec fixture
 
