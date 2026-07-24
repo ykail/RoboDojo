@@ -73,7 +73,8 @@ TRIAL_END  -> TRIAL_END_ACK
 valid request state/business error -> ERROR
 ```
 
-`PREPARE_CASE` is not part of v1; task/seed metadata belongs in `RESET`.
+`PREPARE_CASE` is not part of v1; task, simulator seed, and policy seed
+metadata belongs in `RESET`.
 Policy-specific `update_obs`/`get_action` method names are not part of the
 wire API. Connection shutdown uses the WebSocket close control frame, not a
 second application-level `CLOSE` message.
@@ -102,6 +103,10 @@ Rules:
 - The first frame on a connection is exactly one `HELLO`. Its `session_id`
   becomes bound to that connection; every later frame must use the same ID.
 - `request_id` is unique for the lifetime of a session.
+- A RESET candidate `episode_id` is reserved for the lifetime of the session
+  as soon as `begin()` accepts the RESET envelope in READY. Payload rejection
+  never rolls that reservation back. Correcting a rejected RESET therefore
+  requires both a fresh `request_id` and a fresh `episode_id`.
 - The server atomically reserves its single global model lease when accepting a
   valid `HELLO`, before invoking any adapter operation. A second connection
   receives `session_busy`. The lease becomes owned after `HELLO_ACK` and is not
@@ -119,6 +124,10 @@ Rules:
   executed reset, just as a lost INFER response can hide an advanced RNG.
 - Recovery creates a new connection/session and a new episode, resets the
   simulator, then sends a new explicit `RESET`.
+- An active episode cannot be reset in place. A normal operator retry is
+  `TRIAL_END(status="aborted")`, acknowledgement, simulator reset, then RESET
+  with a new episode ID. A lost session follows the recovery rule above and
+  does not fabricate a `TRIAL_END` result.
 
 The client may retry only before the WebSocket/HELLO session is established
 while a cold policy server is starting. It may not silently reconnect and
@@ -156,8 +165,10 @@ Dispatcher ordering for one connection is:
 
 1. `begin(frame)` before any backend side effect.
 2. Parse the request payload. If it is invalid, call `reject(token)`: the
-   request ID stays burned, but RESET/INFER/TRIAL_END state does not advance
-   and the client may correct it with a new request ID.
+   request ID stays burned, but RESET/INFER/TRIAL_END state does not advance.
+   INFER/TRIAL_END corrections use a fresh request ID and retain the active
+   episode ID. A RESET correction must also use a fresh candidate episode ID,
+   because `begin()` reserved the rejected candidate before payload parsing.
 3. Start and retain the real backend future; shield it from outer-task
    cancellation.
 4. Validate backend output, then call `complete(token)` only for valid output.
@@ -192,6 +203,11 @@ Error-code categories:
   `reset_failed`, `internal`.
 - Client-local failures: `episode_lost`, `timeout`.
 
+An unsupported but otherwise well-formed HELLO profile is a correlated
+`invalid_payload` error with constraint-mismatch details. Because a rejected
+HELLO cannot establish a session, the server sends that one ERROR if possible
+and then closes the connection.
+
 `PayloadValidationError` is deliberately direction-neutral rather than a
 `ProtocolError`. The dispatcher maps an invalid inbound observation to
 `invalid_payload` plus `reject(token)`, but maps an invalid policy action to
@@ -202,12 +218,14 @@ occurred.
 
 ## Payload direction
 
-- `HELLO`: requested observation/action schema IDs and client capabilities.
-- `HELLO_ACK`: policy/config/checkpoint provenance and supported schemas.
-- `RESET`: task, seed, reset reason, and episode metadata.
+- `HELLO`: one fixed observation/action/execution profile assertion.
+- `HELLO_ACK`: an exact semantic confirmation plus policy/config/checkpoint
+  provenance.
+- `RESET`: task, simulator seed, policy seed, reset reason, and episode
+  metadata.
 - `INFER`: exactly `{"observation": <canonical observation>}`.
 - `INFER_RESULT`: exactly `{"action": <canonical action chunk>}`.
-- `TRIAL_END`: success/failure/aborted/error status and optional metrics.
+- `TRIAL_END`: success/failure/aborted/error status, `score`, and `reason`.
 - `ERROR`: stable error code, message, details, and `retryable: false` by
   default.
 
@@ -216,9 +234,181 @@ diagnostics or latency field. A later protocol version may add a typed
 diagnostics object without making v1 implementations guess which fields to
 ignore.
 
+Adding an exact-map field, execution feedback, or new lifecycle meaning
+requires a new protocol/schema version. Replacing a Kai0 implementation branch
+or checkpoint while preserving this complete contract does not; HELLO_ACK
+provenance identifies the actual code and artifacts.
+
+### Lifecycle payloads
+
+All lifecycle payloads are exact maps. `HELLO.payload` is:
+
+```python
+{
+    "schemas": {
+        "observation": "robodojo-arx-x5-dual-rgb-joint-v1",
+        "action": "robodojo-arx-x5-dual-absolute-joint-position-v1",
+        "robot": "arx_x5_dual_v1",
+    },
+    "execution_profile": {
+        "images": {
+            "head": [480, 640, 3],
+            "left_wrist": [480, 640, 3],
+            "right_wrist": [480, 640, 3],
+        },
+        "action": {
+            "horizon": 50,
+            "control_dt_s": 0.04,
+            "chunk_consumption":
+                "sequential_until_terminal_or_preempted",
+            "preemption_boundary": "between_control_targets",
+            "next_infer_observation": "after_last_executed_target",
+            "left_arm_joint_limits": {
+                "lower": [-10, -10, -10, -10, -10, -3.14],
+                "upper": [10, 10, 10, 10, 10, 3.14],
+            },
+            "right_arm_joint_limits": {
+                "lower": [-10, -10, -10, -10, -10, -3.14],
+                "upper": [10, 10, 10, 10, 10, 3.14],
+            },
+        },
+    },
+}
+```
+
+The shape and limit sequences are wire lists, not tuples. `HELLO_ACK.payload`
+must echo `schemas` and `execution_profile` exactly, then add:
+
+```python
+{
+    "policy": {
+        "implementation": "kai0",
+        "policy_family": "pi05",
+        "adapter_profile": "kai0_pi05_aloha_arx_x5_joint_v1",
+        "config_name": str,
+        "checkpoint_id": str,
+        "checkpoint_digest": "sha256:<64 lowercase hex characters>",
+        "checkpoint_step": int | None,
+        "code_revision": "<40 lowercase Git hex characters>",
+        "dirty": bool,
+    },
+}
+```
+
+The displayed arm limits are the current released ARX X5 simulation asset
+limits. They are intentionally named and implemented as
+`ARX_X5_SIM_ARM_LIMITS`; they are not a claim about safe physical X5 hardware
+limits.
+
+`checkpoint_id` is a portable human-readable name or URI, not a host-local
+absolute path. `checkpoint_digest` is the SHA-256 of the deterministic
+effective artifact manifest and is the machine identity of the loaded
+checkpoint. The manifest covers every regular file under the effective
+`params/` and `assets/` trees, including normalization statistics, plus a
+top-level `model.safetensors` when present. Any auxiliary artifact that can
+change inference is included under a stable named role. Symbolic links inside
+artifact roots are rejected.
+
+The manifest wire bytes use `robodojo-artifact-manifest-v1`:
+
+1. The first UTF-8 JSONL line is exactly
+   `{"format":"robodojo-artifact-manifest-v1"}` followed by LF.
+2. Each file entry has exactly `path`, `role`, `sha256`, and `size`. `path` is
+   its slash-separated UTF-8 path relative to that role root, without empty,
+   `.` or `..` components. The `params/` tree uses role `params`; `assets/`
+   uses `assets`; top-level `model.safetensors` uses role `model` and path
+   `model.safetensors`. Auxiliary roots use `aux:<portable-role-id>`.
+   `(role,path)` pairs are unique. `sha256` is 64 lowercase hexadecimal
+   characters for the file bytes; `size` is the byte length.
+3. Entries sort component-wise by
+   `(role.encode("utf-8"), path.encode("utf-8"))`.
+4. Each entry is encoded as UTF-8 JSON with keys sorted lexicographically,
+   `ensure_ascii=false`, no insignificant whitespace, then one LF. In Python
+   this is `json.dumps(entry, ensure_ascii=False, sort_keys=True,
+   separators=(",", ":")) + "\n"`.
+5. `checkpoint_digest` is `"sha256:" + sha256(all JSONL bytes).hexdigest()`.
+
+The adapter persists those exact JSONL bytes beside evaluation logs so another
+implementation can recompute the identity. `checkpoint_step` is display
+metadata and never substitutes for the digest. `code_revision` is the full
+Kai0 commit SHA. Formally comparable runs require `dirty=false`; branch and
+worktree names are not identity.
+
+`RESET.payload` is:
+
+```python
+{
+    "task_name": str,
+    "simulator_seed": int,     # non-negative simulator/layout RNG seed
+    "policy_seed": int,        # [0, 2^32 - 1], episode sampling RNG seed
+    "layout_id": int,          # non-negative
+    "layout_cycle": int,       # non-negative
+    "reason": "episode_start"
+              | "operator_retry"
+              | "simulator_recovery"
+              | "transport_recovery",
+}
+```
+
+RESET has stateful adapter semantics. Before `RESET_RESULT`, Kai0 must clear
+all episode-local observation/history/memory/subtask/action-buffer state and
+initialize the sampler from `policy_seed`; it must not reload weights, assets,
+or compilation caches. `simulator_seed` records the independently chosen
+RoboDojo scene seed. `task_name`, seeds, layout fields, and reason are
+lifecycle context and logging metadata; they do not replace the canonical
+observation instruction. Each INFER observation's `instruction` is the
+authoritative prompt for that inference.
+
+`TRIAL_END.payload` is:
+
+```python
+{
+    "status": "success" | "failure" | "aborted" | "error",
+    "success": bool | None,
+    "score": finite_float | None,
+    "reason": nonempty_str | None,
+}
+```
+
+The outcome is unambiguous: `success` status requires `success=True`,
+`failure` requires `False`, and `aborted`/`error` require `None`.
+`RESET_RESULT.payload` and `TRIAL_END_ACK.payload` are exact empty maps.
+
+TRIAL_END records the outcome and clears all episode-local adapter state
+before acknowledgement. It cannot update weights, learn online, or retain
+episode state for a later RESET in v1. Transport loss during an active episode
+performs the same abort cleanup after any retained worker settles, but records
+no fabricated trial outcome. `success` means task success; `failure` means a
+normal terminal condition without success; `aborted` means an operator/client
+ended the trial; and `error` means simulator/client execution failed.
+
+One correlated `ERROR.payload` is:
+
+```python
+{
+    "code": correlated_server_error_code,
+    "message": nonempty_str,
+    "details": {str: any, ...},
+    "retryable": False,
+}
+```
+
+`retryable=False` means the same request is never replayed. An
+`invalid_payload` response can leave the session usable for a newly constructed
+request with a fresh `request_id`; it does not authorize replay.
+`details` is a recursively bounded JSON-like map: string keys and values made
+from null, bool, msgpack-range integers, finite floats, strings, maps, and
+lists. Tuples, bytes, NumPy values, and arbitrary Python objects are not error
+details. Reference objects recursively snapshot it before an ERROR is queued.
+
+`src/eval_client/policy_runtime/lifecycle_payloads.py` is the executable
+reference for these maps. A server calls `parse_hello_payload()` with its
+concrete `supported_profile`; merely parsing and echoing an arbitrary
+well-formed client profile is not a valid capability check.
+
 ## Canonical ARX X5 joint schemas
 
-The first negotiated schema pair is:
+The fixed v1 schema pair is:
 
 ```text
 observation: robodojo-arx-x5-dual-rgb-joint-v1
@@ -250,8 +440,10 @@ The current released ARX X5 simulation profile requires all three images to be
 exactly `uint8[480, 640, 3]`. The general schema annotation names symbolic
 `H/W` so future profiles can select another exact size, but the
 RoboDojo-owned `ObservationValidationSpec` always supplies and enforces the
-three concrete shapes for a connection. Kai0 confirms the selected profile in
-`HELLO_ACK`; it does not choose the simulator camera shape.
+three concrete shapes for a connection. Kai0 confirms the asserted profile in
+`HELLO_ACK`; it does not choose the simulator camera shape. Exact confirmation
+means equality of normalized field values, not byte-for-byte equality of
+independently encoded msgpack frames.
 The three uncompressed images together must fit a 63 MiB canonical image
 budget, leaving at least 1 MiB inside the 64 MiB frame limit for the envelope,
 instruction, proprioception, and msgpack metadata.
@@ -315,6 +507,24 @@ constraints. For the released Pi0.5 profile, `T=50` and
 `control_dt_s=0.04` (25 Hz simulated targets), so one full chunk represents
 2.0 seconds of simulated targets.
 
+The released v1 consumer is open-loop, not receding-horizon or temporal
+ensemble execution. After validating one INFER_RESULT, RoboDojo owns the
+chunk locally and normally executes target indices `0..49` once, in order. A
+task terminal, operator takeover, executor error, or episode-ending intent may
+preempt only between synchronous control targets. The currently entered target
+finishes; the unexecuted suffix is permanently discarded and is never resumed,
+replayed, or carried into another episode/session. `control_dt_s` is simulated
+time between executed targets, not a wall-clock response deadline.
+
+The next INFER, if any, uses a fresh observation obtained after the final
+actually executed target. The server must not assume that the previous chunk
+was fully consumed. INFER counts policy calls, not executed targets. A policy
+that requires executed-step counts, previous-chunk feedback, per-target
+observations, RTC, or overlapping chunks requires a later protocol/profile;
+those fields cannot be added to v1's exact INFER wrapper. Before TRIAL_END or
+recovery RESET, the client stops its local executor and clears every stale
+suffix. Once TRIAL_END is sent, no target from that episode may execute.
+
 The existing Pi0.5/Aloha output adapter packs one target as
 `left_arm[0:6], left_gripper[6], right_arm[7:13], right_gripper[13]`.
 That model-side packing is not exposed on the wire. The Kai0 adapter unpacks it
@@ -325,8 +535,13 @@ before constructing the strict canonical action, and records the clip count
 and maximum overshoot in server logs. Non-finite predictions are rejected. The
 canonical parser itself never clips.
 
+The executable Kai0 mapping is the versioned
+[`kai0_pi05_aloha_arx_x5_joint_v1` adapter profile](adapter_profiles/kai0_pi05_aloha_arx_x5_joint_v1.md).
+An implementation using the same wire schemas but a different image/state
+mapping or sampling setup must publish a new adapter profile ID.
+
 The JSON schema files document exact maps and NumPy annotations. Standard JSON
-Schema cannot enforce ndarray dtype, layout, symbolic dimensions, or negotiated
+Schema cannot enforce ndarray dtype, layout, symbolic dimensions, or asserted
 client-profile constraints, so
 `src/eval_client/policy_runtime/canonical.py` is the executable runtime
 boundary. Its parsers make immutable, C-contiguous snapshots; they do not

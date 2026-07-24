@@ -456,15 +456,30 @@ class PolicySessionRejectTest(unittest.TestCase):
         session = PolicySession()
         session.complete(session.begin(_request(MessageType.HELLO, "hello-1")))
         reset = session.begin(_request(MessageType.RESET, "reset-invalid"))
+        self.assertEqual(session.snapshot.seen_request_count, 2)
+        self.assertEqual(session.snapshot.seen_episode_count, 1)
+        self.assertIsNone(session.snapshot.active_episode_id)
 
         rejected = session.reject(reset)
         self.assertEqual(rejected.phase, SessionPhase.READY)
         self.assertFalse(rejected.close_after_reply)
+        self.assertEqual(session.snapshot.seen_request_count, 2)
         self.assertEqual(session.snapshot.seen_episode_count, 1)
 
         with self.assertRaises(ProtocolError) as raised:
             session.begin(_request(MessageType.RESET, "reset-reuse"))
         self.assertEqual(raised.exception.code, ErrorCode.INVALID_STATE)
+
+        with self.assertRaises(ProtocolError) as raised:
+            session.begin(
+                _request(
+                    MessageType.RESET,
+                    "reset-invalid",
+                    episode_id="episode-2",
+                )
+            )
+        self.assertEqual(raised.exception.code, ErrorCode.INVALID_STATE)
+        self.assertEqual(session.snapshot.seen_episode_count, 1)
 
         corrected = session.begin(
             _request(

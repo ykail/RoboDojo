@@ -138,9 +138,11 @@ class PolicySession:
         """Validate and reserve one request before any backend side effect.
 
         A request ID from the bound session is burned as soon as the request is
-        received, including when later lifecycle validation rejects it.  A
-        wrong-session frame is rejected before reservation because it does not
-        belong to this session.
+        received, including when later lifecycle validation rejects it. When a
+        RESET reaches the READY reservation branch, its candidate episode ID
+        is also burned before payload validation and is never rolled back. A
+        wrong-session frame is rejected before either reservation because it
+        does not belong to this session.
         """
 
         with self._lock:
@@ -290,10 +292,12 @@ class PolicySession:
     def reject(self, token: OperationToken) -> OperationResult:
         """Reject a payload before any backend side effect.
 
-        The request and candidate episode IDs remain burned, but RESET, INFER,
-        and TRIAL_END may be corrected with a new request ID without advancing
-        lifecycle state. A rejected HELLO ends the unestablished connection
-        after its correlated error reply.
+        The request ID remains burned. A rejected RESET also keeps its
+        candidate episode ID burned, so its correction needs both a fresh
+        request ID and a fresh episode ID. Rejected INFER and TRIAL_END
+        requests may be corrected with a fresh request ID while retaining the
+        active episode ID. Lifecycle state does not advance. A rejected HELLO
+        ends the unestablished connection after its correlated error reply.
 
         This method must never be used after invoking the model or another
         stateful backend operation; use :meth:`fail` in that case.

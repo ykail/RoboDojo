@@ -1,5 +1,8 @@
 """Policy-runtime primitives shared by RoboDojo evaluation modes."""
 
+from src.eval_client.policy_runtime.action_bridge import (
+    iter_arx_x5_eval_actions,
+)
 from src.eval_client.policy_runtime.canonical import (
     ACTION_CONTROL_MODE,
     ACTION_SCHEMA_ID,
@@ -29,7 +32,32 @@ from src.eval_client.policy_runtime.codec import (
     encode_frame,
 )
 from src.eval_client.policy_runtime.errors import ErrorCode, ProtocolError
+from src.eval_client.policy_runtime.execution_profile import (
+    ACTION_CHUNK_CONSUMPTION,
+    ACTION_NEXT_INFER_OBSERVATION,
+    ACTION_PREEMPTION_BOUNDARY,
+    ARX_X5_SIM_ARM_LIMITS,
+    ARX_X5_SIM_PI05_PROFILE,
+    PolicyExecutionProfile,
+)
 from src.eval_client.policy_runtime.frame import Frame
+from src.eval_client.policy_runtime.lifecycle_payloads import (
+    MAX_LIFECYCLE_TEXT_BYTES,
+    PolicyProvenance,
+    RemoteErrorPayload,
+    ResetPayload,
+    ResetReason,
+    TrialEndPayload,
+    TrialStatus,
+    build_hello_ack_payload,
+    build_hello_payload,
+    parse_empty_success_payload,
+    parse_error_payload,
+    parse_hello_ack_payload,
+    parse_hello_payload,
+    parse_reset_payload,
+    parse_trial_end_payload,
+)
 from src.eval_client.policy_runtime.messages import (
     PROTOCOL_VERSION,
     REQUEST_RESPONSE_PAIRS,
@@ -51,8 +79,13 @@ from src.eval_client.policy_runtime.session import (
 
 __all__ = [
     "ACTION_CONTROL_MODE",
+    "ACTION_CHUNK_CONSUMPTION",
+    "ACTION_NEXT_INFER_OBSERVATION",
+    "ACTION_PREEMPTION_BOUNDARY",
     "ACTION_SCHEMA_ID",
     "ARX_X5_SIM_OBSERVATION_SPEC",
+    "ARX_X5_SIM_ARM_LIMITS",
+    "ARX_X5_SIM_PI05_PROFILE",
     "ARX_X5_SIM_RGB_SHAPE",
     "MAX_ACTION_HORIZON",
     "MAX_CANONICAL_IMAGE_BYTES",
@@ -69,6 +102,7 @@ __all__ = [
     "MAX_FRAME_BYTES",
     "MAX_IMAGE_DIMENSION",
     "MAX_INSTRUCTION_BYTES",
+    "MAX_LIFECYCLE_TEXT_BYTES",
     "MessageType",
     "OBSERVATION_SCHEMA_ID",
     "ObservationValidationSpec",
@@ -76,17 +110,33 @@ __all__ = [
     "OperationToken",
     "PayloadErrorKind",
     "PayloadValidationError",
+    "PolicyExecutionProfile",
+    "PolicyProvenance",
     "PolicySession",
     "ProtocolError",
     "RawObservationBuildError",
+    "RemoteErrorPayload",
+    "ResetPayload",
+    "ResetReason",
     "JointLimits",
     "SessionInvariantError",
     "SessionPhase",
     "SessionSnapshot",
+    "TrialEndPayload",
+    "TrialStatus",
+    "build_hello_ack_payload",
+    "build_hello_payload",
     "decode_frame",
     "encode_frame",
+    "iter_arx_x5_eval_actions",
     "parse_action_chunk",
+    "parse_empty_success_payload",
+    "parse_error_payload",
+    "parse_hello_ack_payload",
+    "parse_hello_payload",
     "parse_infer_payload",
     "parse_infer_result_payload",
     "parse_observation",
+    "parse_reset_payload",
+    "parse_trial_end_payload",
 ]
