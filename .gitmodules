@@ -10,3 +10,6 @@
 	path = XPolicyLab
 	url = https://github.com/ykail/XPolicyLab.git
 	branch = feat/robodojo-pi05-runtime
+[submodule "third_party/kai0"]
+	path = third_party/kai0
+	url = git@github.com:jiran0407/kai0.git
