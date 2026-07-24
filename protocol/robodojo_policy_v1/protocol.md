@@ -102,14 +102,17 @@ Rules:
 - The first frame on a connection is exactly one `HELLO`. Its `session_id`
   becomes bound to that connection; every later frame must use the same ID.
 - `request_id` is unique for the lifetime of a session.
-- A session owns the model from successful `HELLO` until its WebSocket is
-  released. A disconnected session with a still-running synchronous inference
-  worker continues to own it; another `HELLO` receives `session_busy` until the
-  worker has actually settled and cleanup finishes.
+- The server atomically reserves its single global model lease when accepting a
+  valid `HELLO`, before invoking any adapter operation. A second connection
+  receives `session_busy`. The lease becomes owned after `HELLO_ACK` and is not
+  released until transport shutdown, worker settlement, and adapter cleanup
+  all finish.
 - `RESET`, `INFER`, and `TRIAL_END` are serialized by one lifecycle lock.
 - A synchronous inference worker cannot be made safe merely by cancelling its
-  outer asyncio task. Reset waits for the worker to actually finish and then
-  discards obsolete results before policy state is reset.
+  outer asyncio task. A connection permits only one outstanding request. To
+  abandon an in-flight inference, the client closes that session; the server
+  waits for the real worker to finish and discards its result. A new session's
+  `RESET` cannot acquire the global lease until that drain and cleanup finish.
 - After `HELLO` succeeds, an ambiguous send, timeout, or disconnect during
   `RESET`, `INFER`, or `TRIAL_END` invalidates the session. None of those
   operations may be replayed: a lost RESET acknowledgement can hide an already
@@ -120,6 +123,55 @@ Rules:
 The client may retry only before the WebSocket/HELLO session is established
 while a cold policy server is starting. It may not silently reconnect and
 continue an established session or trajectory.
+
+### Reference session state machine
+
+RoboDojo keeps a transport- and model-independent executable reference in
+`src/eval_client/policy_runtime/session.py`. Kai0 keeps its own implementation
+and is checked against the same fixtures and black-box conformance tests; it
+must not import its parent RoboDojo checkout at runtime.
+
+```text
+AWAITING_HELLO -> READY -> ACTIVE -> READY
+       |            |        |
+       +------------+--------+-- pending + disconnect --> DRAINING --> CLOSED
+backend failure ---------------------------------------> TERMINATING --> CLOSED
+```
+
+Request processing is two-phase: `begin(frame)` atomically validates and
+reserves IDs, then `complete(token)` or `fail(token)` settles that exact
+operation. A disconnect with an in-flight synchronous worker enters
+`DRAINING`; the worker result is discarded, and cleanup may release the global
+model lease only after the worker has actually settled. The internal operation
+generation is not a wire field.
+
+The reference state machine does not implement the server-global model lease.
+Kai0's dispatcher needs a separate lease owner token. It must reserve that token
+before any HELLO-side adapter work, keep the real synchronous worker future
+alive under outer-task cancellation, wait for it to settle, run adapter
+cleanup, and only then release the lease. `waiting_for_operation: false` means
+cleanup may start; it never means the lease is already safe to release.
+
+Dispatcher ordering for one connection is:
+
+1. `begin(frame)` before any backend side effect.
+2. Start and retain the real backend future; shield it from outer-task
+   cancellation.
+3. Call `complete(token)` or `fail(token)` only when that future truly settles.
+4. If `reply_allowed`, attempt the one correlated encode-and-send before
+   submitting the next frame from that connection. Do not spawn detached
+   per-frame dispatch tasks and do not retry the same reply.
+5. Send failure, send cancellation, or handler cancellation must call
+   `disconnect()` in `finally`. If `close_after_reply`, close the WebSocket and
+   call `disconnect()` whether the reply succeeded or failed.
+6. On earlier transport loss, call `disconnect()` immediately, continue
+   draining the retained worker, settle its token, run adapter cleanup, and
+   finally release the global lease.
+
+`episode_lost` describes server-side episode state that may still need abort or
+cleanup; it does not assert that the client received an acknowledgement. For
+example, after `TRIAL_END` completes, a lost ACK closes the session but does not
+make the already-ended server episode active again.
 
 Only a fully parsed v1 request can receive an application `ERROR` response.
 Malformed envelopes, unknown protocol versions, missing correlation fields, and

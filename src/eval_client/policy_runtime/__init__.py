@@ -12,15 +12,31 @@ from src.eval_client.policy_runtime.messages import (
     REQUEST_RESPONSE_PAIRS,
     MessageType,
 )
+from src.eval_client.policy_runtime.session import (
+    DisconnectResult,
+    OperationResult,
+    OperationToken,
+    PolicySession,
+    SessionInvariantError,
+    SessionPhase,
+    SessionSnapshot,
+)
 
 __all__ = [
     "PROTOCOL_VERSION",
     "REQUEST_RESPONSE_PAIRS",
+    "DisconnectResult",
     "ErrorCode",
     "Frame",
     "MAX_FRAME_BYTES",
     "MessageType",
+    "OperationResult",
+    "OperationToken",
+    "PolicySession",
     "ProtocolError",
+    "SessionInvariantError",
+    "SessionPhase",
+    "SessionSnapshot",
     "decode_frame",
     "encode_frame",
 ]
