@@ -278,6 +278,19 @@ Raw `action`, EE pose, depth, `env_idx`, camera `shape`,
 `data_format_version`, `additional_info.frequency`, and simulator object truth
 are deliberately not part of this visual-policy observation.
 
+The executable projection is
+`src/eval_client/policy_runtime/observation_builder.py`. One
+`ArxX5ObservationBuilder` instance binds a concrete image profile and expected
+`env_idx` for a connection. It also requires raw
+`data_format_version == "v1.0"` before dropping both local metadata fields.
+Images are passed through without cast, resize, transpose, or channel
+conversion. Measured floating arm arrays and normalized floating gripper
+commands are converted explicitly to `float32`; the canonical parser then
+performs the single immutable snapshot. Builder failures always surface as
+`RawObservationBuildError` with a raw-source path; when the final canonical
+validator found the problem, its `PayloadErrorKind` is retained as
+`canonical_error_kind` and the original exception remains chained.
+
 One logical action chunk is:
 
 ```python

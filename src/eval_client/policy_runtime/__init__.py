@@ -35,6 +35,10 @@ from src.eval_client.policy_runtime.messages import (
     REQUEST_RESPONSE_PAIRS,
     MessageType,
 )
+from src.eval_client.policy_runtime.observation_builder import (
+    ArxX5ObservationBuilder,
+    RawObservationBuildError,
+)
 from src.eval_client.policy_runtime.session import (
     DisconnectResult,
     OperationResult,
@@ -56,6 +60,7 @@ __all__ = [
     "REQUEST_RESPONSE_PAIRS",
     "ROBOT_SCHEMA_ID",
     "ActionValidationSpec",
+    "ArxX5ObservationBuilder",
     "CanonicalActionChunk",
     "CanonicalObservation",
     "DisconnectResult",
@@ -73,6 +78,7 @@ __all__ = [
     "PayloadValidationError",
     "PolicySession",
     "ProtocolError",
+    "RawObservationBuildError",
     "JointLimits",
     "SessionInvariantError",
     "SessionPhase",

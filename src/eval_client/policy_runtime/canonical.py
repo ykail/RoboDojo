@@ -696,11 +696,11 @@ def _require_array_metadata(
 
 
 def _freeze_array(value: np.ndarray) -> np.ndarray:
-    contiguous = np.ascontiguousarray(np.asarray(value))
+    source = np.asarray(value)
     return np.frombuffer(
-        contiguous.tobytes(order="C"),
-        dtype=contiguous.dtype,
-    ).reshape(contiguous.shape)
+        source.tobytes(order="C"),
+        dtype=source.dtype,
+    ).reshape(source.shape)
 
 
 def _require_finite(value: np.ndarray, path: tuple[str, ...]) -> None:
