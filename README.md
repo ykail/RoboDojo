@@ -18,7 +18,7 @@ https://private-user-images.githubusercontent.com/88101805/619409345-cc074c5d-45
 
 <p align="center"><em>Overview of RoboDojo. RoboDojo unifies efficient simulation evaluation and reproducible real-world testing for generalist robot manipulation, covering 42 simulation tasks, 18 real-world tasks, heterogeneous parallel simulation, RoboDojo-RealEval, XPolicyLab, and a continuously updated leaderboard.</em></p>
 
-> RoboDojo is **eval-only** in this release: it provides the simulator client, benchmark tasks, asset/config validation, and result artifacts. Policy integration and policy servers are owned by [XPolicyLab](https://github.com/XPolicyLab/XPolicyLab/blob/main/README.md).
+> RoboDojo is **eval-only** in this release: it provides the simulator client, benchmark tasks, asset/config validation, and result artifacts. Policy implementations and servers remain outside RoboDojo, normally in [XPolicyLab](https://github.com/XPolicyLab/XPolicyLab/blob/main/README.md) or an explicitly integrated repository such as Kai0.
 
 - 🌐 **Unified sim-and-real benchmark** — 42 simulation tasks and 18 real-world tasks across 3 robot embodiments for generalist robot manipulation.
 - 🧭 **Five capability dimensions** — Generalization, Memory, Precision, Long-Horizon, and Open, designed to probe different skills rather than simple object or layout reskins.
@@ -42,6 +42,7 @@ The [RoboDojo documentation](https://robodojo-benchmark.com/doc/) is the canonic
 | [Real Robot Tasks Details](https://robodojo-benchmark.com/doc/real-tasks/) | The 18 real-world tasks on Piper X, Piper, and ARX X5. |
 | [Configurations](https://robodojo-benchmark.com/doc/usage/configurations/) | Simulator, scene, robot, and camera configuration options. |
 | [Common Issues](https://robodojo-benchmark.com/doc/common-issue/) | Troubleshooting for installation, assets, GPU memory, and evaluation. |
+| [Kai0 Pi0.5 Integration](docs/KAI0_PI05_INTEGRATION.md) | Strict socket runtime, submodule/worktree workflow, training-code ownership, and one-command evaluation. |
 
 ## 🗂️ Repository Structure
 
@@ -52,12 +53,13 @@ task/RoboDojo/         task logic and task YAML configs
 scripts/robodojo.sh    public RoboDojo-side eval entry
 scripts/eval_policy.sh simulator client launched by XPolicyLab eval.sh
 XPolicyLab/            policy server and policy integrations
+third_party/kai0/      optional pinned Kai0 policy implementation
 Assets/                downloaded robot, object, material, and layout assets
 ```
 
 ## 🔌 Policy Integration
 
-Policies live in [XPolicyLab](https://github.com/XPolicyLab/XPolicyLab/blob/main/README.md), which owns policy structure, dependencies, checkpoint layout, and server behavior. RoboDojo only assumes a policy directory provides:
+Most policies live in [XPolicyLab](https://github.com/XPolicyLab/XPolicyLab/blob/main/README.md), which owns policy structure, dependencies, checkpoint layout, and server behavior. For that runtime, RoboDojo assumes a policy directory provides:
 
 ```text
 XPolicyLab/policy/<POLICY_NAME>/eval.sh
@@ -65,6 +67,11 @@ XPolicyLab/policy/<POLICY_NAME>/deploy.yml
 ```
 
 `eval.sh` starts the policy server and calls back into RoboDojo through `scripts/eval_policy.sh`; `deploy.yml` declares the server host, port, action mode, and policy-specific runtime settings.
+
+Kai0 Pi0.5 also has an optional direct integration through the versioned
+`robodojo-policy-v1` protocol. Kai0 remains the owner of its model server and
+environment; RoboDojo owns only the simulator-side client and adapter. See the
+[Kai0 Pi0.5 integration guide](docs/KAI0_PI05_INTEGRATION.md).
 
 ## 🏆 Leaderboard
 

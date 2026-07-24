@@ -14,6 +14,15 @@ from env.global_configs import *
 from env.global_configs import BENCHMARK
 from env.observation_manager.obs_manager import ObsManager
 from env.seed_manager.seed_manager import SeedManager
+from src.eval_client.policy_runtime import (
+    PolicyV1EvalBridge,
+    ResetPayload,
+    ResetReason,
+    operator_trial_end,
+    run_policy_v1_lifecycle,
+    run_single_env_policy_episode,
+    task_trial_end,
+)
 from utils.cluttered_generator import UnStableError
 from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
@@ -58,6 +67,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.eval_batch = self.eval_cfg.get("eval_batch", False)
             self.eval_num = int(self.eval_cfg.get("eval_num", 50))
             self.policy_name = self.eval_cfg.get("policy_name", None)
+            self.policy_runtime = self.eval_cfg.get("policy_runtime", "xpolicy_ws_v0")
             self.additional_info = self.eval_cfg.get("additional_info", "")
             self.eval_seed = self.eval_cfg.get("seed", 0)
             self.control_mode = self.eval_cfg.get("control_mode", "policy")
@@ -142,6 +152,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 "score": 0.0,
                 "details": {},
             }
+            self.policy_provenance = None
 
             self.scene_manager.layout_manager.replay = True
             self.seed_manager = SeedManager(config.eval_cfg)
@@ -195,27 +206,69 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             if self.port is None:
                 raise ValueError("Port must be specified in deploy_cfg for the policy server!")
             self.host = self.deploy_cfg.get("host", "localhost")
-            _patch_websockets_proxy_compat()
-
             policy_server_url = self.deploy_cfg.get("policy_server_url") or f"ws://{self.host}:{self.port}"
-            evaluation_id = self.deploy_cfg.get("evaluation_id", self.run_id)
-            trial_id = self.deploy_cfg.get("trial_id", f"{self.task_name}-{self.run_id}")
-            action_case_id = self.deploy_cfg.get("action_case_id", f"{self.task_name}_case")
-            ws_request_timeout_s = self.deploy_cfg.get("ws_request_timeout_s")
-            ws_ping_interval_s = self.deploy_cfg.get("ws_ping_interval_s")
-            ws_ping_timeout_s = self.deploy_cfg.get("ws_ping_timeout_s")
-            ws_keepalive = self.deploy_cfg.get("ws_keepalive")
-            self.model_client = WsModelClient(
-                url=policy_server_url,
-                evaluation_id=evaluation_id,
-                trial_id=trial_id,
-                action_case_id=action_case_id,
-                repeat_index=self.deploy_cfg.get("repeat_index"),
-                request_timeout_s=ws_request_timeout_s,
-                ws_ping_interval_s=ws_ping_interval_s,
-                ws_ping_timeout_s=ws_ping_timeout_s,
-                ws_keepalive=ws_keepalive,
-            )
+            self._policy_episode_counter = 0
+            self._next_policy_reset_reason = ResetReason.EPISODE_START
+            if self.policy_runtime == "robodojo_policy_v1":
+                if self.num_envs != 1 or self.eval_batch:
+                    raise ValueError(
+                        "robodojo_policy_v1 requires num_envs=1 and eval_batch=false",
+                    )
+                self.policy_seed = int(self.deploy_cfg.get("policy_seed"))
+                self.model_client = PolicyV1EvalBridge(
+                    policy_server_url,
+                    expected_env_idx=0,
+                    connect_timeout_s=float(
+                        self.deploy_cfg.get("policy_connect_timeout_s", 30.0),
+                    ),
+                    request_timeout_s=float(
+                        self.deploy_cfg.get("policy_request_timeout_s", 600.0),
+                    ),
+                    close_timeout_s=float(
+                        self.deploy_cfg.get("policy_close_timeout_s", 10.0),
+                    ),
+                )
+                self.policy_provenance = self.model_client.provenance.to_payload()
+                resumed_provenance = (
+                    resume_state.get("policy_provenance")
+                    if resume_state is not None
+                    else None
+                )
+                if resumed_provenance is not None and resumed_provenance != self.policy_provenance:
+                    self.model_client.close()
+                    raise ValueError(
+                        "resume manifest policy provenance differs from the connected policy",
+                    )
+                self.eval_result["policy_provenance"] = self.policy_provenance
+                print(
+                    "[PolicyV1] connected "
+                    f"checkpoint={self.policy_provenance['checkpoint_id']} "
+                    f"digest={self.policy_provenance['checkpoint_digest']} "
+                    f"code={self.policy_provenance['code_revision']} "
+                    f"dirty={self.policy_provenance['dirty']}",
+                )
+            elif self.policy_runtime == "xpolicy_ws_v0":
+                _patch_websockets_proxy_compat()
+                evaluation_id = self.deploy_cfg.get("evaluation_id", self.run_id)
+                trial_id = self.deploy_cfg.get("trial_id", f"{self.task_name}-{self.run_id}")
+                action_case_id = self.deploy_cfg.get("action_case_id", f"{self.task_name}_case")
+                ws_request_timeout_s = self.deploy_cfg.get("ws_request_timeout_s")
+                ws_ping_interval_s = self.deploy_cfg.get("ws_ping_interval_s")
+                ws_ping_timeout_s = self.deploy_cfg.get("ws_ping_timeout_s")
+                ws_keepalive = self.deploy_cfg.get("ws_keepalive")
+                self.model_client = WsModelClient(
+                    url=policy_server_url,
+                    evaluation_id=evaluation_id,
+                    trial_id=trial_id,
+                    action_case_id=action_case_id,
+                    repeat_index=self.deploy_cfg.get("repeat_index"),
+                    request_timeout_s=ws_request_timeout_s,
+                    ws_ping_interval_s=ws_ping_interval_s,
+                    ws_ping_timeout_s=ws_ping_timeout_s,
+                    ws_keepalive=ws_keepalive,
+                )
+            else:
+                raise ValueError(f"Unsupported policy runtime: {self.policy_runtime!r}")
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
 
         def close(self):
@@ -265,7 +318,37 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.robot_manager.set_robot_init_state()
             self.reward_manager.init_state()
 
-            self.model_client.call(func_name="reset")
+            if self.policy_runtime == "robodojo_policy_v1":
+                self._start_policy_v1_episode()
+            else:
+                self.model_client.call(func_name="reset")
+
+        def set_next_policy_reset_reason(self, reason):
+            if not isinstance(reason, ResetReason):
+                raise TypeError("reason must be ResetReason")
+            self._next_policy_reset_reason = reason
+
+        def _start_policy_v1_episode(self):
+            if self.model_client.episode_active:
+                raise RuntimeError(
+                    "previous policy-v1 episode is still active before simulator reset",
+                )
+            layout_id = int(self.env_seeds[0])
+            self._policy_episode_counter += 1
+            episode_id = (
+                f"{self.run_id}-pid-{os.getpid()}-"
+                f"episode-{self._policy_episode_counter}"
+            )
+            payload = ResetPayload(
+                task_name=self.task_name,
+                simulator_seed=layout_id,
+                policy_seed=self.policy_seed,
+                layout_id=layout_id,
+                layout_cycle=int(self.layout_cycle),
+                reason=self._next_policy_reset_reason,
+            )
+            self.model_client.start_episode(episode_id, payload)
+            self._next_policy_reset_reason = ResetReason.EPISODE_START
 
         def setup_scene(self):
             self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
@@ -318,6 +401,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
                 run_keyboard_intervention_episode(self, self.model_client)
                 return
+            if self.policy_runtime == "robodojo_policy_v1":
+                run_single_env_policy_episode(self, self.model_client)
+                return
             policy_name = self.deploy_cfg["policy_name"]
             try:
                 eval_module = __import__(
@@ -343,6 +429,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             eval_module.eval_one_episode(TASK_ENV=self, model_client=self.model_client)
 
         def eval_one_episode_batch(self):
+            if self.policy_runtime == "robodojo_policy_v1":
+                raise RuntimeError(
+                    "robodojo_policy_v1 does not support batched evaluation",
+                )
             if self.control_mode == "keyboard_observe":
                 from src.eval_client.observation_loop import run_keyboard_observation_episode
 
@@ -746,6 +836,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 "completed_layout_ids": completed_layout_ids,
                 "abandoned_layout_ids": sorted(int(s) for s in self.abandoned_seeds),
                 "details": self.eval_result.get("details", {}),
+                "policy_provenance": self.policy_provenance,
                 "restart_count": int(restart_count),
             }
             tmp_path = manifest_path + ".tmp"
@@ -814,7 +905,47 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
         def get_seeds_for_envs(self, env_idxs) -> set:
             return {self.current_env_seed_map[i] for i in env_idxs if i in self.current_env_seed_map}
 
+        @staticmethod
+        def _is_operator_policy_boundary(error):
+            from src.eval_client.intervention_loop import (
+                InterventionAcceptedAndExit,
+                InterventionDiscardedAndExit,
+                InterventionRejected,
+                InterventionSavedForRetry,
+            )
+            from src.eval_client.observation_loop import (
+                ObservationAdvance,
+                ObservationExit,
+            )
+
+            return isinstance(
+                error,
+                InterventionAcceptedAndExit
+                | InterventionDiscardedAndExit
+                | InterventionRejected
+                | InterventionSavedForRetry
+                | ObservationAdvance
+                | ObservationExit
+                | KeyboardInterrupt,
+            )
+
         def run_eval(self):
+            if self.policy_runtime != "robodojo_policy_v1":
+                return self._run_eval_impl()
+
+            def normal_outcome():
+                if self.operator_driven or self.observation_mode:
+                    return operator_trial_end("operator_controlled_boundary")
+                return task_trial_end(bool(self.success[0]))
+
+            return run_policy_v1_lifecycle(
+                self.model_client,
+                self._run_eval_impl,
+                normal_outcome=normal_outcome,
+                is_operator_boundary=self._is_operator_policy_boundary,
+            )
+
+        def _run_eval_impl(self):
             self.run_reward()
             if hasattr(self, "get_score"):
                 self.get_score()

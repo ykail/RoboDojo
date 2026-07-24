@@ -526,6 +526,10 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
     layout_id = env_seeds[0] if env_seeds is not None and len(env_seeds) else -1
     seed_manager = getattr(task_env, "seed_manager", None)
     layout_cycle = getattr(task_env, "layout_cycle", getattr(seed_manager, "cycle_index", 0))
+    policy_provenance = getattr(task_env, "policy_provenance", None)
+    if not isinstance(policy_provenance, dict):
+        policy_provenance = {}
+    checkpoint_id = policy_provenance.get("checkpoint_id")
     return {
         "task_name": getattr(task_env, "task_name", os.environ.get("ROBODOJO_TASK_NAME", "")),
         "env_config": getattr(task_env, "config_name", os.environ.get("ROBODOJO_ENV_CFG", "")),
@@ -533,9 +537,15 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         "layout_cycle": int(layout_cycle),
         "eval_seed": int(getattr(task_env, "eval_seed", -1)),
         "policy_name": getattr(task_env, "policy_name", "Pi_05"),
-        "base_checkpoint": os.environ.get(
-            "ROBODOJO_CHECKPOINT", str(getattr(task_env, "additional_info", ""))
+        "base_checkpoint": str(
+            checkpoint_id
+            or os.environ.get(
+                "ROBODOJO_CHECKPOINT",
+                getattr(task_env, "additional_info", ""),
+            ),
         ),
+        "policy_runtime": getattr(task_env, "policy_runtime", "xpolicy_ws_v0"),
+        "policy_provenance": dict(policy_provenance),
         "robodojo_commit": _git_revision(project_root),
         "xpolicylab_commit": _git_revision(project_root / "XPolicyLab"),
         "run_id": os.environ.get("ROBODOJO_RUN_ID", ""),

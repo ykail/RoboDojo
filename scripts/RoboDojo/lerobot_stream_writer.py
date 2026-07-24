@@ -652,11 +652,19 @@ def _episode_metadata(
         except (TypeError, ValueError):
             return default
 
+    policy_provenance = metadata.get("policy_provenance", {})
+    if not isinstance(policy_provenance, dict):
+        policy_provenance = {}
+
     return {
         "robodojo_task": str(metadata.get("task_name", "")),
         "robodojo_env_config": str(metadata.get("env_config", "")),
         "robodojo_checkpoint": str(metadata.get("base_checkpoint", "")),
         "robodojo_policy_name": str(metadata.get("policy_name", "")),
+        "robodojo_policy_runtime": str(
+            metadata.get("policy_runtime", "xpolicy_ws_v0"),
+        ),
+        "robodojo_policy_provenance": dict(policy_provenance),
         "robodojo_layout_id": integer("layout_id"),
         "robodojo_layout_cycle": integer("layout_cycle", 0),
         "robodojo_eval_seed": integer("eval_seed"),

@@ -27,11 +27,17 @@ seed=""
 host="localhost"
 protocol=""
 policy_server_url=""
+policy_runtime="xpolicy_ws_v0"
+action_type=""
+policy_seed=""
+policy_connect_timeout_s="30"
+policy_request_timeout_s="600"
+policy_close_timeout_s="10"
 extra_args=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --root_dir|--bench_name|--dataset_name|--task_name|--env_cfg_type|--device_id|--policy_name|--port|--eval_batch|--additional_info|--seed|--host|--protocol|--policy_server_url)
+    --root_dir|--bench_name|--dataset_name|--task_name|--env_cfg_type|--device_id|--policy_name|--port|--eval_batch|--additional_info|--seed|--host|--protocol|--policy_server_url|--policy_runtime|--action_type|--policy_seed|--policy_connect_timeout_s|--policy_request_timeout_s|--policy_close_timeout_s)
       if [[ $# -lt 2 || "$2" == --* ]]; then
         echo "[ERROR] Missing value for argument: $1"
         exit 1
@@ -51,6 +57,12 @@ while [[ $# -gt 0 ]]; do
         --host) host="$2" ;;
         --protocol) protocol="$2" ;;
         --policy_server_url) policy_server_url="$2" ;;
+        --policy_runtime) policy_runtime="$2" ;;
+        --action_type) action_type="$2" ;;
+        --policy_seed) policy_seed="$2" ;;
+        --policy_connect_timeout_s) policy_connect_timeout_s="$2" ;;
+        --policy_request_timeout_s) policy_request_timeout_s="$2" ;;
+        --policy_close_timeout_s) policy_close_timeout_s="$2" ;;
       esac
       shift 2
       ;;
@@ -100,6 +112,7 @@ if [[ "${protocol}" == "ws" ]]; then
 else
   echo "[INFO] policy transport = ${protocol}"
 fi
+echo "[INFO] policy runtime = ${policy_runtime}"
 if [[ -n "${policy_server_url}" ]]; then
   echo "[INFO] policy_server_url = ${policy_server_url}"
 fi
@@ -149,6 +162,11 @@ if [[ -z "${ROBODOJO_RUN_ID:-}" ]]; then
 fi
 echo "[eval_policy] ROBODOJO_RUN_ID=${ROBODOJO_RUN_ID}"
 
+POLICY_SEED_ARGS=()
+if [[ -n "${policy_seed}" ]]; then
+  POLICY_SEED_ARGS+=(--policy_seed "${policy_seed}")
+fi
+
 MAX_BASH_RETRIES="${ROBODOJO_MAX_BASH_RETRIES:-10}"
 attempt=0
 while : ; do
@@ -163,10 +181,16 @@ while : ; do
     --policy_name "$policy_name" \
     --port "$port" \
     --protocol "$protocol" \
+    --policy_runtime "$policy_runtime" \
+    --action_type "$action_type" \
     --policy_server_url "$policy_server_url" \
+    --policy_connect_timeout_s "$policy_connect_timeout_s" \
+    --policy_request_timeout_s "$policy_request_timeout_s" \
+    --policy_close_timeout_s "$policy_close_timeout_s" \
     --additional_info "$additional_info" \
     --seed "$seed" \
     --host "$host" \
+    "${POLICY_SEED_ARGS[@]}" \
     "${APP_MODE_ARGS[@]}" \
     "${extra_args[@]}" \
     "$@"

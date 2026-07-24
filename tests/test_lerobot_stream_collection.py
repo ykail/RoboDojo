@@ -5,6 +5,7 @@ from pathlib import Path
 import queue
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -13,9 +14,10 @@ import numpy as np
 from scripts.RoboDojo import lerobot_stream_writer as writer
 from src.eval_client.lerobot_stream_protocol import receive_message, send_message
 from src.eval_client.lerobot_stream_recorder import (
-    LeRobotStreamStartupError,
     LeRobotStreamRecorder,
+    LeRobotStreamStartupError,
     StreamConfig,
+    _task_metadata,
     _WriterSidecar,
     config_from_environment,
 )
@@ -177,6 +179,35 @@ def _all_packets(stream):
 
 
 class LeRobotStreamWriterTest(unittest.TestCase):
+    def test_episode_metadata_preserves_strict_policy_provenance(self):
+        provenance = {
+            "implementation": "kai0",
+            "config_name": "pi05_robodojo_arx_x5_joint",
+            "checkpoint_id": "toast/5000",
+            "checkpoint_digest": "sha256:" + "a" * 64,
+            "code_revision": "b" * 40,
+            "dirty": False,
+        }
+        metadata = writer._episode_metadata(
+            {
+                "task_name": "make_toast",
+                "policy_runtime": "robodojo_policy_v1",
+                "policy_provenance": provenance,
+            },
+            success=True,
+            reason="operator_accept",
+            has_intervention=True,
+            frame_count=42,
+        )
+        self.assertEqual(
+            metadata["robodojo_policy_runtime"],
+            "robodojo_policy_v1",
+        )
+        self.assertEqual(
+            metadata["robodojo_policy_provenance"],
+            provenance,
+        )
+
     def test_frame_matches_kai0_intervention_features(self):
         frame = writer.build_frame(_frame_message(source="safety_hold", policy=False))
         self.assertEqual(frame["observation.state"].shape, (14,))
@@ -588,6 +619,44 @@ class _FakeSidecar:
 
 
 class LeRobotStreamRecorderTest(unittest.TestCase):
+    def test_task_metadata_uses_connected_checkpoint_identity(self):
+        provenance = {
+            "checkpoint_id": "toast/5000",
+            "checkpoint_digest": "sha256:" + "a" * 64,
+            "code_revision": "b" * 40,
+            "dirty": False,
+        }
+        task_env = SimpleNamespace(
+            env_seeds=[7],
+            layout_cycle=2,
+            task_name="make_toast",
+            config_name="arx_x5",
+            eval_seed=3,
+            policy_name="Kai0_Pi05",
+            policy_runtime="robodojo_policy_v1",
+            policy_provenance=provenance,
+            additional_info="human-label",
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ROBODOJO_RUN_ID": "run-1",
+                    "ROBODOJO_CHECKPOINT": "conflicting-legacy-label",
+                },
+                clear=True,
+            ),
+            mock.patch(
+                "src.eval_client.lerobot_stream_recorder._git_revision",
+                return_value="revision",
+            ),
+        ):
+            metadata = _task_metadata(task_env)
+
+        self.assertEqual(metadata["base_checkpoint"], "toast/5000")
+        self.assertEqual(metadata["policy_runtime"], "robodojo_policy_v1")
+        self.assertEqual(metadata["policy_provenance"], provenance)
+
     def test_config_preserves_virtualenv_python_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

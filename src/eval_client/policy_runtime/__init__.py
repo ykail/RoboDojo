@@ -53,6 +53,17 @@ from src.eval_client.policy_runtime.codec import (
     encode_frame,
 )
 from src.eval_client.policy_runtime.errors import ErrorCode, ProtocolError
+from src.eval_client.policy_runtime.eval_bridge import (
+    PolicyV1BridgeStateError,
+    PolicyV1EvalBridge,
+    interrupted_trial_end,
+    operator_trial_end,
+    run_policy_v1_lifecycle,
+    task_trial_end,
+)
+from src.eval_client.policy_runtime.eval_loop import (
+    run_single_env_policy_episode,
+)
 from src.eval_client.policy_runtime.execution_profile import (
     ACTION_CHUNK_CONSUMPTION,
     ACTION_NEXT_INFER_OBSERVATION,
@@ -146,6 +157,8 @@ __all__ = [
     "PolicyClientStateError",
     "PolicyTimeoutError",
     "PolicyExecutionProfile",
+    "PolicyV1BridgeStateError",
+    "PolicyV1EvalBridge",
     "PolicyProvenance",
     "PolicySession",
     "ProtocolError",
@@ -169,6 +182,8 @@ __all__ = [
     "decode_frame",
     "encode_frame",
     "iter_arx_x5_eval_actions",
+    "interrupted_trial_end",
+    "operator_trial_end",
     "parse_action_chunk",
     "parse_empty_success_payload",
     "parse_error_payload",
@@ -179,4 +194,7 @@ __all__ = [
     "parse_observation",
     "parse_reset_payload",
     "parse_trial_end_payload",
+    "run_single_env_policy_episode",
+    "run_policy_v1_lifecycle",
+    "task_trial_end",
 ]

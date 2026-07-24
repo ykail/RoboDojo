@@ -42,6 +42,27 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--policy_runtime",
+    choices=("xpolicy_ws_v0", "robodojo_policy_v1"),
+    default="xpolicy_ws_v0",
+    help="Application-level policy API; independent from the WebSocket transport.",
+)
+parser.add_argument(
+    "--action_type",
+    type=str,
+    default="",
+    help="Policy action-space label used for runtime compatibility checks.",
+)
+parser.add_argument(
+    "--policy_seed",
+    type=int,
+    default=None,
+    help="Episode sampling seed for policy-v1; defaults to --seed.",
+)
+parser.add_argument("--policy_connect_timeout_s", type=float, default=30.0)
+parser.add_argument("--policy_request_timeout_s", type=float, default=600.0)
+parser.add_argument("--policy_close_timeout_s", type=float, default=10.0)
+parser.add_argument(
     "--policy_server_url",
     type=str,
     default="",
@@ -62,6 +83,22 @@ parser.add_argument("--seed", type=int, required=True, help="policy seed for eva
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.policy_seed is None:
+    args_cli.policy_seed = args_cli.seed
+if args_cli.policy_runtime == "robodojo_policy_v1":
+    if not 0 <= args_cli.policy_seed <= (1 << 32) - 1:
+        parser.error("--policy_seed must be in [0, 2^32 - 1] for policy-v1")
+    if args_cli.env_cfg_type != "arx_x5":
+        parser.error("policy-v1 currently requires --env_cfg_type arx_x5")
+    if args_cli.action_type != "joint":
+        parser.error("policy-v1 currently requires --action_type joint")
+    for timeout_name in (
+        "policy_connect_timeout_s",
+        "policy_request_timeout_s",
+        "policy_close_timeout_s",
+    ):
+        if getattr(args_cli, timeout_name) <= 0:
+            parser.error(f"--{timeout_name} must be positive")
 
 # Safe to import before AppLauncher: env is a namespace package (no __init__)
 # and GLOBAL_CONFIGS only imports os, so this pulls in no app-dependent code.
@@ -139,6 +176,7 @@ from src.eval_client.lerobot_stream_recorder import (
     close_lerobot_stream_session,
 )
 from src.eval_client.observation_loop import ObservationAdvance, ObservationExit
+from src.eval_client.policy_runtime import PolicyClientError, ResetReason
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
@@ -229,6 +267,10 @@ def _restart_or_exit(env, simulation_app, fatal_msg):
         f"[FATAL] PhysX kernel failure detected: {fatal_msg}; persisted manifest. "
         f"In-process restart attempt {restart_count}/{MAX_INPROC_RESTARTS}."
     )
+    # Release the strict policy server's single-model lease before execv.
+    # Otherwise the replacement process can race the server's disconnect
+    # cleanup and receive a terminal session_busy response during HELLO.
+    _close_model_client(env)
     try:
         simulation_app.close()
     except Exception:
@@ -251,6 +293,9 @@ def _exit_for_shell_restart(env, fatal_msg):
     except Exception as e:
         print(f"[FATAL] persist_resume_manifest failed: {e}")
     print(f"[FATAL] PhysX requested shell-level restart: {fatal_msg}; exiting with rc=99 for bash-level retry.")
+    # os._exit skips normal cleanup; explicitly close the socket so the next
+    # shell-launched client does not inherit a still-held Kai0 policy lease.
+    _close_model_client(env)
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(99)
@@ -262,6 +307,7 @@ def main():
     """
     task_name = args_cli.task_name
     num_envs = args_cli.num_envs
+    policy_runtime = args_cli.policy_runtime
     control_mode = os.environ.get("ROBODOJO_CONTROL_MODE", "policy").strip().lower()
     if control_mode not in {"policy", "keyboard_intervention", "keyboard_observe"}:
         raise ValueError(
@@ -272,7 +318,7 @@ def main():
     operator_driven = control_mode == "keyboard_intervention"
     observation_mode = control_mode == "keyboard_observe"
     if control_mode in {"keyboard_intervention", "keyboard_observe"}:
-        if args_cli.policy_name != "Pi_05":
+        if policy_runtime == "xpolicy_ws_v0" and args_cli.policy_name != "Pi_05":
             raise ValueError("Interactive keyboard modes are currently validated only for policy_name=Pi_05.")
         launcher_headless = bool(getattr(app_launcher, "_headless", getattr(args_cli, "headless", False)))
         if launcher_headless:
@@ -283,13 +329,24 @@ def main():
         if num_envs != 1:
             print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
             num_envs = 1
+    if policy_runtime == "robodojo_policy_v1" and num_envs != 1:
+        print(f"[main] policy-v1 forces num_envs {num_envs} -> 1")
+        num_envs = 1
     eval_cfg_name = args_cli.env_cfg_type
     eval_cfg = load_yaml(os.path.join(ENV_CONFIG_PATH, eval_cfg_name + ".yml"))
     eval_cfg["task_name"] = task_name
     eval_cfg["num_envs"] = num_envs
     eval_cfg["device_id"] = args_cli.device_id
-    policy_deploy_cfg = _load_policy_deploy(args_cli.policy_name)
-    eval_batch = bool(policy_deploy_cfg.get("eval_batch", False))
+    policy_deploy_cfg = (
+        _load_policy_deploy(args_cli.policy_name)
+        if policy_runtime == "xpolicy_ws_v0"
+        else {}
+    )
+    eval_batch = (
+        bool(policy_deploy_cfg.get("eval_batch", False))
+        if policy_runtime == "xpolicy_ws_v0"
+        else False
+    )
     eval_cfg["eval_batch"] = eval_batch
     eval_cfg["policy_name"] = args_cli.policy_name
     eval_cfg["additional_info"] = args_cli.additional_info
@@ -298,13 +355,19 @@ def main():
     eval_cfg["control_mode"] = control_mode
     eval_cfg["operator_driven"] = operator_driven
     eval_cfg["observation_mode"] = observation_mode
+    eval_cfg["policy_runtime"] = policy_runtime
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
     deploy_cfg["port"] = args_cli.port
     deploy_cfg["host"] = args_cli.host
     deploy_cfg["protocol"] = args_cli.protocol
+    deploy_cfg["policy_runtime"] = policy_runtime
     deploy_cfg["policy_server_url"] = args_cli.policy_server_url or f"ws://{args_cli.host}:{args_cli.port}"
+    deploy_cfg["policy_seed"] = args_cli.policy_seed
+    deploy_cfg["policy_connect_timeout_s"] = args_cli.policy_connect_timeout_s
+    deploy_cfg["policy_request_timeout_s"] = args_cli.policy_request_timeout_s
+    deploy_cfg["policy_close_timeout_s"] = args_cli.policy_close_timeout_s
     deploy_cfg["evaluation_id"] = os.environ["ROBODOJO_RUN_ID"]
     deploy_cfg["trial_id"] = f"{task_name}-{os.environ['ROBODOJO_RUN_ID']}"
     deploy_cfg["action_case_id"] = f"{task_name}_case"
@@ -350,7 +413,7 @@ def main():
     num_envs = capped_num_envs
     if not eval_batch and num_envs != 1:
         print(
-            f"[main] eval_batch=false in XPolicyLab/policy/{args_cli.policy_name}/deploy.yml; "
+            f"[main] eval_batch=false for policy runtime {policy_runtime}; "
             f"forcing num_envs {num_envs} -> 1"
         )
         num_envs = 1
@@ -359,6 +422,13 @@ def main():
     OmegaConf.update(env_cfg, "eval_cfg.num_envs", num_envs, force_add=True)
     env_cfg = process_randomization(env_cfg)
     env_cfg, eval_num = process_config(env_cfg, task_name=task_name)
+    if policy_runtime == "robodojo_policy_v1":
+        collect_freq = float(eval_cfg["observation"].get("collect_freq", 0))
+        if collect_freq != 25.0:
+            raise ValueError(
+                "policy-v1 ARX X5 profile requires observation.collect_freq=25, "
+                f"got {collect_freq}",
+            )
 
     if os.environ.get("EVAL_NUM") and not operator_driven:
         _env_eval_num = os.environ.get("EVAL_NUM")
@@ -419,6 +489,7 @@ def main():
             env.seed_manager.eval_step()
         except InterventionRejected:
             print("[Intervention] rejected attempt does not count; retrying the same layout.")
+            env.set_next_policy_reset_reason(ResetReason.OPERATOR_RETRY)
             env.close()
             retry_round = True
         except InterventionSavedForRetry as request:
@@ -426,6 +497,7 @@ def main():
                 "[Intervention] saved attempt does not consume the layout; "
                 f"resetting the same layout. file={request.saved_path}"
             )
+            env.set_next_policy_reset_reason(ResetReason.OPERATOR_RETRY)
             env.close()
             retry_round = True
         except InterventionAcceptedAndExit as request:
@@ -451,6 +523,17 @@ def main():
             # dataset lock.  Stop cleanly instead of reloading Isaac forever.
             print(f"[Intervention][FATAL] {e}", flush=True)
             env.close()
+            operator_fatal_error = e
+            operator_stop_requested = True
+        except KeyboardInterrupt as e:
+            print("[main] interrupted by operator; closing the current run.", flush=True)
+            operator_fatal_error = e
+            operator_stop_requested = True
+        except PolicyClientError as e:
+            print(
+                f"[PolicyV1][FATAL] policy session cannot be replayed or reused: {e}",
+                flush=True,
+            )
             operator_fatal_error = e
             operator_stop_requested = True
         except Exception as e:
@@ -479,8 +562,17 @@ def main():
                         "[Intervention] current candidate was discarded after an error; "
                         "retrying the same layout."
                     )
+                    env.set_next_policy_reset_reason(ResetReason.SIMULATOR_RECOVERY)
                     env.close()
                     retry_round = True
+                elif policy_runtime == "robodojo_policy_v1":
+                    print(
+                        "[PolicyV1][FATAL] local policy-v1 integration error; "
+                        "the current session will not be reused.",
+                        flush=True,
+                    )
+                    operator_fatal_error = e
+                    operator_stop_requested = True
                 else:
                     env.seed_manager.eval_step()
 
@@ -510,6 +602,7 @@ def main():
                 f"refill from queue={replacements}; new batch={env.env_seeds}; "
                 f"real_remaining={real_remaining}"
             )
+            env.set_next_policy_reset_reason(ResetReason.SIMULATOR_RECOVERY)
             env.close()
             if real_remaining == 0:
                 print("[PhysX] no real seeds remaining in this batch, advancing.")
@@ -548,7 +641,13 @@ def main():
 
         env.close()
 
-    _delete_resume_manifest(env)
+    if operator_fatal_error is None:
+        _delete_resume_manifest(env)
+    else:
+        try:
+            env.persist_resume_manifest()
+        except Exception as e:
+            print(f"[main] failed to preserve resume manifest: {e}")
     close_lerobot_stream_session()
     _close_model_client(env)
     env.close()
