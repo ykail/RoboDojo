@@ -1,5 +1,12 @@
 # Pi0.5 keyboard intervention deployment
 
+> **Runtime scope:** this document describes the legacy XPolicyLab Pi0.5
+> launcher (`collect_pi05_keyboard.sh`). For the canonical direct Kai0 runtime
+> on `feat/kai0-pi05-runtime`, including its separate Kai0 `.venv` and
+> `eval_kai0_pi05.sh`, use
+> [`KAI0_PI05_SETUP.md`](KAI0_PI05_SETUP.md). The host, CUDA, Assets, GUI, and
+> keyboard guidance below remains useful for both paths.
+
 This guide reproduces the visible RoboDojo simulation, Pi0.5 inference server,
 and direct LeRobot v3 keyboard-intervention recorder on another Ubuntu
 workstation. For operator controls and output semantics, see
@@ -32,10 +39,11 @@ Only the RoboDojo superproject is required. It pins these submodules:
 | `third_party/IsaacLab` | `afca7b09d60d8beb9c1cb28b43066499940b969b` |
 | `third_party/curobo` | `895c6517243f8cb091c73c018c8167192d39599a` |
 
-OpenPI is already vendored under `XPolicyLab/policy/Pi_05/openpi`. Do not clone
-another OpenPI repository. Kai0 and ROS are not required for inference or
-intervention recording. Kai0 is only needed later if it is
-chosen as the training stack.
+For the legacy path documented below, OpenPI is already vendored under
+`XPolicyLab/policy/Pi_05/openpi`; do not clone another OpenPI repository. Kai0
+and ROS are not required for that legacy launcher. The direct Kai0 runtime is a
+separate supported path and requires the pinned `third_party/kai0` submodule;
+follow [`KAI0_PI05_SETUP.md`](KAI0_PI05_SETUP.md) for that configuration.
 
 This branch reads `XPolicyLab` from `https://github.com/ykail/XPolicyLab.git`,
 branch `feat/robodojo-pi05-runtime`, so fresh clones can fetch the pinned

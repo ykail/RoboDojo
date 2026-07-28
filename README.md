@@ -42,6 +42,7 @@ The [RoboDojo documentation](https://robodojo-benchmark.com/doc/) is the canonic
 | [Real Robot Tasks Details](https://robodojo-benchmark.com/doc/real-tasks/) | The 18 real-world tasks on Piper X, Piper, and ARX X5. |
 | [Configurations](https://robodojo-benchmark.com/doc/usage/configurations/) | Simulator, scene, robot, and camera configuration options. |
 | [Common Issues](https://robodojo-benchmark.com/doc/common-issue/) | Troubleshooting for installation, assets, GPU memory, and evaluation. |
+| [Kai0 Pi0.5 Setup](docs/KAI0_PI05_SETUP.md) | Standard fresh-machine setup, checkpoint configuration, evaluation, intervention collection, and development workflow. |
 | [Kai0 Pi0.5 Integration](docs/KAI0_PI05_INTEGRATION.md) | Strict socket runtime, submodule/worktree workflow, training-code ownership, and one-command evaluation. |
 
 ## 🗂️ Repository Structure
@@ -71,7 +72,9 @@ XPolicyLab/policy/<POLICY_NAME>/deploy.yml
 Kai0 Pi0.5 also has an optional direct integration through the versioned
 `robodojo-policy-v1` protocol. Kai0 remains the owner of its model server and
 environment; RoboDojo owns only the simulator-side client and adapter. See the
-[Kai0 Pi0.5 integration guide](docs/KAI0_PI05_INTEGRATION.md).
+[Kai0 Pi0.5 setup guide](docs/KAI0_PI05_SETUP.md) for installation and commands,
+and the [integration guide](docs/KAI0_PI05_INTEGRATION.md) for architecture and
+protocol details.
 
 ## 🏆 Leaderboard
 
