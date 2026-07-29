@@ -18,7 +18,8 @@ import time
 from typing import Any
 import uuid
 
-PROTOCOL = "robodojo_piperx_v2"
+PROTOCOL = "robodojo_piperx_v3"
+EMBODIMENT_PROFILE = "arx_x5_piperx_relative_v1"
 MAX_FRAME_BYTES = 1 << 20
 _ENVELOPE_KEYS = frozenset(
     {
@@ -33,11 +34,22 @@ _ENVELOPE_KEYS = frozenset(
         "payload",
     }
 )
-_REQUEST_TYPES = frozenset({"begin_episode", "exchange", "heartbeat", "hold", "end_episode"})
+_REQUEST_TYPES = frozenset(
+    {
+        "arm_and_begin_episode",
+        "exchange",
+        "transition_ack",
+        "manual_sample",
+        "manual_resolve",
+        "heartbeat",
+        "hold",
+        "end_episode",
+    }
+)
 _MODES = frozenset({"policy", "intervention", "fault"})
-_CONTROL_TOPOLOGY = "accepted_sim_to_follower_to_leader"
+_CONTROL_TOPOLOGY = "policy_sim_to_follower_to_leader_manual_leader_joint_fanout"
 _LEADER_ACTUATION_MODES = frozenset({"output_follow", "native_leader", "disabled", "fault"})
-_FOLLOWER_ACTUATION_MODES = frozenset({"sim_follow", "hold", "disabled", "fault"})
+_FOLLOWER_ACTUATION_MODES = frozenset({"sim_follow", "leader_follow", "hold", "disabled", "fault"})
 _TRANSITIONS = frozenset({None, "entering_intervention", "reattaching_policy"})
 _EDGES = frozenset({None, "enter", "exit"})
 _TERMINAL_REQUESTS = frozenset({None, "accept_next", "discard_retry", "accept_exit", "discard_exit"})
@@ -128,10 +140,29 @@ class SimTargets:
 
 @dataclass(frozen=True)
 class OperatorArmSample:
-    """Absolute leader pose and measured gripper opening."""
+    """One physical leader state whose pose was computed from the same cached joints."""
 
     pose: tuple[float, ...]
     gripper_m: float
+    sampled_monotonic_ns: int
+
+
+@dataclass(frozen=True)
+class ManualSample:
+    """A single-use, bimanual leader sample cached by the hardware bridge."""
+
+    sample_id: int
+    left: OperatorArmSample
+    right: OperatorArmSample
+
+
+@dataclass(frozen=True)
+class ManualResolution:
+    """Hardware outcome for one exact manual sample."""
+
+    sample_id: int
+    decision: str
+    follower_commanded: bool
 
 
 @dataclass(frozen=True)
@@ -142,16 +173,29 @@ class OperatorSample:
     seq: int
     mode: str
     control_topology: str
+    embodiment_profile: str
     leader_actuation_mode: str
     follower_actuation_mode: str
     transition: str | None
     edge: str | None
     terminal_request: str | None
-    left: OperatorArmSample
-    right: OperatorArmSample
-    mirror_accepted: bool
+    manual_sample: ManualSample | None
+    manual_resolution: ManualResolution | None
+    motion_accepted: bool
     health: dict[str, Any]
     diagnostics: dict[str, Any]
+
+    @property
+    def left(self) -> OperatorArmSample:
+        if self.manual_sample is None:
+            raise PiperXBridgeProtocolError("Response does not carry a manual leader sample")
+        return self.manual_sample.left
+
+    @property
+    def right(self) -> OperatorArmSample:
+        if self.manual_sample is None:
+            raise PiperXBridgeProtocolError("Response does not carry a manual leader sample")
+        return self.manual_sample.right
 
 
 def encode_frame(message: dict[str, Any], *, max_frame_bytes: int = MAX_FRAME_BYTES) -> bytes:
@@ -222,14 +266,61 @@ def receive_frame(connection: socket.socket, *, max_frame_bytes: int = MAX_FRAME
 
 
 def _parse_arm_sample(value: Any, *, label: str) -> OperatorArmSample:
-    if not isinstance(value, dict) or set(value) != {"pose", "gripper_m"}:
-        raise PiperXBridgeProtocolError(f"{label} must contain exactly pose and gripper_m")
+    expected = {"pose", "gripper_m", "sampled_monotonic_ns"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise PiperXBridgeProtocolError(
+            f"{label} must contain exactly pose, gripper_m and sampled_monotonic_ns"
+        )
     gripper_m = _finite_number(value["gripper_m"], label=f"{label}.gripper_m")
     if not 0.0 <= gripper_m <= 0.2:
         raise PiperXBridgeProtocolError(f"{label}.gripper_m must be in [0, 0.2]")
     return OperatorArmSample(
         pose=_pose(value["pose"], label=f"{label}.pose"),
         gripper_m=gripper_m,
+        sampled_monotonic_ns=_non_negative_int(
+            value["sampled_monotonic_ns"], label=f"{label}.sampled_monotonic_ns"
+        ),
+    )
+
+
+def _parse_manual_sample(value: Any) -> ManualSample | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"sample_id", "left", "right"}:
+        raise PiperXBridgeProtocolError(
+            "manual_sample must be null or contain exactly sample_id, left and right"
+        )
+    sample_id = _non_negative_int(value["sample_id"], label="manual_sample.sample_id")
+    if sample_id < 1:
+        raise PiperXBridgeProtocolError("manual_sample.sample_id must be positive")
+    return ManualSample(
+        sample_id=sample_id,
+        left=_parse_arm_sample(value["left"], label="manual_sample.left"),
+        right=_parse_arm_sample(value["right"], label="manual_sample.right"),
+    )
+
+
+def _parse_manual_resolution(value: Any) -> ManualResolution | None:
+    if value is None:
+        return None
+    expected = {"sample_id", "decision", "follower_commanded"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise PiperXBridgeProtocolError(
+            "manual_resolution must be null or contain exactly sample_id, decision and follower_commanded"
+        )
+    sample_id = _non_negative_int(value["sample_id"], label="manual_resolution.sample_id")
+    decision = value["decision"]
+    follower_commanded = value["follower_commanded"]
+    if sample_id < 1 or decision not in {"anchor", "commit", "reject"} or not isinstance(
+        follower_commanded, bool
+    ):
+        raise PiperXBridgeProtocolError("manual_resolution contains an invalid outcome")
+    if follower_commanded is not (decision == "commit"):
+        raise PiperXBridgeProtocolError("manual_resolution decision disagrees with follower_commanded")
+    return ManualResolution(
+        sample_id=sample_id,
+        decision=decision,
+        follower_commanded=follower_commanded,
     )
 
 
@@ -243,6 +334,8 @@ class PiperXBridgeClient:
         port: int = 8765,
         connect_timeout_s: float = 5.0,
         response_timeout_s: float = 0.2,
+        arm_timeout_s: float = 60.0,
+        transition_timeout_s: float = 10.0,
         heartbeat_interval_s: float = 0.25,
         session_id: str | None = None,
         max_frame_bytes: int = MAX_FRAME_BYTES,
@@ -251,7 +344,13 @@ class PiperXBridgeClient:
             raise ValueError("PiPER-X bridge host must be loopback (127.0.0.1, ::1, or localhost)")
         if not 1 <= int(port) <= 65535:
             raise ValueError("PiPER-X bridge port must be in [1, 65535]")
-        if connect_timeout_s <= 0 or response_timeout_s <= 0 or heartbeat_interval_s <= 0:
+        if (
+            connect_timeout_s <= 0
+            or response_timeout_s <= 0
+            or arm_timeout_s <= 0
+            or transition_timeout_s <= 0
+            or heartbeat_interval_s <= 0
+        ):
             raise ValueError("PiPER-X bridge timeouts must be positive")
         if max_frame_bytes <= 0:
             raise ValueError("PiPER-X bridge frame limit must be positive")
@@ -259,6 +358,8 @@ class PiperXBridgeClient:
         self.port = int(port)
         self.connect_timeout_s = float(connect_timeout_s)
         self.response_timeout_s = float(response_timeout_s)
+        self.arm_timeout_s = float(arm_timeout_s)
+        self.transition_timeout_s = float(transition_timeout_s)
         self.heartbeat_interval_s = float(heartbeat_interval_s)
         self.session_id = _identifier(session_id or str(uuid.uuid4()), label="session_id")
         self.max_frame_bytes = int(max_frame_bytes)
@@ -267,6 +368,7 @@ class PiperXBridgeClient:
         self._episode_active = False
         self._generation = 0
         self._seq = 0
+        self._pending_manual_sample_id: int | None = None
         self._session_lost = False
         self._request_lock = threading.RLock()
         self._heartbeat_stop = threading.Event()
@@ -309,6 +411,7 @@ class PiperXBridgeClient:
         *,
         from_heartbeat: bool = False,
         ignore_heartbeat_error: bool = False,
+        timeout_s: float | None = None,
     ) -> OperatorSample:
         if request_type not in _REQUEST_TYPES:
             raise ValueError(f"Unknown PiPER-X bridge request type: {request_type!r}")
@@ -321,8 +424,11 @@ class PiperXBridgeClient:
                 ) from self._heartbeat_error
             self.connect()
             assert self._socket is not None
+            request_timeout_s = self.response_timeout_s if timeout_s is None else float(timeout_s)
+            if request_timeout_s <= 0:
+                raise ValueError("PiPER-X request timeout must be positive")
             sent_ns = time.monotonic_ns()
-            deadline_ns = sent_ns + int(self.response_timeout_s * 1_000_000_000)
+            deadline_ns = sent_ns + int(request_timeout_s * 1_000_000_000)
             request_generation = self._generation
             sequence = self._seq
             envelope = {
@@ -337,12 +443,15 @@ class PiperXBridgeClient:
                 "payload": payload,
             }
             try:
+                self._socket.settimeout(request_timeout_s)
                 self._socket.sendall(encode_frame(envelope, max_frame_bytes=self.max_frame_bytes))
                 response = receive_frame(self._socket, max_frame_bytes=self.max_frame_bytes)
+                self._socket.settimeout(self.response_timeout_s)
                 self._seq += 1
                 sample = self._parse_response(
                     response,
                     request_type=request_type,
+                    request_payload=payload,
                     request_generation=request_generation,
                     sequence=sequence,
                     deadline_ns=deadline_ns,
@@ -362,6 +471,7 @@ class PiperXBridgeClient:
         response: dict[str, Any],
         *,
         request_type: str,
+        request_payload: dict[str, Any],
         request_generation: int,
         sequence: int,
         deadline_ns: int,
@@ -384,40 +494,48 @@ class PiperXBridgeClient:
         payload = response["payload"]
         expected_payload_keys = {
             "mode",
+            "edge",
+            "transition",
+            "terminal_request",
+            "manual_sample",
+            "manual_resolution",
+            "motion_accepted",
+            "embodiment_profile",
             "control_topology",
             "leader_actuation_mode",
             "follower_actuation_mode",
-            "transition",
-            "edge",
-            "terminal_request",
-            "leader",
-            "mirror_accepted",
             "health",
             "diagnostics",
         }
         if not isinstance(payload, dict) or set(payload) != expected_payload_keys:
             raise PiperXBridgeProtocolError(
-                "PiPER-X response payload must contain exactly mode, control_topology, "
-                "leader_actuation_mode, follower_actuation_mode, transition, edge, "
-                "terminal_request, leader, mirror_accepted, health, diagnostics"
+                "PiPER-X v3 response payload keys do not match the strict schema"
             )
         mode = payload["mode"]
+        edge = payload["edge"]
+        transition = payload["transition"]
+        terminal_request = payload["terminal_request"]
+        manual_sample = _parse_manual_sample(payload["manual_sample"])
+        manual_resolution = _parse_manual_resolution(payload["manual_resolution"])
+        motion_accepted = payload["motion_accepted"]
+        embodiment_profile = payload["embodiment_profile"]
         control_topology = payload["control_topology"]
         leader_actuation_mode = payload["leader_actuation_mode"]
         follower_actuation_mode = payload["follower_actuation_mode"]
-        transition = payload["transition"]
-        edge = payload["edge"]
-        terminal_request = payload["terminal_request"]
         if mode not in _MODES or edge not in _EDGES or terminal_request not in _TERMINAL_REQUESTS:
             raise PiperXBridgeProtocolError("PiPER-X response has an invalid mode, edge, or terminal request")
         if control_topology != _CONTROL_TOPOLOGY:
             raise PiperXBridgeProtocolError("PiPER-X response has an invalid control_topology")
+        if embodiment_profile != EMBODIMENT_PROFILE:
+            raise PiperXBridgeProtocolError("PiPER-X response has an invalid embodiment_profile")
         if leader_actuation_mode not in _LEADER_ACTUATION_MODES:
             raise PiperXBridgeProtocolError("PiPER-X response has an invalid leader_actuation_mode")
         if follower_actuation_mode not in _FOLLOWER_ACTUATION_MODES:
             raise PiperXBridgeProtocolError("PiPER-X response has an invalid follower_actuation_mode")
         if transition not in _TRANSITIONS:
             raise PiperXBridgeProtocolError("PiPER-X response has an invalid transition")
+        if not isinstance(motion_accepted, bool):
+            raise PiperXBridgeProtocolError("PiPER-X motion_accepted must be boolean")
         if transition is not None:
             expected_mode = {
                 "entering_intervention": "policy",
@@ -427,14 +545,15 @@ class PiperXBridgeClient:
                 raise PiperXBridgeProtocolError(
                     f"PiPER-X transition {transition!r} is inconsistent with mode {mode!r}"
                 )
-            if edge is not None or terminal_request is not None or payload["mirror_accepted"] is not False:
+            if edge is not None or motion_accepted is not False:
                 raise PiperXBridgeProtocolError(
-                    "PiPER-X transition must freeze mirroring and cannot carry an edge or terminal request"
+                    "PiPER-X transition must freeze motion and cannot carry an edge"
                 )
-            if follower_actuation_mode not in {"sim_follow", "hold"}:
+            if manual_sample is not None or manual_resolution is not None:
+                raise PiperXBridgeProtocolError("PiPER-X transition cannot carry a manual sample/result")
+            if follower_actuation_mode != "hold":
                 raise PiperXBridgeSafetyError(
-                    "PiPER-X followers must report the blocked prior sim target or measured hold "
-                    "during a hardware transition"
+                    "PiPER-X followers must report measured hold during a transition"
                 )
         if request_type == "heartbeat" and (edge is not None or terminal_request is not None):
             raise PiperXBridgeProtocolError("heartbeat must not consume an operator edge or terminal request")
@@ -447,11 +566,6 @@ class PiperXBridgeClient:
             )
         if (edge == "enter" and mode != "intervention") or (edge == "exit" and mode != "policy"):
             raise PiperXBridgeProtocolError(f"PiPER-X edge {edge!r} is inconsistent with mode {mode!r}")
-        leader = payload["leader"]
-        if not isinstance(leader, dict) or set(leader) != {"left", "right"}:
-            raise PiperXBridgeProtocolError("PiPER-X leader sample must contain exactly left and right")
-        if not isinstance(payload["mirror_accepted"], bool):
-            raise PiperXBridgeProtocolError("PiPER-X mirror_accepted must be boolean")
         if not isinstance(payload["health"], dict) or not isinstance(payload["diagnostics"], dict):
             raise PiperXBridgeProtocolError("PiPER-X health and diagnostics must be objects")
         if not isinstance(payload["diagnostics"].get("request_ok"), bool):
@@ -461,14 +575,15 @@ class PiperXBridgeClient:
             seq=sequence,
             mode=mode,
             control_topology=control_topology,
+            embodiment_profile=embodiment_profile,
             leader_actuation_mode=leader_actuation_mode,
             follower_actuation_mode=follower_actuation_mode,
             transition=transition,
             edge=edge,
             terminal_request=terminal_request,
-            left=_parse_arm_sample(leader["left"], label="leader.left"),
-            right=_parse_arm_sample(leader["right"], label="leader.right"),
-            mirror_accepted=payload["mirror_accepted"],
+            manual_sample=manual_sample,
+            manual_resolution=manual_resolution,
+            motion_accepted=motion_accepted,
             health=dict(payload["health"]),
             diagnostics=dict(payload["diagnostics"]),
         )
@@ -486,6 +601,7 @@ class PiperXBridgeClient:
             raise PiperXBridgeSafetyError(f"PiPER-X bridge rejected {request_type}: {sample.diagnostics}")
         for key, expected in (
             ("control_topology", sample.control_topology),
+            ("embodiment_profile", sample.embodiment_profile),
             ("leader_actuation_mode", sample.leader_actuation_mode),
             ("follower_actuation_mode", sample.follower_actuation_mode),
         ):
@@ -494,28 +610,48 @@ class PiperXBridgeClient:
                     f"PiPER-X response {key} disagrees with hardware health: "
                     f"payload={expected!r}, health={sample.health.get(key)!r}"
                 )
-        if transition is None:
+        if transition is None and mode != "fault":
             expected_leader_actuation = {
                 "policy": "output_follow",
                 "intervention": "native_leader",
-                "fault": "fault",
             }[mode]
             if sample.leader_actuation_mode != expected_leader_actuation:
                 raise PiperXBridgeSafetyError(
                     "PiPER-X leader actuation does not match the acknowledged bridge mode: "
                     f"mode={mode}, leader_actuation_mode={sample.leader_actuation_mode}"
                 )
-        if (
-            request_type == "exchange"
-            and not sample.mirror_accepted
-            and sample.edge is None
-            and sample.terminal_request is None
-            and sample.transition is None
-        ):
-            raise PiperXBridgeSafetyError(f"PiPER-X bridge rejected the simulator mirror target: {sample.diagnostics}")
+        if manual_sample is not None:
+            if request_type != "manual_sample" or mode != "intervention" or transition is not None:
+                raise PiperXBridgeProtocolError("manual_sample appeared on an invalid response")
+            if motion_accepted:
+                raise PiperXBridgeProtocolError("manual sampling must not move hardware")
+        elif request_type == "manual_sample" and transition is None and terminal_request is None:
+            raise PiperXBridgeProtocolError("steady manual_sample response omitted its sample")
+
+        if manual_resolution is not None:
+            if request_type != "manual_resolve" or mode != "intervention" or transition is not None:
+                raise PiperXBridgeProtocolError("manual_resolution appeared on an invalid response")
+            if (
+                manual_resolution.sample_id != request_payload.get("sample_id")
+                or manual_resolution.decision != request_payload.get("decision")
+            ):
+                raise PiperXBridgeProtocolError(
+                    "manual_resolution sample_id/decision does not match the exact request"
+                )
+            if not motion_accepted:
+                raise PiperXBridgeProtocolError("resolved manual sample must confirm its hardware outcome")
+        elif request_type == "manual_resolve" and transition is None and terminal_request is None:
+            raise PiperXBridgeProtocolError("steady manual_resolve response omitted its result")
+
+        if request_type in {"arm_and_begin_episode", "exchange", "transition_ack", "hold", "end_episode"}:
+            safe_noop = transition is not None or terminal_request is not None
+            if not motion_accepted and not safe_noop:
+                raise PiperXBridgeSafetyError(
+                    f"PiPER-X bridge rejected {request_type}: {sample.diagnostics}"
+                )
         return sample
 
-    def begin_episode(
+    def arm_and_begin_episode(
         self,
         episode_id: str,
         sim: SimTargets,
@@ -525,11 +661,13 @@ class PiperXBridgeClient:
         with self._request_lock:
             self._episode_id = _identifier(episode_id, label="episode_id")
             self._generation = 0
+            self._pending_manual_sample_id = None
             self._heartbeat_error = None
             try:
                 sample = self._request(
-                    "begin_episode",
+                    "arm_and_begin_episode",
                     {"sim": sim.to_payload()},
+                    timeout_s=self.arm_timeout_s,
                 )
             except PiperXBridgeSafetyError:
                 # The peer returned a well-formed response but rejected or
@@ -543,16 +681,76 @@ class PiperXBridgeClient:
                 raise
         if sample.mode != "policy" or sample.edge is not None or sample.generation != 0:
             self.fail_closed("invalid_begin_state")
-            raise PiperXBridgeProtocolError("begin_episode must reset the bridge to policy mode at generation 0")
+            raise PiperXBridgeProtocolError(
+                "arm_and_begin_episode must enter policy mode at generation 0"
+            )
         self._episode_active = True
         if self._heartbeat_thread is None:
             self._start_heartbeat()
         return sample
 
+    # Preserve the evaluator-facing name while making the physical arming
+    # boundary explicit on the wire. The hardware bridge arms only on the
+    # first call and reuses its held session for later episodes.
+    begin_episode = arm_and_begin_episode
+
     def exchange(self, sim: SimTargets) -> OperatorSample:
         if not self._episode_active:
             raise PiperXBridgeProtocolError("exchange requires an active PiPER-X episode")
         return self._request("exchange", {"sim": sim.to_payload()})
+
+    def transition_ack(self, sim: SimTargets) -> OperatorSample:
+        if not self._episode_active:
+            raise PiperXBridgeProtocolError("transition_ack requires an active PiPER-X episode")
+        sample = self._request(
+            "transition_ack",
+            {"sim": sim.to_payload()},
+            timeout_s=self.transition_timeout_s,
+        )
+        self._pending_manual_sample_id = None
+        if sample.edge not in {"enter", "exit"}:
+            raise PiperXBridgeProtocolError("transition_ack did not complete one control edge")
+        return sample
+
+    def manual_sample(self) -> OperatorSample:
+        if not self._episode_active:
+            raise PiperXBridgeProtocolError("manual_sample requires an active PiPER-X episode")
+        if self._pending_manual_sample_id is not None:
+            raise PiperXBridgeProtocolError(
+                f"manual sample {self._pending_manual_sample_id} must be resolved before sampling again"
+            )
+        sample = self._request("manual_sample", {})
+        if sample.manual_sample is not None:
+            self._pending_manual_sample_id = sample.manual_sample.sample_id
+        return sample
+
+    def _resolve_manual_sample(self, sample_id: int, decision: str) -> OperatorSample:
+        if not self._episode_active:
+            raise PiperXBridgeProtocolError("manual_resolve requires an active PiPER-X episode")
+        if isinstance(sample_id, bool) or not isinstance(sample_id, int) or sample_id < 1:
+            raise ValueError("manual sample_id must be a positive integer")
+        if decision not in {"anchor", "commit", "reject"}:
+            raise ValueError("manual decision must be anchor, commit, or reject")
+        if sample_id != self._pending_manual_sample_id:
+            raise PiperXBridgeProtocolError(
+                f"manual sample {sample_id} is not the one pending exact resolution "
+                f"({self._pending_manual_sample_id})"
+            )
+        sample = self._request(
+            "manual_resolve",
+            {"sample_id": sample_id, "decision": decision},
+        )
+        if sample.transition is not None or sample.manual_resolution is not None:
+            self._pending_manual_sample_id = None
+        return sample
+
+    def anchor_manual_sample(self, sample_id: int) -> OperatorSample:
+        """Latch the post-switch leader/follower zero from one exact sample."""
+
+        return self._resolve_manual_sample(sample_id, "anchor")
+
+    def manual_resolve(self, sample_id: int, *, commit: bool) -> OperatorSample:
+        return self._resolve_manual_sample(sample_id, "commit" if commit else "reject")
 
     def hold(self, reason: str) -> OperatorSample:
         if not self._episode_active:
@@ -563,6 +761,7 @@ class PiperXBridgeClient:
             # HOLD, like END, clears motion anchors. Keep session heartbeat
             # alive in idle state, but require a new begin before exchange.
             self._episode_active = False
+            self._pending_manual_sample_id = None
 
     def end_episode(self, *, reason: str) -> OperatorSample:
         if not self._episode_active:
@@ -577,6 +776,7 @@ class PiperXBridgeClient:
             # CPU LeRobot writer commits video. Followers are already held by
             # END; the heartbeat refreshes session liveness only.
             self._episode_active = False
+            self._pending_manual_sample_id = None
 
     def fail_closed(self, reason: str) -> None:
         """Best-effort follower hold followed by connection teardown."""
@@ -593,6 +793,7 @@ class PiperXBridgeClient:
                 pass
         self._episode_id = None
         self._episode_active = False
+        self._pending_manual_sample_id = None
         self.close()
         # A fail-closed boundary is intentionally non-replayable even when
         # the final HOLD acknowledgement was received.  A new process/session
@@ -658,6 +859,8 @@ def client_from_environment() -> PiperXBridgeClient:
         port=int(os.environ.get("ROBODOJO_PIPERX_BRIDGE_PORT", "8765")),
         connect_timeout_s=float(os.environ.get("ROBODOJO_PIPERX_CONNECT_TIMEOUT_S", "5.0")),
         response_timeout_s=float(os.environ.get("ROBODOJO_PIPERX_RESPONSE_TIMEOUT_S", "0.2")),
+        arm_timeout_s=float(os.environ.get("ROBODOJO_PIPERX_ARM_TIMEOUT_S", "60.0")),
+        transition_timeout_s=float(os.environ.get("ROBODOJO_PIPERX_TRANSITION_TIMEOUT_S", "10.0")),
         heartbeat_interval_s=float(os.environ.get("ROBODOJO_PIPERX_HEARTBEAT_INTERVAL_S", "0.25")),
     )
 
@@ -673,6 +876,8 @@ def _environment_identity() -> tuple[Any, ...]:
         int(os.environ.get("ROBODOJO_PIPERX_BRIDGE_PORT", "8765")),
         float(os.environ.get("ROBODOJO_PIPERX_CONNECT_TIMEOUT_S", "5.0")),
         float(os.environ.get("ROBODOJO_PIPERX_RESPONSE_TIMEOUT_S", "0.2")),
+        float(os.environ.get("ROBODOJO_PIPERX_ARM_TIMEOUT_S", "60.0")),
+        float(os.environ.get("ROBODOJO_PIPERX_TRANSITION_TIMEOUT_S", "10.0")),
         float(os.environ.get("ROBODOJO_PIPERX_HEARTBEAT_INTERVAL_S", "0.25")),
     )
 

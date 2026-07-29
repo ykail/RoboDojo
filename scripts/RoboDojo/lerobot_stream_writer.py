@@ -668,11 +668,8 @@ def _episode_metadata(
         "robodojo_piperx_bridge_protocol": str(
             metadata.get("piperx_bridge_protocol", ""),
         ),
-        "robodojo_piperx_calibration_name": str(
-            metadata.get("piperx_calibration_name", ""),
-        ),
-        "robodojo_piperx_calibration_sha256": str(
-            metadata.get("piperx_calibration_sha256", ""),
+        "robodojo_piperx_embodiment_profile": str(
+            metadata.get("piperx_embodiment_profile", ""),
         ),
         "robodojo_policy_provenance": dict(policy_provenance),
         "robodojo_layout_id": integer("layout_id"),

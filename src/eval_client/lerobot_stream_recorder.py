@@ -553,11 +553,8 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         "control_mode": control_mode,
     }
     if control_mode == "piperx_sim_dagger":
-        calibration = Path(os.environ.get("ROBODOJO_PIPERX_CALIBRATION", ""))
-        if calibration.is_file():
-            metadata["piperx_calibration_name"] = calibration.name
-            metadata["piperx_calibration_sha256"] = hashlib.sha256(calibration.read_bytes()).hexdigest()
-        metadata["piperx_bridge_protocol"] = "robodojo_piperx_v2"
+        metadata["piperx_embodiment_profile"] = "arx_x5_piperx_relative_v1"
+        metadata["piperx_bridge_protocol"] = "robodojo_piperx_v3"
     return metadata
 
 

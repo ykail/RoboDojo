@@ -43,12 +43,14 @@ Intervention recording:
   --lerobot-vcodec CODEC      h264, hevc, or libsvtav1 (default: h264)
   --encoder-threads NUM       CPU video encoder threads (default: 2)
 
-PiPER-X simulator DAgger (does not start or enable hardware):
-  --piperx-calibration PATH   Required retarget JSON with calibrated=true
+PiPER-X simulator DAgger (uses the separately supervised hardware owner):
   --piperx-bridge-host HOST   Must be loopback (default: 127.0.0.1)
   --piperx-bridge-port NUM    Existing LeRobot bridge port (default: 8765)
   --piperx-connect-timeout S  Initial TCP timeout (default: 5.0)
   --piperx-response-timeout S Per-request/deadline timeout (default: 0.2)
+  --piperx-arm-timeout S      First supervised four-arm bring-up (default: 60.0)
+  --piperx-transition-timeout S
+                              Leader role transition timeout (default: 10.0)
   --piperx-heartbeat-interval S
                               Session heartbeat period (default: 0.25)
   --piperx-max-ik-failures N  Consecutive rejected samples before abort
@@ -102,11 +104,12 @@ lerobot_repo_id="${ROBODOJO_LEROBOT_REPO_ID:-}"
 resume="0"
 lerobot_vcodec="h264"
 encoder_threads="2"
-piperx_calibration="${ROBODOJO_PIPERX_CALIBRATION:-}"
 piperx_bridge_host="${ROBODOJO_PIPERX_BRIDGE_HOST:-127.0.0.1}"
 piperx_bridge_port="${ROBODOJO_PIPERX_BRIDGE_PORT:-8765}"
 piperx_connect_timeout="${ROBODOJO_PIPERX_CONNECT_TIMEOUT_S:-5.0}"
 piperx_response_timeout="${ROBODOJO_PIPERX_RESPONSE_TIMEOUT_S:-0.2}"
+piperx_arm_timeout="${ROBODOJO_PIPERX_ARM_TIMEOUT_S:-60.0}"
+piperx_transition_timeout="${ROBODOJO_PIPERX_TRANSITION_TIMEOUT_S:-10.0}"
 piperx_heartbeat_interval="${ROBODOJO_PIPERX_HEARTBEAT_INTERVAL_S:-0.25}"
 piperx_max_ik_failures="${ROBODOJO_PIPERX_MAX_CONSECUTIVE_IK_FAILURES:-25}"
 dry_run="0"
@@ -201,11 +204,6 @@ while [[ $# -gt 0 ]]; do
       encoder_threads="$2"
       shift 2
       ;;
-    --piperx-calibration)
-      need_value "$@"
-      piperx_calibration="$2"
-      shift 2
-      ;;
     --piperx-bridge-host)
       need_value "$@"
       piperx_bridge_host="$2"
@@ -224,6 +222,16 @@ while [[ $# -gt 0 ]]; do
     --piperx-response-timeout)
       need_value "$@"
       piperx_response_timeout="$2"
+      shift 2
+      ;;
+    --piperx-arm-timeout)
+      need_value "$@"
+      piperx_arm_timeout="$2"
+      shift 2
+      ;;
+    --piperx-transition-timeout)
+      need_value "$@"
+      piperx_transition_timeout="$2"
       shift 2
       ;;
     --piperx-heartbeat-interval)
@@ -292,7 +300,6 @@ if [[ "${headless}" == "1" && "${control_mode}" != "policy" ]]; then
 fi
 
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
-  [[ -n "${piperx_calibration}" ]] || die "--piperx-calibration is required for piperx_sim_dagger"
   case "${piperx_bridge_host}" in
     127.0.0.1|localhost|::1) ;;
     *) die "--piperx-bridge-host must be loopback" ;;
@@ -307,15 +314,12 @@ if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   for timeout_value in \
     "${piperx_connect_timeout}" \
     "${piperx_response_timeout}" \
+    "${piperx_arm_timeout}" \
+    "${piperx_transition_timeout}" \
     "${piperx_heartbeat_interval}"; do
     [[ "${timeout_value}" =~ ^[0-9]+([.][0-9]+)?$ && "${timeout_value}" =~ [1-9] ]] \
       || die "PiPER-X timeout/heartbeat values must be positive numbers"
   done
-  if [[ "${piperx_calibration}" != /* ]]; then
-    piperx_calibration="${LAUNCH_DIR}/${piperx_calibration}"
-  fi
-  [[ -f "${piperx_calibration}" ]] || die "PiPER-X calibration does not exist: ${piperx_calibration}"
-  piperx_calibration="$(cd "$(dirname "${piperx_calibration}")" && pwd -P)/$(basename "${piperx_calibration}")"
 fi
 
 if [[ "${kai0_root}" != /* ]]; then
@@ -339,20 +343,6 @@ else
 fi
 [[ -x "${kai0_python}" ]] || die "Kai0 Python is not executable: ${kai0_python}"
 kai0_python="$(cd "$(dirname "${kai0_python}")" && pwd -P)/$(basename "${kai0_python}")"
-
-if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
-  if ! env \
-    -u PYTHONHOME \
-    -u VIRTUAL_ENV \
-    -u CONDA_PREFIX \
-    -u CONDA_DEFAULT_ENV \
-    "PYTHONPATH=${ROOT_DIR}" \
-    "${kai0_python}" -c \
-    'import sys; from src.eval_client.piperx_retarget import RetargetConfig; RetargetConfig.from_file(sys.argv[1])' \
-    "${piperx_calibration}"; then
-    die "PiPER-X calibration is incomplete or unsafe; verify the full schema and calibrated=true"
-  fi
-fi
 
 if [[ "${control_mode}" == "keyboard_intervention" \
   || "${control_mode}" == "piperx_sim_dagger" ]]; then
@@ -456,11 +446,12 @@ if [[ "${control_mode}" == "keyboard_intervention" \
 fi
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   eval_environment+=(
-    "ROBODOJO_PIPERX_CALIBRATION=${piperx_calibration}"
     "ROBODOJO_PIPERX_BRIDGE_HOST=${piperx_bridge_host}"
     "ROBODOJO_PIPERX_BRIDGE_PORT=${piperx_bridge_port}"
     "ROBODOJO_PIPERX_CONNECT_TIMEOUT_S=${piperx_connect_timeout}"
     "ROBODOJO_PIPERX_RESPONSE_TIMEOUT_S=${piperx_response_timeout}"
+    "ROBODOJO_PIPERX_ARM_TIMEOUT_S=${piperx_arm_timeout}"
+    "ROBODOJO_PIPERX_TRANSITION_TIMEOUT_S=${piperx_transition_timeout}"
     "ROBODOJO_PIPERX_HEARTBEAT_INTERVAL_S=${piperx_heartbeat_interval}"
     "ROBODOJO_PIPERX_MAX_CONSECUTIVE_IK_FAILURES=${piperx_max_ik_failures}"
   )
@@ -496,8 +487,8 @@ if [[ "${control_mode}" == "keyboard_intervention" \
 fi
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   echo "[eval_kai0_pi05] PiPER-X bridge=${piperx_bridge_host}:${piperx_bridge_port}"
-  echo "[eval_kai0_pi05] PiPER-X calibration=${piperx_calibration}"
-  echo "[eval_kai0_pi05] NOTE: this command never starts or enables PiPER-X hardware"
+  echo "[eval_kai0_pi05] PiPER-X profile=arx_x5_piperx_relative_v1 (automatic relative anchors)"
+  echo "[eval_kai0_pi05] NOTE: the separate supervised bridge owns CAN; the first episode authorizes its arm stage"
 fi
 
 if [[ "${dry_run}" == "1" ]]; then

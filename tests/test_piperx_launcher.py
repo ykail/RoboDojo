@@ -7,7 +7,6 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 EVAL = ROOT / "scripts" / "RoboDojo" / "eval_kai0_pi05.sh"
 WRAPPER = ROOT / "scripts" / "RoboDojo" / "collect_pi05_piperx_sim_dagger.sh"
-CALIBRATION = ROOT / "config" / "piperx_sim_dagger.example.json"
 
 
 class PiperXLauncherTest(unittest.TestCase):
@@ -20,7 +19,8 @@ class PiperXLauncherTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(wrapper.returncode, 0, wrapper.stderr)
-        self.assertIn("never starts, enables, or configures", wrapper.stdout)
+        self.assertIn("first episode explicitly", wrapper.stdout)
+        self.assertIn("No manual", wrapper.stdout)
 
         evaluator = subprocess.run(
             ["bash", str(EVAL), "--help"],
@@ -31,7 +31,9 @@ class PiperXLauncherTest(unittest.TestCase):
         )
         self.assertEqual(evaluator.returncode, 0, evaluator.stderr)
         self.assertIn("piperx_sim_dagger", evaluator.stdout)
-        self.assertIn("--piperx-calibration", evaluator.stdout)
+        self.assertIn("--piperx-arm-timeout", evaluator.stdout)
+        self.assertIn("--piperx-transition-timeout", evaluator.stdout)
+        self.assertNotIn("--piperx-calibration", evaluator.stdout)
 
     def test_headless_is_rejected_for_visual_intervention(self):
         result = subprocess.run(
@@ -46,8 +48,6 @@ class PiperXLauncherTest(unittest.TestCase):
                 "test-checkpoint",
                 "--control-mode",
                 "piperx_sim_dagger",
-                "--piperx-calibration",
-                str(CALIBRATION),
                 "--headless",
             ],
             cwd=ROOT,
@@ -63,13 +63,8 @@ class PiperXLauncherTest(unittest.TestCase):
             tmp_path = Path(tmp)
             kai0 = tmp_path / "kai0"
             checkpoint = tmp_path / "checkpoint"
-            calibration = tmp_path / "calibration.json"
             (kai0 / "scripts").mkdir(parents=True)
             checkpoint.mkdir()
-            calibration.write_text(
-                CALIBRATION.read_text(encoding="utf-8").replace('"calibrated": false', '"calibrated": true'),
-                encoding="utf-8",
-            )
             (kai0 / "scripts" / "serve_robodojo_policy.py").write_text("# test\n")
             result = subprocess.run(
                 [
@@ -87,8 +82,10 @@ class PiperXLauncherTest(unittest.TestCase):
                     sys.executable,
                     "--control-mode",
                     "piperx_sim_dagger",
-                    "--piperx-calibration",
-                    str(calibration),
+                    "--piperx-arm-timeout",
+                    "45.0",
+                    "--piperx-transition-timeout",
+                    "7.5",
                     "--lerobot-root",
                     str(tmp_path / "data"),
                     "--dry-run",
@@ -102,7 +99,11 @@ class PiperXLauncherTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ROBODOJO_CONTROL_MODE=piperx_sim_dagger", result.stdout)
         self.assertIn("ROBODOJO_PIPERX_BRIDGE_PORT=8765", result.stdout)
+        self.assertIn("ROBODOJO_PIPERX_ARM_TIMEOUT_S=45.0", result.stdout)
+        self.assertIn("ROBODOJO_PIPERX_TRANSITION_TIMEOUT_S=7.5", result.stdout)
         self.assertIn("ROBODOJO_LEROBOT_REPO_ID=robodojo_interventions_make_toast", result.stdout)
+        self.assertIn("PiPER-X profile=arx_x5_piperx_relative_v1", result.stdout)
+        self.assertNotIn("ROBODOJO_PIPERX_CALIBRATION", result.stdout)
 
     def test_launcher_never_probes_hardware_socket_before_real_client(self):
         source = EVAL.read_text(encoding="utf-8")
@@ -111,7 +112,7 @@ class PiperXLauncherTest(unittest.TestCase):
             source,
         )
 
-    def test_uncalibrated_example_is_rejected_before_launch(self):
+    def test_removed_calibration_option_is_rejected_as_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             kai0 = tmp_path / "kai0"
@@ -136,7 +137,7 @@ class PiperXLauncherTest(unittest.TestCase):
                     "--control-mode",
                     "piperx_sim_dagger",
                     "--piperx-calibration",
-                    str(CALIBRATION),
+                    "/unused/legacy-calibration.json",
                     "--dry-run",
                 ],
                 cwd=ROOT,
@@ -146,17 +147,15 @@ class PiperXLauncherTest(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("calibrated=true", result.stderr)
+        self.assertIn("Unknown argument: --piperx-calibration", result.stderr)
 
-    def test_calibrated_flag_alone_does_not_bypass_full_schema_validation(self):
+    def test_arm_and_transition_timeouts_must_be_positive(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             kai0 = tmp_path / "kai0"
             checkpoint = tmp_path / "checkpoint"
-            calibration = tmp_path / "incomplete.json"
             (kai0 / "scripts").mkdir(parents=True)
             checkpoint.mkdir()
-            calibration.write_text('{"calibrated": true}', encoding="utf-8")
             (kai0 / "scripts" / "serve_robodojo_policy.py").write_text("# test\n")
             result = subprocess.run(
                 [
@@ -174,8 +173,10 @@ class PiperXLauncherTest(unittest.TestCase):
                     sys.executable,
                     "--control-mode",
                     "piperx_sim_dagger",
-                    "--piperx-calibration",
-                    str(calibration),
+                    "--piperx-arm-timeout",
+                    "0",
+                    "--piperx-transition-timeout",
+                    "10.0",
                     "--dry-run",
                 ],
                 cwd=ROOT,
@@ -185,7 +186,7 @@ class PiperXLauncherTest(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("full schema", result.stderr)
+        self.assertIn("timeout/heartbeat values must be positive", result.stderr)
 
 
 if __name__ == "__main__":

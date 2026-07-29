@@ -10,12 +10,12 @@ Usage:
     --task TASK \
     --checkpoint-dir PATH \
     --checkpoint-id ID \
-    --piperx-calibration PATH \
     [eval_kai0_pi05.sh options]
 
-This starts Kai0 and RoboDojo only. It never starts, enables, or configures
-PiPER-X hardware. Start the supervised LeRobot hardware bridge separately,
-verify its safety checks, then run this command.
+This starts Kai0 and RoboDojo. The separately supervised LeRobot process owns
+all CAN devices; after policy/simulator preflight, the first episode explicitly
+authorizes that bridge to perform its bounded four-arm bring-up. No manual
+frame calibration file is used: takeover is anchored automatically.
 
 The dedicated launcher fixes --control-mode=piperx_sim_dagger. Use
 eval_kai0_pi05.sh --help for the complete option list.

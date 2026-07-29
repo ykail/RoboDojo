@@ -35,8 +35,11 @@ def _terminal_request(sample: OperatorSample, frame_count: int) -> str | None:
     request = sample.terminal_request
     if request in {"accept_next", "discard_retry", "accept_exit", "discard_exit", None}:
         if request == "accept_next" and frame_count == 0:
-            print(f"\n[PiPER-X DAgger] Ignoring {request}: no frames have been staged yet.")
-            return None
+            # The bridge has already delivered and consumed this terminal key;
+            # silently ignoring it would make the next request illegal. End the
+            # empty candidate cleanly and retry the layout instead.
+            print("\n[PiPER-X DAgger] Empty accept-next candidate; discarding and retrying the layout.")
+            return "discard_retry"
         return request
     raise ValueError(f"Unknown PiPER-X terminal request: {request!r}")
 
@@ -68,9 +71,10 @@ def run_piperx_sim_dagger_episode(
     follower feedback.  A bridge-side ``I`` edge immediately invalidates the
     current policy chunk.  During the physical mode transition the simulator
     is frozen and no frame is recorded.  While intervention is active,
-    synchronized leader samples are retargeted into the simulator; the
-    followers receive only the simulator's accepted result on the next
-    exchange.
+    each synchronized leader sample is first checked by ARX IK, then explicitly
+    committed as a calibration-free relative joint delta to the matching
+    PiPER-X follower. The simulator executes only after that exact physical
+    sample has been acknowledged.
     """
 
     if task_env.num_envs != 1:
@@ -94,10 +98,7 @@ def run_piperx_sim_dagger_episode(
 
     try:
         if controller is None:
-            controller = ArxPiperXRetargetController(
-                task_env,
-                RetargetConfig.from_environment(),
-            )
+            controller = ArxPiperXRetargetController(task_env, RetargetConfig())
         if recorder is None:
             from src.eval_client.lerobot_stream_recorder import recorder_for_env
 
@@ -108,11 +109,13 @@ def run_piperx_sim_dagger_episode(
         )
         obs = task_env.get_obs()
         initial_sim = sim_targets_from_env(task_env, obs)
+        # Finish all policy-side staging before authorizing the separate
+        # hardware owner to leave SAFE_IDLE and arm the four physical devices.
+        _send_observation(task_env, model_client, obs)
         bridge.begin_episode(
             _episode_id(task_env),
             initial_sim,
         )
-        _send_observation(task_env, model_client, obs)
         print(
             "[PiPER-X DAgger] policy -> simulation -> followers -> leaders; "
             "I toggles leader intervention; Right/Left/Esc/Backspace label the episode."
@@ -132,11 +135,12 @@ def run_piperx_sim_dagger_episode(
         ) from exc
 
     chunk_id = -1
+    pending_takeover_edge = 0
     pending_release_edge = 0
     consecutive_manual_failures = 0
     reported_transition: str | None = None
 
-    def exchange() -> tuple[OperatorSample, Any]:
+    def policy_exchange() -> tuple[OperatorSample, Any]:
         sim = sim_targets_from_env(task_env, obs)
         return bridge.exchange(sim), sim
 
@@ -218,81 +222,142 @@ def run_piperx_sim_dagger_episode(
         if callable(render):
             render()
 
+    intervention_active = False
+
+    def complete_transition(sample: OperatorSample, sim: Any) -> None:
+        """Acknowledge a hardware hold before either control authority changes."""
+
+        nonlocal intervention_active, pending_takeover_edge, pending_release_edge, reported_transition
+        nonlocal consecutive_manual_failures
+        freeze_transition(sample)
+        completed = bridge.transition_ack(sim)
+        reported_transition = None
+        if completed.edge == "enter":
+            # The leaders are native now, but the operator is still instructed
+            # not to move. Capture one exact post-switch sample and use it as
+            # both the ARX Cartesian zero and the PiPER-X qL/qF zero. Only then
+            # announce manual authority; this avoids any drift between the
+            # physical role switch and the later RoboDojo anchor.
+            anchor = bridge.manual_sample()
+            if anchor.transition is not None:
+                complete_transition(anchor, sim)
+                return
+            if process_terminal(anchor):
+                return
+            if anchor.manual_sample is None:
+                raise PiperXBridgeSafetyError("entry anchor omitted the exact manual sample")
+            controller.enter(anchor, sim)
+            resolution = bridge.anchor_manual_sample(anchor.manual_sample.sample_id)
+            if resolution.transition is not None:
+                controller.exit()
+                complete_transition(resolution, sim)
+                return
+            result = resolution.manual_resolution
+            operation = resolution.diagnostics.get("operation")
+            if (
+                result is None
+                or result.sample_id != anchor.manual_sample.sample_id
+                or result.decision != "anchor"
+                or result.follower_commanded
+                or not isinstance(operation, dict)
+                or operation.get("manual_anchor_latched") is not True
+            ):
+                raise PiperXBridgeSafetyError(
+                    "entry sample did not latch the same physical and simulator manual anchor"
+                )
+            intervention_active = True
+            pending_takeover_edge = 1
+            consecutive_manual_failures = 0
+            print(
+                "\n[PiPER-X DAgger] manual control ON; leader sample fan-out active; "
+                "policy chunk preempted."
+            )
+            return
+        if completed.edge == "exit":
+            controller.exit()
+            intervention_active = False
+            pending_release_edge = -1
+            consecutive_manual_failures = 0
+            print(
+                "\n[PiPER-X DAgger] manual control OFF; policy mapping re-anchored; "
+                "requesting a fresh chunk."
+            )
+            process_terminal(completed)
+            return
+        raise PiperXBridgeSafetyError("transition acknowledgement returned no enter/exit edge")
+
     try:
-        intervention_active = False
         while terminal_request is None:
             if intervention_active:
-                sample, sim = exchange()
+                sim = sim_targets_from_env(task_env, obs)
+                sample = bridge.manual_sample()
+                if sample.transition is not None:
+                    complete_transition(sample, sim)
+                    continue
                 if process_terminal(sample):
                     break
-                if sample.transition is not None:
-                    freeze_transition(sample)
-                    continue
                 reported_transition = None
-                if sample.mode == "policy":
-                    controller.exit()
-                    intervention_active = False
-                    pending_release_edge = -1
-                    print(
-                        "\n[PiPER-X DAgger] manual control OFF; "
-                        "discarding stale policy state and requesting a fresh chunk."
-                    )
-                    continue
+                if sample.mode != "intervention" or sample.manual_sample is None:
+                    raise PiperXBridgeSafetyError("manual_sample returned outside intervention mode")
                 action, control = controller.build_action(obs, sample)
                 control.update(
                     {
-                        "takeover_edge": 1 if sample.edge == "enter" else 0,
+                        "takeover_edge": pending_takeover_edge,
                         "chunk_id": chunk_id,
                         "chunk_index": -1,
+                        "manual_sample_id": sample.manual_sample.sample_id,
                     }
                 )
                 if not control["ik_success"]:
+                    resolution = bridge.manual_resolve(sample.manual_sample.sample_id, commit=False)
+                    if resolution.transition is not None:
+                        complete_transition(resolution, sim)
+                        continue
+                    result = resolution.manual_resolution
+                    if (
+                        result is None
+                        or result.sample_id != sample.manual_sample.sample_id
+                        or result.decision != "reject"
+                        or result.follower_commanded
+                    ):
+                        raise PiperXBridgeSafetyError("rejected ARX IK did not produce a confirmed follower hold")
                     reject_unsafe_manual(control)
                     continue
+                resolution = bridge.manual_resolve(sample.manual_sample.sample_id, commit=True)
+                if resolution.transition is not None:
+                    complete_transition(resolution, sim)
+                    continue
+                result = resolution.manual_resolution
+                if (
+                    result is None
+                    or result.sample_id != sample.manual_sample.sample_id
+                    or result.decision != "commit"
+                    or not result.follower_commanded
+                ):
+                    raise PiperXBridgeSafetyError("manual sample was not committed to both followers")
                 consecutive_manual_failures = 0
                 execute(
                     action,
                     policy_action=None,
                     human_action=action if control["intervention_mask"] else None,
                     control=control,
-                    sample=sample,
+                    sample=resolution,
                 )
+                pending_takeover_edge = 0
                 continue
 
             # Check bridge state immediately before inference.  The heartbeat
             # continues while the synchronous model call is blocked; any edge
             # it observes is surfaced by the post-inference exchange below.
-            sample, sim = exchange()
+            sample, sim = policy_exchange()
+            if sample.transition is not None:
+                complete_transition(sample, sim)
+                continue
             if process_terminal(sample):
                 break
-            if sample.transition is not None:
-                freeze_transition(sample)
-                continue
             reported_transition = None
-            if sample.mode == "intervention":
-                controller.enter(sample, sim)
-                intervention_active = True
-                print("\n[PiPER-X DAgger] manual control ON; policy chunk preempted.")
-                action, control = controller.build_action(obs, sample)
-                control.update(
-                    {
-                        "takeover_edge": 1,
-                        "chunk_id": chunk_id,
-                        "chunk_index": -1,
-                    }
-                )
-                if not control["ik_success"]:
-                    reject_unsafe_manual(control)
-                    continue
-                consecutive_manual_failures = 0
-                execute(
-                    action,
-                    policy_action=None,
-                    human_action=action if control["intervention_mask"] else None,
-                    control=control,
-                    sample=sample,
-                )
-                continue
+            if sample.mode != "policy":
+                raise PiperXBridgeSafetyError("policy exchange returned outside policy mode")
 
             # Policy-v1 consumes its staged observation when inference starts.
             # Re-stage unconditionally: an I enter+exit can invalidate a slow
@@ -303,61 +368,21 @@ def run_piperx_sim_dagger_episode(
             chunk_id += 1
             stale_chunk = False
             for chunk_index, policy_action in enumerate(chunk):
-                sample, sim = exchange()
-                if process_terminal(sample):
-                    stale_chunk = True
-                    break
+                sample, sim = policy_exchange()
                 if sample.transition is not None:
-                    freeze_transition(sample)
+                    complete_transition(sample, sim)
                     stale_chunk = True
                     print(
                         f"[PiPER-X DAgger] discarded {len(chunk) - chunk_index} "
                         "policy target(s) at the hardware transition boundary."
                     )
                     break
+                if process_terminal(sample):
+                    stale_chunk = True
+                    break
                 reported_transition = None
-                if sample.mode == "intervention":
-                    controller.enter(sample, sim)
-                    intervention_active = True
-                    print(
-                        f"\n[PiPER-X DAgger] manual control ON at chunk={chunk_id} "
-                        f"index={chunk_index}; discarding "
-                        f"{len(chunk) - chunk_index} stale target(s)."
-                    )
-                    manual_action, control = controller.build_action(obs, sample)
-                    control.update(
-                        {
-                            "takeover_edge": 1,
-                            "chunk_id": chunk_id,
-                            "chunk_index": chunk_index,
-                        }
-                    )
-                    if not control["ik_success"]:
-                        reject_unsafe_manual(control)
-                        stale_chunk = True
-                        break
-                    consecutive_manual_failures = 0
-                    execute(
-                        manual_action,
-                        policy_action=policy_action,
-                        human_action=(manual_action if control["intervention_mask"] else None),
-                        control=control,
-                        sample=sample,
-                    )
-                    stale_chunk = True
-                    break
-                if sample.edge == "exit":
-                    # An enter+exit may have happened during slow inference.
-                    # Even with no manual simulator step, that generation
-                    # change invalidates the just-returned chunk.
-                    controller.exit()
-                    pending_release_edge = -1
-                    stale_chunk = True
-                    print(
-                        "\n[PiPER-X DAgger] operator generation changed during inference; "
-                        "discarding the returned policy chunk."
-                    )
-                    break
+                if sample.mode != "policy":
+                    raise PiperXBridgeSafetyError("policy exchange returned outside policy mode")
                 execute(
                     policy_action,
                     policy_action=policy_action,

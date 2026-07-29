@@ -194,9 +194,8 @@ class LeRobotStreamWriterTest(unittest.TestCase):
                 "policy_runtime": "robodojo_policy_v1",
                 "policy_provenance": provenance,
                 "control_mode": "piperx_sim_dagger",
-                "piperx_bridge_protocol": "robodojo_piperx_v2",
-                "piperx_calibration_name": "coffee.json",
-                "piperx_calibration_sha256": "c" * 64,
+                "piperx_bridge_protocol": "robodojo_piperx_v3",
+                "piperx_embodiment_profile": "arx_x5_piperx_relative_v1",
             },
             success=True,
             reason="operator_accept",
@@ -214,9 +213,14 @@ class LeRobotStreamWriterTest(unittest.TestCase):
         self.assertEqual(metadata["robodojo_control_mode"], "piperx_sim_dagger")
         self.assertEqual(
             metadata["robodojo_piperx_bridge_protocol"],
-            "robodojo_piperx_v2",
+            "robodojo_piperx_v3",
         )
-        self.assertEqual(metadata["robodojo_piperx_calibration_sha256"], "c" * 64)
+        self.assertEqual(
+            metadata["robodojo_piperx_embodiment_profile"],
+            "arx_x5_piperx_relative_v1",
+        )
+        self.assertNotIn("robodojo_piperx_calibration_name", metadata)
+        self.assertNotIn("robodojo_piperx_calibration_sha256", metadata)
 
     def test_frame_matches_kai0_intervention_features(self):
         frame = writer.build_frame(_frame_message(source="safety_hold", policy=False))
@@ -629,33 +633,36 @@ class _FakeSidecar:
 
 
 class LeRobotStreamRecorderTest(unittest.TestCase):
-    def test_piperx_metadata_attests_control_mode_and_calibration(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            calibration = Path(tmp) / "calibration.json"
-            calibration.write_bytes(b'{"calibrated":true}')
-            task_env = SimpleNamespace(
-                env_seeds=[7],
-                layout_cycle=0,
-                task_name="make_toast",
-                config_name="arx_x5",
-                eval_seed=0,
-                policy_name="Kai0_Pi05",
-                policy_runtime="robodojo_policy_v1",
-                policy_provenance={},
-                additional_info="",
-                control_mode="piperx_sim_dagger",
-            )
-            with mock.patch.dict(
-                os.environ,
-                {"ROBODOJO_PIPERX_CALIBRATION": str(calibration)},
-                clear=False,
-            ):
-                metadata = _task_metadata(task_env)
+    def test_piperx_metadata_attests_v3_and_fixed_embodiment_profile(self):
+        task_env = SimpleNamespace(
+            env_seeds=[7],
+            layout_cycle=0,
+            task_name="make_toast",
+            config_name="arx_x5",
+            eval_seed=0,
+            policy_name="Kai0_Pi05",
+            policy_runtime="robodojo_policy_v1",
+            policy_provenance={},
+            additional_info="",
+            control_mode="piperx_sim_dagger",
+        )
+        # A stale deployment environment must not resurrect the removed
+        # machine-specific calibration contract.
+        with mock.patch.dict(
+            os.environ,
+            {"ROBODOJO_PIPERX_CALIBRATION": "/unused/legacy.json"},
+            clear=False,
+        ):
+            metadata = _task_metadata(task_env)
 
         self.assertEqual(metadata["control_mode"], "piperx_sim_dagger")
-        self.assertEqual(metadata["piperx_bridge_protocol"], "robodojo_piperx_v2")
-        self.assertEqual(metadata["piperx_calibration_name"], "calibration.json")
-        self.assertEqual(len(metadata["piperx_calibration_sha256"]), 64)
+        self.assertEqual(metadata["piperx_bridge_protocol"], "robodojo_piperx_v3")
+        self.assertEqual(
+            metadata["piperx_embodiment_profile"],
+            "arx_x5_piperx_relative_v1",
+        )
+        self.assertNotIn("piperx_calibration_name", metadata)
+        self.assertNotIn("piperx_calibration_sha256", metadata)
 
     def test_task_metadata_uses_connected_checkpoint_identity(self):
         provenance = {

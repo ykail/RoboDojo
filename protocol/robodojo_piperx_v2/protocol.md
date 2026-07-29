@@ -1,5 +1,10 @@
 # RoboDojo PiPER-X bridge protocol v2
 
+> Historical contract. Manual leader motion in v2 is routed back through
+> PiPER-X IK and is not the required joint-fan-out behavior. New deployments
+> must use `protocol/robodojo_piperx_v3/protocol.md`; v2 and v3 are wire
+> incompatible.
+
 Status: experimental, safety-critical local integration contract.
 
 Protocol identifier: `robodojo_piperx_v2`.

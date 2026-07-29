@@ -1,157 +1,170 @@
 # PiPER-X-assisted RoboDojo DAgger
 
-This mode connects a Kai0 Pi0.5 rollout in RoboDojo to two PiPER-X
-leader/follower pairs. Humans move the **leaders only**, and only after the
-first `i` takeover has completed. Before takeover, followers track the latest
-pose accepted by RoboDojo and the motor-driven leaders track fresh measured
-follower feedback.
+This mode runs a Kai0 Pi0.5 policy in RoboDojo, mirrors the accepted simulated
+motion on two PiPER-X follower arms, and makes the two motor-driven leaders
+display the measured follower motion. Pressing `i` transfers authority to the
+leaders; the same cached leader sample then drives both the followers and the
+ARX X5 simulation.
 
 ```text
-policy mode:       Kai0 -> RoboDojo ARX X5 -> accepted sim pose -> followers
-                              fresh measured follower joints -> leaders
-intervention mode: leaders -> relative SE(3) -> RoboDojo IK/ARX X5
-                                                -> accepted sim pose -> followers
-recording:         RoboDojo observation + actual ARX action + policy proposal
-                   + is_intervention -> one full LeRobot v3 episode
+policy:
+  Pi0.5 -> ARX X5 simulation -> PiPER-X followers -> PiPER-X leaders
+
+manual after i:
+  PiPER-X leaders
+    +-> direct relative joint delta -> PiPER-X followers
+    `-> relative FK pose -> ARX X5 IK -> simulation
+
+recording:
+  full simulation observation + executed ARX action + policy proposal
+  + intervention flag -> one LeRobot v3 episode
 ```
 
-## Current deployment constraint
+The manual fan-out avoids a PiPER-X end-pose/IK round trip. The followers use
+the original leader joint delta, while RoboDojo independently solves IK only
+for its different ARX X5 embodiment.
 
-Protocol v2 is loopback-only. The LeRobot hardware bridge and RoboDojo must run
-on the **same Linux host**, and the bridge listens only on `127.0.0.1:8765`.
-Do not expose the hardware bridge on a LAN or forward this v2 protocol between
-machines. Cross-host operation needs a separately designed authenticated
-transport and cannot reuse the monotonic-deadline assumptions in v2.
+## Safety and deployment constraint
 
-The bridge refuses a v1 peer because v1 leaves leaders permanently
-backdrivable. No real PiPER-X or Isaac Sim hardware-in-the-loop acceptance test
-has been run for v2 yet. The first run must therefore be supervised, with all
-four arms supported and the hard E-stop in hand.
+Protocol v3 is loopback-only: the LeRobot hardware bridge and RoboDojo must run
+on the same Linux host. Do not expose or forward port 8765. The protocol uses
+host-monotonic deadlines and is not an authenticated network transport.
 
-## Two-terminal startup
+No real four-arm/Isaac acceptance test is implied by the software tests. The
+first run must have an onsite operator supporting all four arms, clear follower
+workspaces, and a hard E-stop in hand. Stop immediately for vibration,
+knocking, unexpected self-motion, or heating.
 
-The example configurations in both repositories are intentionally disabled.
-Do not merely change their booleans. First measure and verify every frame map,
-axis sign/scale, gripper range and CAN assignment locally.
-Also review the leader/follower synchronization-gap and per-command step
-limits. Align each matching PiPER-X pair before startup; an excessive initial
-gap is rejected rather than turned into a catch-up movement.
+V3 has no per-machine retarget calibration file. It accepts only the built-in
+`arx_x5_piperx_relative_v1` profile and takes relative anchors at episode and
+takeover boundaries. You must still verify all four CAN names, physical arm
+identity, workspace clearance, joint zero behavior, and the safety thresholds
+in `configs/piper_x_robodojo_bridge.json`.
 
-Terminal A owns PiPER-X hardware and keyboard events. Start it first:
+## Why Terminal A starts first
+
+Terminal A is the exclusive hardware owner and local keyboard endpoint. At
+startup it is **listen-only**: it opens the local socket but does not connect,
+enable, or command any arm. Terminal B first starts Kai0, creates Isaac Sim,
+and stages the initial policy observation. Only its subsequent
+`arm_and_begin_episode` request authorizes Terminal A to perform bounded
+four-arm bring-up. Starting A first therefore guarantees a ready local endpoint
+without moving hardware before the policy and simulation exist.
+
+## Terminal A: local PiPER-X owner
+
+Use the LeRobot checkout that contains the v3 bridge:
 
 ```bash
-cd /home/hoo/piper_x/lerobot_sealab-robodojo-v2
+cd /path/to/lerobot_sealab
 
 cp --no-clobber configs/piper_x_robodojo_bridge.json \
-  /home/hoo/piper_x/robodojo_bridge.v2.reviewed.json
+  /path/to/piper_x_robodojo_bridge.reviewed.json
 
-# Physically calibrate/review axis_map, position_scale, both gripper ranges,
-# and all four CAN assignments. Only after verification, set the reviewed
-# file's retarget_calibrated field to the JSON boolean true.
+# Review the four CAN names and safety limits in the copied file.
 
 source /opt/anaconda3/etc/profile.d/conda.sh
-conda activate /home/hoo/piper_x/.conda
+conda activate /path/to/piper_x_conda_env
 
-PIPERX_ROBODOJO_BRIDGE_CONFIG=/home/hoo/piper_x/robodojo_bridge.v2.reviewed.json \
+PIPERX_ROBODOJO_BRIDGE_CONFIG=/path/to/piper_x_robodojo_bridge.reviewed.json \
 PIPERX_MOTION_ACK=I_HAVE_ESTOP_AND_SUPPORT \
 bash cmds/piper_x_robodojo_bridge.sh
 ```
 
-Do not continue until this terminal reports:
+Keep this terminal focused: `i` and the episode-label keys are read from its
+local TTY, not from the Isaac window. The initial ready message must say v3 and
+`SAFE LISTEN-ONLY`; at that moment the arms are still untouched.
 
-```text
-PiPER-X RoboDojo bridge ready on 127.0.0.1:8765; i toggles intervention.
-```
+## Terminal B: Kai0, RoboDojo, and Isaac Sim
 
-Keep Terminal A focused for operator keys. Its standard input must remain a
-TTY.
-
-Terminal B starts Kai0, RoboDojo and Isaac Sim:
+On a fresh RoboDojo checkout, first initialize the assets and Kai0 environment
+as described in the repository setup guide. Then run:
 
 ```bash
-cd /home/hoo/RoboDojo-piperx-dagger-v2
-
-# One-time prerequisite on a fresh worktree. Skip only when Assets already
-# contains Robots, Object, Material and Eval_Layout.
-bash scripts/init_assets.sh
-source /opt/anaconda3/etc/profile.d/conda.sh
-conda activate RoboDojo
-python utils/update_embodiment_config_path.py
-
-cp --no-clobber config/piperx_sim_dagger.example.json \
-  /home/hoo/piper_x/piperx_sim_dagger.v2.reviewed.json
-
-# Calibrate leader_to_sim_rotation_qwxyz, translation_scale, both gripper
-# ranges and safety limits. After an offline/no-follower verification, set
-# calibrated to the JSON boolean true in this reviewed copy.
+cd /path/to/RoboDojo
 
 OMNI_KIT_ACCEPT_EULA=YES \
 bash scripts/RoboDojo/collect_pi05_piperx_sim_dagger.sh \
   --task make_toast \
-  --checkpoint-dir /home/hoo/RoboDojo/.cache/robodojo_ckpt_huggingface_repo/ckpt/RoboDojo/Pi_05/RoboDojo-sim-arx_x5-joint-0/59999 \
+  --checkpoint-dir /path/to/checkpoint/59999 \
   --checkpoint-id RoboDojo-sim-arx_x5-joint-0/59999 \
-  --kai0-root /home/hoo/RoboDojo/third_party/kai0 \
-  --kai0-python /home/hoo/RoboDojo/third_party/kai0/.venv/bin/python \
-  --piperx-calibration /home/hoo/piper_x/piperx_sim_dagger.v2.reviewed.json \
+  --kai0-root /path/to/RoboDojo/third_party/kai0 \
+  --kai0-python /path/to/RoboDojo/third_party/kai0/.venv/bin/python \
   --piperx-response-timeout 1.0 \
-  --lerobot-root /home/hoo/data/lerobot \
+  --piperx-arm-timeout 60 \
+  --piperx-transition-timeout 10 \
+  --lerobot-root /path/to/data/lerobot \
   --lerobot-repo-id robodojo_piperx_make_toast_official_59999 \
   --eval-num 10 \
   --policy-gpu 0 \
   --env-gpu 0
 ```
 
-The `1.0` second bridge deadline is deliberately conservative for the first
-four-arm acceptance run. Measure real exchange latency before reducing it; the
-normal launcher default remains `0.2` seconds. This does not remove the
-independent hardware motion/session watchdogs.
+The 1.0-second steady-response deadline is conservative for the first HIL run;
+the launcher default is 0.2 seconds. It is independent of hardware watchdogs.
+The default is GUI mode. Add `--headless` only when a window is intentionally
+unnecessary. Add `--resume` only when appending to an existing compatible
+LeRobot v3 dataset.
 
-Add `--resume` only when appending to an existing compatible LeRobot v3
-dataset. The RoboDojo launcher never starts, enables or configures PiPER-X; it
-only connects to the already-ready local bridge.
+The command launches the Kai0 server itself, waits for it to become ready, and
+then starts the RoboDojo evaluator. A third policy-server command is neither
+needed nor allowed on the same port.
 
 ## Operator workflow
 
-- In policy mode, Kai0 controls RoboDojo and the followers mirror the accepted
-  simulated motion. Each leader is motor-driven from its matching follower's
-  fresh measured joints and gripper. **Do not pull a leader in this mode.**
-- Press `i` in **Terminal A** once to enter intervention. The bridge freezes
-  followers, stops leader following, and switches both leaders to native
-  backdrivable mode at the next serialized control boundary. Terminal A first
-  prints `TRANSITION ... DO NOT MOVE`; do not move either leader until it
-  prints `MANUAL READY`. That line confirms only the physical role. Begin the
-  recorded correction after **Terminal B** prints `[PiPER-X DAgger] manual
-  control ON`, which is emitted after RoboDojo has consumed the takeover edge
-  and anchored the leader poses. Then move both leaders;
-  RoboDojo anchors their current poses to the current simulated end-effector
-  poses, applies relative Cartesian deltas, solves ARX X5 IK, and executes the
-  safe result. The followers then mirror that accepted simulated result.
-- Press `i` again to leave intervention. Both leaders first hold their current
-  pose and safely reattach to fresh follower feedback. If their synchronization
-  gap is too large, no catch-up target is sent; the bridge fails closed and
-  disables all four arms, so the session must be inspected and restarted.
-  Wait for Terminal A to print `POLICY FOLLOW READY`, then for Terminal B to
-  print `manual control OFF`. After the completed `exit`, RoboDojo
-  discards the stale Pi0.5 action chunk and runs fresh inference from the
-  post-intervention observation.
-- `Right Arrow`: accept and commit the complete episode, then load the next
-  layout.
-- `Left Arrow`: discard the candidate and retry the same layout.
-- `Esc`: accept and commit the complete episode, then exit cleanly.
-- `Backspace`: discard the candidate, then exit cleanly.
+1. In policy mode, Pi0.5 moves the ARX X5 simulation. Followers mirror the last
+   accepted simulated end poses, then leaders mirror fresh measured follower
+   joints. Do not pull a motor-driven leader.
+2. Press `i` once in Terminal A. Both followers take measured hold and both
+   leaders remain held while RoboDojo freezes Isaac. Do not move until Terminal
+   B prints `[PiPER-X DAgger] manual control ON`. Before printing it, RoboDojo
+   resolves one exact post-switch sample as `anchor`, so the physical joint
+   zero and simulated Cartesian zero come from the same leader state.
+3. Move the two leaders. For every bimanual sample RoboDojo first checks both
+   ARX IK results. On success, that exact sample is committed to both followers
+   by relative PiPER-X joint deltas; only after the physical acknowledgement
+   does Isaac execute and record the ARX action. If either IK/safety check
+   fails, both followers and Isaac hold and no expert frame is recorded.
+4. Press `i` again. Both sides hold, the bridge anchors policy mapping at the
+   final manual state, and leaders safely reattach to fresh follower feedback.
+   RoboDojo discards the stale Pi0.5 action chunk and infers again from the
+   post-correction observation.
+5. When the complete rollout can be judged, label it:
 
-During either hardware transition Isaac is frozen and no dataset frame is
-written. An accepted episode stores every executed simulation step, not only the
-intervention segment. `action` is the action actually executed by the ARX X5
-simulation; `complementary_info.policy_action` preserves the available policy
-proposal; and `complementary_info.is_intervention` identifies valid human
-steps. Unsafe/failed IK samples freeze both arms and are not written as expert
-training actions.
+   | Key in Terminal A | Result |
+   |---|---|
+   | Right Arrow | save complete episode, then load next layout |
+   | Left Arrow | discard candidate, retry same layout |
+   | Esc | save complete episode, then exit |
+   | Backspace | discard candidate, then exit |
 
-If the bridge disconnects, misses a deadline, rejects a mirror target or
-reports unhealthy hardware, the bridge disables both leaders and both
-followers; RoboDojo discards the staged candidate and ends the session without
-reconnecting or replaying it.
+If a terminal key is pressed during intervention, the bridge first performs
+the same safe exit/reattachment and only then delivers the label.
 
-The exact wire contract and lifecycle invariants are documented in
-`protocol/robodojo_piperx_v2/protocol.md`.
+`i` is a control-boundary request, not a hard E-stop. If it is pressed after a
+policy exchange has already been acknowledged but just before Isaac applies
+that action, the one already-authorized simulator step may finish before the
+transition is observed (bounded to one control tick). No later policy action is
+executed; takeover then pairs the resulting simulator state with the held
+physical state through the explicit relative anchor. Use the hardware E-stop,
+not `i`, for an immediate safety stop.
+
+## What is stored
+
+Only accepted episodes are committed. Each contains all executed policy and
+manual steps, not merely the intervention interval:
+
+- `action`: action actually executed by the ARX X5 simulation;
+- `complementary_info.policy_action`: original policy proposal when available;
+- `complementary_info.is_intervention`: one for accepted human corrections;
+- episode metadata: task, checkpoint provenance, v3 protocol, fixed embodiment
+  profile, layout/seed, success, finish reason, and intervention presence.
+
+Transition frames, the takeover anchor, rejected IK, and physical holds do not
+step Isaac and are not stored as expert actions. A disconnect, missed deadline,
+stale feedback, TTY loss, CAN failure, partial command, or invalid protocol
+response disables all four arms, discards the candidate, and makes that session
+non-replayable.
+
+The complete contract is in
+`protocol/robodojo_piperx_v3/protocol.md`.
