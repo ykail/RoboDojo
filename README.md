@@ -44,6 +44,7 @@ The [RoboDojo documentation](https://robodojo-benchmark.com/doc/) is the canonic
 | [Common Issues](https://robodojo-benchmark.com/doc/common-issue/) | Troubleshooting for installation, assets, GPU memory, and evaluation. |
 | [Kai0 Pi0.5 Setup](docs/KAI0_PI05_SETUP.md) | Standard fresh-machine setup, checkpoint configuration, evaluation, intervention collection, and development workflow. |
 | [Kai0 Pi0.5 Integration](docs/KAI0_PI05_INTEGRATION.md) | Strict socket runtime, submodule/worktree workflow, training-code ownership, and one-command evaluation. |
+| [PiPER-X Sim DAgger](docs/PIPERX_SIM_DAGGER.md) | Supervised two-terminal startup, leader intervention, follower mirroring, and LeRobot v3 recording semantics. |
 
 ## 🗂️ Repository Structure
 

@@ -176,6 +176,10 @@ from src.eval_client.lerobot_stream_recorder import (
     close_lerobot_stream_session,
 )
 from src.eval_client.observation_loop import ObservationAdvance, ObservationExit
+from src.eval_client.piperx_bridge_client import (
+    PiperXBridgeError,
+    close_piperx_bridge_session,
+)
 from src.eval_client.policy_runtime import PolicyClientError, ResetReason
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
@@ -271,6 +275,7 @@ def _restart_or_exit(env, simulation_app, fatal_msg):
     # Otherwise the replacement process can race the server's disconnect
     # cleanup and receive a terminal session_busy response during HELLO.
     _close_model_client(env)
+    close_piperx_bridge_session()
     try:
         simulation_app.close()
     except Exception:
@@ -296,6 +301,7 @@ def _exit_for_shell_restart(env, fatal_msg):
     # os._exit skips normal cleanup; explicitly close the socket so the next
     # shell-launched client does not inherit a still-held Kai0 policy lease.
     _close_model_client(env)
+    close_piperx_bridge_session()
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(99)
@@ -309,13 +315,18 @@ def main():
     num_envs = args_cli.num_envs
     policy_runtime = args_cli.policy_runtime
     control_mode = os.environ.get("ROBODOJO_CONTROL_MODE", "policy").strip().lower()
-    if control_mode not in {"policy", "keyboard_intervention", "keyboard_observe"}:
+    if control_mode not in {
+        "policy",
+        "keyboard_intervention",
+        "keyboard_observe",
+        "piperx_sim_dagger",
+    }:
         raise ValueError(
             "ROBODOJO_CONTROL_MODE must be 'policy', 'keyboard_intervention', "
-            "or 'keyboard_observe', "
+            "'keyboard_observe', or 'piperx_sim_dagger', "
             f"got {control_mode!r}."
         )
-    operator_driven = control_mode == "keyboard_intervention"
+    operator_driven = control_mode in {"keyboard_intervention", "piperx_sim_dagger"}
     observation_mode = control_mode == "keyboard_observe"
     if control_mode in {"keyboard_intervention", "keyboard_observe"}:
         if policy_runtime == "xpolicy_ws_v0" and args_cli.policy_name != "Pi_05":
@@ -325,6 +336,19 @@ def main():
             raise ValueError(
                 "Interactive keyboard mode needs the Isaac Sim window. Set ROBODOJO_HEADLESS=0, "
                 "HEADLESS=0, and LIVESTREAM=0, then keep that window focused while operating."
+            )
+        if num_envs != 1:
+            print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
+            num_envs = 1
+    if control_mode == "piperx_sim_dagger":
+        if policy_runtime != "robodojo_policy_v1":
+            raise ValueError("piperx_sim_dagger requires --policy_runtime robodojo_policy_v1")
+        launcher_headless = bool(
+            getattr(app_launcher, "_headless", getattr(args_cli, "headless", False))
+        )
+        if launcher_headless:
+            raise ValueError(
+                "piperx_sim_dagger requires the live Isaac Sim window; disable --headless"
             )
         if num_envs != 1:
             print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
@@ -525,6 +549,14 @@ def main():
             env.close()
             operator_fatal_error = e
             operator_stop_requested = True
+        except PiperXBridgeError as e:
+            # Hardware/protocol ambiguity is never replayable: the bridge has
+            # already entered fail-closed hold/disable and the staged episode
+            # was discarded by the control loop.
+            print(f"[PiPER-X DAgger][FATAL] {e}", flush=True)
+            env.close()
+            operator_fatal_error = e
+            operator_stop_requested = True
         except KeyboardInterrupt as e:
             print("[main] interrupted by operator; closing the current run.", flush=True)
             operator_fatal_error = e
@@ -649,6 +681,7 @@ def main():
         except Exception as e:
             print(f"[main] failed to preserve resume manifest: {e}")
     close_lerobot_stream_session()
+    close_piperx_bridge_session()
     _close_model_client(env)
     env.close()
     simulation_app.close()

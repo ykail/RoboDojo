@@ -664,6 +664,16 @@ def _episode_metadata(
         "robodojo_policy_runtime": str(
             metadata.get("policy_runtime", "xpolicy_ws_v0"),
         ),
+        "robodojo_control_mode": str(metadata.get("control_mode", "")),
+        "robodojo_piperx_bridge_protocol": str(
+            metadata.get("piperx_bridge_protocol", ""),
+        ),
+        "robodojo_piperx_calibration_name": str(
+            metadata.get("piperx_calibration_name", ""),
+        ),
+        "robodojo_piperx_calibration_sha256": str(
+            metadata.get("piperx_calibration_sha256", ""),
+        ),
         "robodojo_policy_provenance": dict(policy_provenance),
         "robodojo_layout_id": integer("layout_id"),
         "robodojo_layout_cycle": integer("layout_cycle", 0),

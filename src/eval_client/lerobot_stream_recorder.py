@@ -530,7 +530,8 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
     if not isinstance(policy_provenance, dict):
         policy_provenance = {}
     checkpoint_id = policy_provenance.get("checkpoint_id")
-    return {
+    control_mode = getattr(task_env, "control_mode", "keyboard_intervention")
+    metadata = {
         "task_name": getattr(task_env, "task_name", os.environ.get("ROBODOJO_TASK_NAME", "")),
         "env_config": getattr(task_env, "config_name", os.environ.get("ROBODOJO_ENV_CFG", "")),
         "layout_id": int(layout_id),
@@ -549,8 +550,15 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         "robodojo_commit": _git_revision(project_root),
         "xpolicylab_commit": _git_revision(project_root / "XPolicyLab"),
         "run_id": os.environ.get("ROBODOJO_RUN_ID", ""),
-        "control_mode": "keyboard_intervention",
+        "control_mode": control_mode,
     }
+    if control_mode == "piperx_sim_dagger":
+        calibration = Path(os.environ.get("ROBODOJO_PIPERX_CALIBRATION", ""))
+        if calibration.is_file():
+            metadata["piperx_calibration_name"] = calibration.name
+            metadata["piperx_calibration_sha256"] = hashlib.sha256(calibration.read_bytes()).hexdigest()
+        metadata["piperx_bridge_protocol"] = "robodojo_piperx_v1"
+    return metadata
 
 
 def recorder_for_env(task_env: Any, record_dir: str | None = None) -> LeRobotStreamRecorder:

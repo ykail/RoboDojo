@@ -30,8 +30,9 @@ RoboDojo simulation:
   --eval-num NUM              Number of evaluation episodes (default: 10)
   --env-gpu ID                GPU visible to Isaac Sim (default: 0)
   --seed NUM                  RoboDojo layout-set seed (default: 0)
-  --control-mode MODE         policy, keyboard_intervention, or
-                              keyboard_observe (default: policy)
+  --control-mode MODE         policy, keyboard_intervention,
+                              keyboard_observe, or piperx_sim_dagger
+                              (default: policy)
   --headless                  Disable the Isaac Sim window (GUI is the default)
 
 Intervention recording:
@@ -41,6 +42,17 @@ Intervention recording:
   --resume                    Append to an existing compatible dataset
   --lerobot-vcodec CODEC      h264, hevc, or libsvtav1 (default: h264)
   --encoder-threads NUM       CPU video encoder threads (default: 2)
+
+PiPER-X simulator DAgger (does not start or enable hardware):
+  --piperx-calibration PATH   Required retarget JSON with calibrated=true
+  --piperx-bridge-host HOST   Must be loopback (default: 127.0.0.1)
+  --piperx-bridge-port NUM    Existing LeRobot bridge port (default: 8765)
+  --piperx-connect-timeout S  Initial TCP timeout (default: 5.0)
+  --piperx-response-timeout S Per-request/deadline timeout (default: 0.2)
+  --piperx-heartbeat-interval S
+                              Session heartbeat period (default: 0.25)
+  --piperx-max-ik-failures N  Consecutive rejected samples before abort
+                              (default: 25)
 
 Other:
   --dry-run                   Validate inputs and print both commands only
@@ -90,6 +102,13 @@ lerobot_repo_id="${ROBODOJO_LEROBOT_REPO_ID:-}"
 resume="0"
 lerobot_vcodec="h264"
 encoder_threads="2"
+piperx_calibration="${ROBODOJO_PIPERX_CALIBRATION:-}"
+piperx_bridge_host="${ROBODOJO_PIPERX_BRIDGE_HOST:-127.0.0.1}"
+piperx_bridge_port="${ROBODOJO_PIPERX_BRIDGE_PORT:-8765}"
+piperx_connect_timeout="${ROBODOJO_PIPERX_CONNECT_TIMEOUT_S:-5.0}"
+piperx_response_timeout="${ROBODOJO_PIPERX_RESPONSE_TIMEOUT_S:-0.2}"
+piperx_heartbeat_interval="${ROBODOJO_PIPERX_HEARTBEAT_INTERVAL_S:-0.25}"
+piperx_max_ik_failures="${ROBODOJO_PIPERX_MAX_CONSECUTIVE_IK_FAILURES:-25}"
 dry_run="0"
 
 while [[ $# -gt 0 ]]; do
@@ -182,6 +201,41 @@ while [[ $# -gt 0 ]]; do
       encoder_threads="$2"
       shift 2
       ;;
+    --piperx-calibration)
+      need_value "$@"
+      piperx_calibration="$2"
+      shift 2
+      ;;
+    --piperx-bridge-host)
+      need_value "$@"
+      piperx_bridge_host="$2"
+      shift 2
+      ;;
+    --piperx-bridge-port)
+      need_value "$@"
+      piperx_bridge_port="$2"
+      shift 2
+      ;;
+    --piperx-connect-timeout)
+      need_value "$@"
+      piperx_connect_timeout="$2"
+      shift 2
+      ;;
+    --piperx-response-timeout)
+      need_value "$@"
+      piperx_response_timeout="$2"
+      shift 2
+      ;;
+    --piperx-heartbeat-interval)
+      need_value "$@"
+      piperx_heartbeat_interval="$2"
+      shift 2
+      ;;
+    --piperx-max-ik-failures)
+      need_value "$@"
+      piperx_max_ik_failures="$2"
+      shift 2
+      ;;
     --dry-run)
       dry_run="1"
       shift
@@ -228,13 +282,40 @@ fi
 (( policy_seed <= 4294967295 )) || die "--policy-seed must be in [0, 2^32 - 1]"
 
 case "${control_mode}" in
-  policy|keyboard_intervention|keyboard_observe) ;;
+  policy|keyboard_intervention|keyboard_observe|piperx_sim_dagger) ;;
   *)
-    die "--control-mode must be policy, keyboard_intervention, or keyboard_observe"
+    die "--control-mode must be policy, keyboard_intervention, keyboard_observe, or piperx_sim_dagger"
     ;;
 esac
 if [[ "${headless}" == "1" && "${control_mode}" != "policy" ]]; then
-  die "--headless cannot be combined with an interactive keyboard control mode"
+  die "--headless cannot be combined with an interactive/observation control mode"
+fi
+
+if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
+  [[ -n "${piperx_calibration}" ]] || die "--piperx-calibration is required for piperx_sim_dagger"
+  case "${piperx_bridge_host}" in
+    127.0.0.1|localhost|::1) ;;
+    *) die "--piperx-bridge-host must be loopback" ;;
+  esac
+  [[ "${piperx_bridge_port}" =~ ^[0-9]+$ ]] || die "--piperx-bridge-port must be an integer"
+  (( piperx_bridge_port >= 1 && piperx_bridge_port <= 65535 )) \
+    || die "--piperx-bridge-port must be in [1, 65535]"
+  [[ "${piperx_bridge_port}" != "${port}" ]] \
+    || die "policy and PiPER-X bridge ports must be different"
+  [[ "${piperx_max_ik_failures}" =~ ^[1-9][0-9]*$ ]] \
+    || die "--piperx-max-ik-failures must be a positive integer"
+  for timeout_value in \
+    "${piperx_connect_timeout}" \
+    "${piperx_response_timeout}" \
+    "${piperx_heartbeat_interval}"; do
+    [[ "${timeout_value}" =~ ^[0-9]+([.][0-9]+)?$ && "${timeout_value}" =~ [1-9] ]] \
+      || die "PiPER-X timeout/heartbeat values must be positive numbers"
+  done
+  if [[ "${piperx_calibration}" != /* ]]; then
+    piperx_calibration="${LAUNCH_DIR}/${piperx_calibration}"
+  fi
+  [[ -f "${piperx_calibration}" ]] || die "PiPER-X calibration does not exist: ${piperx_calibration}"
+  piperx_calibration="$(cd "$(dirname "${piperx_calibration}")" && pwd -P)/$(basename "${piperx_calibration}")"
 fi
 
 if [[ "${kai0_root}" != /* ]]; then
@@ -259,7 +340,22 @@ fi
 [[ -x "${kai0_python}" ]] || die "Kai0 Python is not executable: ${kai0_python}"
 kai0_python="$(cd "$(dirname "${kai0_python}")" && pwd -P)/$(basename "${kai0_python}")"
 
-if [[ "${control_mode}" == "keyboard_intervention" ]]; then
+if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
+  if ! env \
+    -u PYTHONHOME \
+    -u VIRTUAL_ENV \
+    -u CONDA_PREFIX \
+    -u CONDA_DEFAULT_ENV \
+    "PYTHONPATH=${ROOT_DIR}" \
+    "${kai0_python}" -c \
+    'import sys; from src.eval_client.piperx_retarget import RetargetConfig; RetargetConfig.from_file(sys.argv[1])' \
+    "${piperx_calibration}"; then
+    die "PiPER-X calibration is incomplete or unsafe; verify the full schema and calibrated=true"
+  fi
+fi
+
+if [[ "${control_mode}" == "keyboard_intervention" \
+  || "${control_mode}" == "piperx_sim_dagger" ]]; then
   if [[ -z "${lerobot_repo_id}" ]]; then
     lerobot_repo_id="robodojo_interventions_${task}"
   fi
@@ -340,7 +436,8 @@ eval_environment=(
   "HEADLESS=${headless}"
   "LIVESTREAM=0"
 )
-if [[ "${control_mode}" == "keyboard_intervention" ]]; then
+if [[ "${control_mode}" == "keyboard_intervention" \
+  || "${control_mode}" == "piperx_sim_dagger" ]]; then
   eval_environment+=(
     "ROBODOJO_OPERATOR_DRIVEN=1"
     "ROBODOJO_REALTIME=1"
@@ -355,6 +452,17 @@ if [[ "${control_mode}" == "keyboard_intervention" ]]; then
     "ROBODOJO_TASK_NAME=${task}"
     "ROBODOJO_ENV_CFG=arx_x5"
     "ROBODOJO_CHECKPOINT=${checkpoint_id}"
+  )
+fi
+if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
+  eval_environment+=(
+    "ROBODOJO_PIPERX_CALIBRATION=${piperx_calibration}"
+    "ROBODOJO_PIPERX_BRIDGE_HOST=${piperx_bridge_host}"
+    "ROBODOJO_PIPERX_BRIDGE_PORT=${piperx_bridge_port}"
+    "ROBODOJO_PIPERX_CONNECT_TIMEOUT_S=${piperx_connect_timeout}"
+    "ROBODOJO_PIPERX_RESPONSE_TIMEOUT_S=${piperx_response_timeout}"
+    "ROBODOJO_PIPERX_HEARTBEAT_INTERVAL_S=${piperx_heartbeat_interval}"
+    "ROBODOJO_PIPERX_MAX_CONSECUTIVE_IK_FAILURES=${piperx_max_ik_failures}"
   )
 fi
 
@@ -382,8 +490,14 @@ echo "[eval_kai0_pi05] task=${task} eval_num=${eval_num} control_mode=${control_
 echo "[eval_kai0_pi05] checkpoint=${checkpoint_dir} checkpoint_id=${checkpoint_id}"
 echo "[eval_kai0_pi05] Kai0=${kai0_root} policy_gpu=${policy_gpu} env_gpu=${env_gpu}"
 echo "[eval_kai0_pi05] policy_url=${policy_url} headless=${headless}"
-if [[ "${control_mode}" == "keyboard_intervention" ]]; then
+if [[ "${control_mode}" == "keyboard_intervention" \
+  || "${control_mode}" == "piperx_sim_dagger" ]]; then
   echo "[eval_kai0_pi05] LeRobot=${lerobot_root%/}/${lerobot_repo_id} resume=${resume}"
+fi
+if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
+  echo "[eval_kai0_pi05] PiPER-X bridge=${piperx_bridge_host}:${piperx_bridge_port}"
+  echo "[eval_kai0_pi05] PiPER-X calibration=${piperx_calibration}"
+  echo "[eval_kai0_pi05] NOTE: this command never starts or enables PiPER-X hardware"
 fi
 
 if [[ "${dry_run}" == "1" ]]; then
@@ -393,8 +507,14 @@ if [[ "${dry_run}" == "1" ]]; then
   exit 0
 fi
 
+tcp_endpoint_is_open() {
+  local endpoint_host="$1"
+  local endpoint_port="$2"
+  (exec 3<>"/dev/tcp/${endpoint_host}/${endpoint_port}") >/dev/null 2>&1
+}
+
 tcp_is_open() {
-  (exec 3<>"/dev/tcp/${server_host}/${port}") >/dev/null 2>&1
+  tcp_endpoint_is_open "${server_host}" "${port}"
 }
 
 server_is_ready() {

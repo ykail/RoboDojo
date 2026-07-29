@@ -75,7 +75,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.operator_driven = bool(
                 self.eval_cfg.get(
                     "operator_driven",
-                    self.control_mode == "keyboard_intervention",
+                    self.control_mode in {"keyboard_intervention", "piperx_sim_dagger"},
                 )
             )
             self.layout_cycle = 0
@@ -401,6 +401,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
                 run_keyboard_intervention_episode(self, self.model_client)
                 return
+            if self.control_mode == "piperx_sim_dagger":
+                from src.eval_client.piperx_sim_dagger_loop import (
+                    run_piperx_sim_dagger_episode,
+                )
+
+                run_piperx_sim_dagger_episode(self, self.model_client)
+                return
             if self.policy_runtime == "robodojo_policy_v1":
                 run_single_env_policy_episode(self, self.model_client)
                 return
@@ -443,6 +450,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
                 run_keyboard_intervention_episode(self, self.model_client)
                 return
+            if self.control_mode == "piperx_sim_dagger":
+                raise RuntimeError("piperx_sim_dagger does not support batched evaluation")
             policy_name = self.deploy_cfg["policy_name"]
             try:
                 eval_module = __import__(
