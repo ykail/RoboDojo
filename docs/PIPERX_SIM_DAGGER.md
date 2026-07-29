@@ -40,10 +40,10 @@ gap is rejected rather than turned into a catch-up movement.
 Terminal A owns PiPER-X hardware and keyboard events. Start it first:
 
 ```bash
-cd /home/hoo/piper_x/lerobot_sealab
+cd /home/hoo/piper_x/lerobot_sealab-robodojo-v2
 
-cp configs/piper_x_robodojo_bridge.json \
-  /home/hoo/piper_x/robodojo_bridge.reviewed.json
+cp --no-clobber configs/piper_x_robodojo_bridge.json \
+  /home/hoo/piper_x/robodojo_bridge.v2.reviewed.json
 
 # Physically calibrate/review axis_map, position_scale, both gripper ranges,
 # and all four CAN assignments. Only after verification, set the reviewed
@@ -52,7 +52,7 @@ cp configs/piper_x_robodojo_bridge.json \
 source /opt/anaconda3/etc/profile.d/conda.sh
 conda activate /home/hoo/piper_x/.conda
 
-PIPERX_ROBODOJO_BRIDGE_CONFIG=/home/hoo/piper_x/robodojo_bridge.reviewed.json \
+PIPERX_ROBODOJO_BRIDGE_CONFIG=/home/hoo/piper_x/robodojo_bridge.v2.reviewed.json \
 PIPERX_MOTION_ACK=I_HAVE_ESTOP_AND_SUPPORT \
 bash cmds/piper_x_robodojo_bridge.sh
 ```
@@ -69,23 +69,42 @@ TTY.
 Terminal B starts Kai0, RoboDojo and Isaac Sim:
 
 ```bash
-cd /path/to/RoboDojo
+cd /home/hoo/RoboDojo-piperx-dagger-v2
 
-cp config/piperx_sim_dagger.example.json \
-  /absolute/path/piperx_sim_dagger.reviewed.json
+# One-time prerequisite on a fresh worktree. Skip only when Assets already
+# contains Robots, Object, Material and Eval_Layout.
+bash scripts/init_assets.sh
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate RoboDojo
+python utils/update_embodiment_config_path.py
+
+cp --no-clobber config/piperx_sim_dagger.example.json \
+  /home/hoo/piper_x/piperx_sim_dagger.v2.reviewed.json
 
 # Calibrate leader_to_sim_rotation_qwxyz, translation_scale, both gripper
 # ranges and safety limits. After an offline/no-follower verification, set
 # calibrated to the JSON boolean true in this reviewed copy.
 
+OMNI_KIT_ACCEPT_EULA=YES \
 bash scripts/RoboDojo/collect_pi05_piperx_sim_dagger.sh \
   --task make_toast \
-  --checkpoint-dir /absolute/path/to/kai0_checkpoint/5000 \
-  --checkpoint-id make_toast-left-dagger/5000 \
-  --piperx-calibration /absolute/path/piperx_sim_dagger.reviewed.json \
-  --lerobot-root /absolute/path/to/data \
-  --lerobot-repo-id robodojo_piperx_make_toast
+  --checkpoint-dir /home/hoo/RoboDojo/.cache/robodojo_ckpt_huggingface_repo/ckpt/RoboDojo/Pi_05/RoboDojo-sim-arx_x5-joint-0/59999 \
+  --checkpoint-id RoboDojo-sim-arx_x5-joint-0/59999 \
+  --kai0-root /home/hoo/RoboDojo/third_party/kai0 \
+  --kai0-python /home/hoo/RoboDojo/third_party/kai0/.venv/bin/python \
+  --piperx-calibration /home/hoo/piper_x/piperx_sim_dagger.v2.reviewed.json \
+  --piperx-response-timeout 1.0 \
+  --lerobot-root /home/hoo/data/lerobot \
+  --lerobot-repo-id robodojo_piperx_make_toast_official_59999 \
+  --eval-num 10 \
+  --policy-gpu 0 \
+  --env-gpu 0
 ```
+
+The `1.0` second bridge deadline is deliberately conservative for the first
+four-arm acceptance run. Measure real exchange latency before reducing it; the
+normal launcher default remains `0.2` seconds. This does not remove the
+independent hardware motion/session watchdogs.
 
 Add `--resume` only when appending to an existing compatible LeRobot v3
 dataset. The RoboDojo launcher never starts, enables or configures PiPER-X; it
