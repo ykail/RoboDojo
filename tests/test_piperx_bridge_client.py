@@ -32,7 +32,17 @@ def _response(
     terminal=None,
     seq=None,
     mirror_accepted=None,
+    leader_actuation_mode=None,
+    follower_actuation_mode=None,
+    transition=None,
 ):
+    topology = "accepted_sim_to_follower_to_leader"
+    leader_mode = (
+        {"policy": "output_follow", "intervention": "native_leader", "fault": "fault"}[mode]
+        if leader_actuation_mode is None
+        else leader_actuation_mode
+    )
+    follower_mode = "sim_follow" if follower_actuation_mode is None else follower_actuation_mode
     return {
         "protocol": PROTOCOL,
         "type": request["type"],
@@ -44,6 +54,10 @@ def _response(
         "deadline_monotonic_ns": request["deadline_monotonic_ns"],
         "payload": {
             "mode": mode,
+            "control_topology": topology,
+            "leader_actuation_mode": leader_mode,
+            "follower_actuation_mode": follower_mode,
+            "transition": transition,
             "edge": edge,
             "terminal_request": terminal,
             "leader": {
@@ -57,7 +71,12 @@ def _response(
                 },
             },
             "mirror_accepted": (request["type"] == "exchange" if mirror_accepted is None else mirror_accepted),
-            "health": {"ok": True},
+            "health": {
+                "ok": True,
+                "control_topology": topology,
+                "leader_actuation_mode": leader_mode,
+                "follower_actuation_mode": follower_mode,
+            },
             "diagnostics": {"request_ok": True},
         },
     }
@@ -207,6 +226,75 @@ class PiperXBridgeClientTest(unittest.TestCase):
         client.begin_episode("mirror-rejected", _sim())
         with self.assertRaisesRegex(PiperXBridgeSafetyError, "rejected"):
             client.exchange(_sim())
+        client.close()
+        server.join()
+
+    def test_non_heartbeat_response_rejects_wrong_leader_actuation_mode(self):
+        def handler(server, connection):
+            request = receive_frame(connection)
+            server.requests.append(request)
+            connection.sendall(
+                encode_frame(_response(request, leader_actuation_mode="native_leader"))
+            )
+
+        server = _Server(handler).start()
+        client = PiperXBridgeClient(
+            port=server.port,
+            response_timeout_s=1.0,
+            heartbeat_interval_s=10.0,
+        )
+        with self.assertRaisesRegex(PiperXBridgeSafetyError, "leader actuation"):
+            client.begin_episode("wrong-leader-mode", _sim())
+        client.close()
+        server.join()
+
+    def test_transition_freeze_is_not_a_plain_mirror_rejection(self):
+        def handler(server, connection):
+            begin = receive_frame(connection)
+            server.requests.append(begin)
+            connection.sendall(encode_frame(_response(begin)))
+            exchange = receive_frame(connection)
+            server.requests.append(exchange)
+            connection.sendall(
+                encode_frame(
+                    _response(
+                        exchange,
+                        transition="entering_intervention",
+                        follower_actuation_mode="hold",
+                        mirror_accepted=False,
+                    )
+                )
+            )
+
+        server = _Server(handler).start()
+        client = PiperXBridgeClient(
+            port=server.port,
+            response_timeout_s=1.0,
+            heartbeat_interval_s=10.0,
+        )
+        client.begin_episode("transition-freeze", _sim())
+        sample = client.exchange(_sim())
+        self.assertEqual(sample.transition, "entering_intervention")
+        self.assertFalse(sample.mirror_accepted)
+        client.close()
+        server.join()
+
+    def test_v1_peer_is_rejected_before_hardware_state_can_be_assumed(self):
+        def handler(server, connection):
+            request = receive_frame(connection)
+            server.requests.append(request)
+            response = _response(request)
+            response["protocol"] = "robodojo_piperx_v1"
+            connection.sendall(encode_frame(response))
+
+        server = _Server(handler).start()
+        client = PiperXBridgeClient(
+            port=server.port,
+            response_timeout_s=1.0,
+            heartbeat_interval_s=10.0,
+        )
+        with self.assertRaisesRegex(PiperXBridgeProtocolError, "protocol/type"):
+            client.begin_episode("old-peer", _sim())
         client.close()
         server.join()
 

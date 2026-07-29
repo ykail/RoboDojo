@@ -64,10 +64,12 @@ def run_piperx_sim_dagger_episode(
 
     Policy actions drive the ARX X5 simulation.  Before every action, the
     latest accepted simulator pose is exchanged with the local hardware
-    bridge so the two PiPER-X followers mirror it.  A bridge-side ``I`` edge
-    immediately invalidates the current policy chunk.  While intervention is
-    active, synchronized leader samples are retargeted into the simulator;
-    the followers receive only the simulator's accepted result on the next
+    bridge so the two PiPER-X followers mirror it and the leaders follow fresh
+    follower feedback.  A bridge-side ``I`` edge immediately invalidates the
+    current policy chunk.  During the physical mode transition the simulator
+    is frozen and no frame is recorded.  While intervention is active,
+    synchronized leader samples are retargeted into the simulator; the
+    followers receive only the simulator's accepted result on the next
     exchange.
     """
 
@@ -112,7 +114,7 @@ def run_piperx_sim_dagger_episode(
         )
         _send_observation(task_env, model_client, obs)
         print(
-            "[PiPER-X DAgger] policy -> simulation -> followers; "
+            "[PiPER-X DAgger] policy -> simulation -> followers -> leaders; "
             "I toggles leader intervention; Right/Left/Esc/Backspace label the episode."
         )
         print(f"[PiPER-X DAgger] Recording under {recorder.record_dir}")
@@ -132,6 +134,7 @@ def run_piperx_sim_dagger_episode(
     chunk_id = -1
     pending_release_edge = 0
     consecutive_manual_failures = 0
+    reported_transition: str | None = None
 
     def exchange() -> tuple[OperatorSample, Any]:
         sim = sim_targets_from_env(task_env, obs)
@@ -153,6 +156,8 @@ def run_piperx_sim_dagger_episode(
                 "bridge_generation": sample.generation,
                 "bridge_seq": sample.seq,
                 "bridge_mode": sample.mode,
+                "leader_actuation_mode": sample.leader_actuation_mode,
+                "follower_actuation_mode": sample.follower_actuation_mode,
             }
         )
         recorder.append(
@@ -198,6 +203,21 @@ def run_piperx_sim_dagger_episode(
         if callable(render):
             render()
 
+    def freeze_transition(sample: OperatorSample) -> None:
+        """Keep Isaac and the recorder idle while the hardware changes authority."""
+
+        nonlocal reported_transition
+        if sample.transition != reported_transition:
+            print(
+                "\n[PiPER-X DAgger] hardware transition in progress: "
+                f"{sample.transition}; simulation frozen and no frame recorded."
+            )
+            reported_transition = sample.transition
+        pacer.wait()
+        render = getattr(task_env, "render", None)
+        if callable(render):
+            render()
+
     try:
         intervention_active = False
         while terminal_request is None:
@@ -205,6 +225,10 @@ def run_piperx_sim_dagger_episode(
                 sample, sim = exchange()
                 if process_terminal(sample):
                     break
+                if sample.transition is not None:
+                    freeze_transition(sample)
+                    continue
+                reported_transition = None
                 if sample.mode == "policy":
                     controller.exit()
                     intervention_active = False
@@ -241,9 +265,14 @@ def run_piperx_sim_dagger_episode(
             sample, sim = exchange()
             if process_terminal(sample):
                 break
+            if sample.transition is not None:
+                freeze_transition(sample)
+                continue
+            reported_transition = None
             if sample.mode == "intervention":
                 controller.enter(sample, sim)
                 intervention_active = True
+                print("\n[PiPER-X DAgger] manual control ON; policy chunk preempted.")
                 action, control = controller.build_action(obs, sample)
                 control.update(
                     {
@@ -263,7 +292,6 @@ def run_piperx_sim_dagger_episode(
                     control=control,
                     sample=sample,
                 )
-                print("\n[PiPER-X DAgger] manual control ON; policy chunk preempted.")
                 continue
 
             # Policy-v1 consumes its staged observation when inference starts.
@@ -279,9 +307,23 @@ def run_piperx_sim_dagger_episode(
                 if process_terminal(sample):
                     stale_chunk = True
                     break
+                if sample.transition is not None:
+                    freeze_transition(sample)
+                    stale_chunk = True
+                    print(
+                        f"[PiPER-X DAgger] discarded {len(chunk) - chunk_index} "
+                        "policy target(s) at the hardware transition boundary."
+                    )
+                    break
+                reported_transition = None
                 if sample.mode == "intervention":
                     controller.enter(sample, sim)
                     intervention_active = True
+                    print(
+                        f"\n[PiPER-X DAgger] manual control ON at chunk={chunk_id} "
+                        f"index={chunk_index}; discarding "
+                        f"{len(chunk) - chunk_index} stale target(s)."
+                    )
                     manual_action, control = controller.build_action(obs, sample)
                     control.update(
                         {
@@ -303,11 +345,6 @@ def run_piperx_sim_dagger_episode(
                         sample=sample,
                     )
                     stale_chunk = True
-                    print(
-                        f"\n[PiPER-X DAgger] manual control ON at chunk={chunk_id} "
-                        f"index={chunk_index}; discarded "
-                        f"{len(chunk) - chunk_index} stale target(s)."
-                    )
                     break
                 if sample.edge == "exit":
                     # An enter+exit may have happened during slow inference.

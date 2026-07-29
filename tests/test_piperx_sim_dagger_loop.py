@@ -15,12 +15,24 @@ from src.eval_client.piperx_bridge_client import (
 from src.eval_client.piperx_sim_dagger_loop import run_piperx_sim_dagger_episode
 
 
-def _sample(seq, *, mode="policy", edge=None, terminal=None, generation=0):
+def _sample(
+    seq,
+    *,
+    mode="policy",
+    edge=None,
+    terminal=None,
+    generation=0,
+    transition=None,
+):
     arm = OperatorArmSample((0.0, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0), 0.04)
     return OperatorSample(
         generation=generation,
         seq=seq,
         mode=mode,
+        control_topology="accepted_sim_to_follower_to_leader",
+        leader_actuation_mode="native_leader" if mode == "intervention" else "output_follow",
+        follower_actuation_mode="hold" if transition else "sim_follow",
+        transition=transition,
         edge=edge,
         terminal_request=terminal,
         left=arm,
@@ -185,6 +197,49 @@ class _Recorder:
 
 
 class PiperXSimDaggerLoopTest(unittest.TestCase):
+    def test_hardware_transitions_freeze_sim_and_discard_policy_chunk(self):
+        env = _Env()
+        model = _Model()
+        bridge = _Bridge(
+            [
+                _sample(0),
+                _sample(1, transition="entering_intervention"),
+                _sample(2, transition="entering_intervention"),
+                _sample(3, mode="intervention", edge="enter", generation=1),
+                _sample(4, mode="intervention", generation=1),
+                _sample(
+                    5,
+                    mode="intervention",
+                    generation=1,
+                    transition="reattaching_policy",
+                ),
+                _sample(6, mode="policy", edge="exit", generation=2),
+                _sample(7, mode="policy", generation=2),
+                _sample(8, mode="policy", generation=2),
+                _sample(9, mode="policy", terminal="accept_next", generation=2),
+            ]
+        )
+        recorder = _Recorder()
+
+        result = run_piperx_sim_dagger_episode(
+            env,
+            model,
+            bridge=bridge,
+            controller=_Controller(),
+            recorder=recorder,
+            pace_realtime=False,
+        )
+
+        self.assertEqual(result, "fake-lerobot")
+        self.assertEqual(
+            env.actions,
+            [{"id": "human-1"}, {"id": "human-2"}, {"id": 100}],
+        )
+        self.assertEqual(len(recorder.rows), 3)
+        self.assertGreaterEqual(env.render_count, 3)
+        self.assertEqual(model.chunk, 2)
+        self.assertEqual(bridge.fail_reasons, [])
+
     def test_enter_preempts_chunk_exit_reinfers_and_records_executed_actions(self):
         env = _Env()
         model = _Model()

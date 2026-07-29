@@ -557,7 +557,7 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         if calibration.is_file():
             metadata["piperx_calibration_name"] = calibration.name
             metadata["piperx_calibration_sha256"] = hashlib.sha256(calibration.read_bytes()).hexdigest()
-        metadata["piperx_bridge_protocol"] = "robodojo_piperx_v1"
+        metadata["piperx_bridge_protocol"] = "robodojo_piperx_v2"
     return metadata
 
 

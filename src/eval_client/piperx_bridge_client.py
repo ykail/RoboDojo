@@ -18,7 +18,7 @@ import time
 from typing import Any
 import uuid
 
-PROTOCOL = "robodojo_piperx_v1"
+PROTOCOL = "robodojo_piperx_v2"
 MAX_FRAME_BYTES = 1 << 20
 _ENVELOPE_KEYS = frozenset(
     {
@@ -35,6 +35,10 @@ _ENVELOPE_KEYS = frozenset(
 )
 _REQUEST_TYPES = frozenset({"begin_episode", "exchange", "heartbeat", "hold", "end_episode"})
 _MODES = frozenset({"policy", "intervention", "fault"})
+_CONTROL_TOPOLOGY = "accepted_sim_to_follower_to_leader"
+_LEADER_ACTUATION_MODES = frozenset({"output_follow", "native_leader", "disabled", "fault"})
+_FOLLOWER_ACTUATION_MODES = frozenset({"sim_follow", "hold", "disabled", "fault"})
+_TRANSITIONS = frozenset({None, "entering_intervention", "reattaching_policy"})
 _EDGES = frozenset({None, "enter", "exit"})
 _TERMINAL_REQUESTS = frozenset({None, "accept_next", "discard_retry", "accept_exit", "discard_exit"})
 
@@ -137,6 +141,10 @@ class OperatorSample:
     generation: int
     seq: int
     mode: str
+    control_topology: str
+    leader_actuation_mode: str
+    follower_actuation_mode: str
+    transition: str | None
     edge: str | None
     terminal_request: str | None
     left: OperatorArmSample
@@ -376,6 +384,10 @@ class PiperXBridgeClient:
         payload = response["payload"]
         expected_payload_keys = {
             "mode",
+            "control_topology",
+            "leader_actuation_mode",
+            "follower_actuation_mode",
+            "transition",
             "edge",
             "terminal_request",
             "leader",
@@ -385,14 +397,45 @@ class PiperXBridgeClient:
         }
         if not isinstance(payload, dict) or set(payload) != expected_payload_keys:
             raise PiperXBridgeProtocolError(
-                "PiPER-X response payload must contain exactly mode, edge, terminal_request, "
-                "leader, mirror_accepted, health, diagnostics"
+                "PiPER-X response payload must contain exactly mode, control_topology, "
+                "leader_actuation_mode, follower_actuation_mode, transition, edge, "
+                "terminal_request, leader, mirror_accepted, health, diagnostics"
             )
         mode = payload["mode"]
+        control_topology = payload["control_topology"]
+        leader_actuation_mode = payload["leader_actuation_mode"]
+        follower_actuation_mode = payload["follower_actuation_mode"]
+        transition = payload["transition"]
         edge = payload["edge"]
         terminal_request = payload["terminal_request"]
         if mode not in _MODES or edge not in _EDGES or terminal_request not in _TERMINAL_REQUESTS:
             raise PiperXBridgeProtocolError("PiPER-X response has an invalid mode, edge, or terminal request")
+        if control_topology != _CONTROL_TOPOLOGY:
+            raise PiperXBridgeProtocolError("PiPER-X response has an invalid control_topology")
+        if leader_actuation_mode not in _LEADER_ACTUATION_MODES:
+            raise PiperXBridgeProtocolError("PiPER-X response has an invalid leader_actuation_mode")
+        if follower_actuation_mode not in _FOLLOWER_ACTUATION_MODES:
+            raise PiperXBridgeProtocolError("PiPER-X response has an invalid follower_actuation_mode")
+        if transition not in _TRANSITIONS:
+            raise PiperXBridgeProtocolError("PiPER-X response has an invalid transition")
+        if transition is not None:
+            expected_mode = {
+                "entering_intervention": "policy",
+                "reattaching_policy": "intervention",
+            }[transition]
+            if mode != expected_mode:
+                raise PiperXBridgeProtocolError(
+                    f"PiPER-X transition {transition!r} is inconsistent with mode {mode!r}"
+                )
+            if edge is not None or terminal_request is not None or payload["mirror_accepted"] is not False:
+                raise PiperXBridgeProtocolError(
+                    "PiPER-X transition must freeze mirroring and cannot carry an edge or terminal request"
+                )
+            if follower_actuation_mode not in {"sim_follow", "hold"}:
+                raise PiperXBridgeSafetyError(
+                    "PiPER-X followers must report the blocked prior sim target or measured hold "
+                    "during a hardware transition"
+                )
         if request_type == "heartbeat" and (edge is not None or terminal_request is not None):
             raise PiperXBridgeProtocolError("heartbeat must not consume an operator edge or terminal request")
         expected_generation = (
@@ -417,6 +460,10 @@ class PiperXBridgeClient:
             generation=generation,
             seq=sequence,
             mode=mode,
+            control_topology=control_topology,
+            leader_actuation_mode=leader_actuation_mode,
+            follower_actuation_mode=follower_actuation_mode,
+            transition=transition,
             edge=edge,
             terminal_request=terminal_request,
             left=_parse_arm_sample(leader["left"], label="leader.left"),
@@ -437,11 +484,33 @@ class PiperXBridgeClient:
             )
         if sample.diagnostics["request_ok"] is not True:
             raise PiperXBridgeSafetyError(f"PiPER-X bridge rejected {request_type}: {sample.diagnostics}")
+        for key, expected in (
+            ("control_topology", sample.control_topology),
+            ("leader_actuation_mode", sample.leader_actuation_mode),
+            ("follower_actuation_mode", sample.follower_actuation_mode),
+        ):
+            if sample.health.get(key) != expected:
+                raise PiperXBridgeSafetyError(
+                    f"PiPER-X response {key} disagrees with hardware health: "
+                    f"payload={expected!r}, health={sample.health.get(key)!r}"
+                )
+        if transition is None:
+            expected_leader_actuation = {
+                "policy": "output_follow",
+                "intervention": "native_leader",
+                "fault": "fault",
+            }[mode]
+            if sample.leader_actuation_mode != expected_leader_actuation:
+                raise PiperXBridgeSafetyError(
+                    "PiPER-X leader actuation does not match the acknowledged bridge mode: "
+                    f"mode={mode}, leader_actuation_mode={sample.leader_actuation_mode}"
+                )
         if (
             request_type == "exchange"
             and not sample.mirror_accepted
             and sample.edge is None
             and sample.terminal_request is None
+            and sample.transition is None
         ):
             raise PiperXBridgeSafetyError(f"PiPER-X bridge rejected the simulator mirror target: {sample.diagnostics}")
         return sample

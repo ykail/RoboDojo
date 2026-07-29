@@ -1,5 +1,10 @@
 # RoboDojo PiPER-X bridge protocol v1
 
+> Obsolete for four-arm follower/leader mirroring. In v1 both leaders remain
+> permanently backdrivable. The corrected policy → follower → leader topology
+> is intentionally incompatible and uses `robodojo_piperx_v2`; do not mix v1
+> and v2 processes.
+
 Status: experimental, safety-critical local integration contract.
 
 Protocol identifier: `robodojo_piperx_v1`.

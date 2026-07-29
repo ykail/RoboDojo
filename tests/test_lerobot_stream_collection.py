@@ -194,7 +194,7 @@ class LeRobotStreamWriterTest(unittest.TestCase):
                 "policy_runtime": "robodojo_policy_v1",
                 "policy_provenance": provenance,
                 "control_mode": "piperx_sim_dagger",
-                "piperx_bridge_protocol": "robodojo_piperx_v1",
+                "piperx_bridge_protocol": "robodojo_piperx_v2",
                 "piperx_calibration_name": "coffee.json",
                 "piperx_calibration_sha256": "c" * 64,
             },
@@ -214,7 +214,7 @@ class LeRobotStreamWriterTest(unittest.TestCase):
         self.assertEqual(metadata["robodojo_control_mode"], "piperx_sim_dagger")
         self.assertEqual(
             metadata["robodojo_piperx_bridge_protocol"],
-            "robodojo_piperx_v1",
+            "robodojo_piperx_v2",
         )
         self.assertEqual(metadata["robodojo_piperx_calibration_sha256"], "c" * 64)
 
@@ -653,7 +653,7 @@ class LeRobotStreamRecorderTest(unittest.TestCase):
                 metadata = _task_metadata(task_env)
 
         self.assertEqual(metadata["control_mode"], "piperx_sim_dagger")
-        self.assertEqual(metadata["piperx_bridge_protocol"], "robodojo_piperx_v1")
+        self.assertEqual(metadata["piperx_bridge_protocol"], "robodojo_piperx_v2")
         self.assertEqual(metadata["piperx_calibration_name"], "calibration.json")
         self.assertEqual(len(metadata["piperx_calibration_sha256"]), 64)
 
