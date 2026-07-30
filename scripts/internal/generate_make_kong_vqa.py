@@ -15,6 +15,7 @@ An example command to generate a small set of samples is:
 """
 
 import argparse
+from itertools import combinations
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -379,7 +380,7 @@ def _tile_indices(robot_side_labels: list[str], labels: list[str]) -> list[int]:
     return sorted(label_to_index[label] for label in labels)
 
 
-def _random_fallen_labels(
+def _balanced_fallen_labels(
     target_labels: list[str],
     *,
     layout_id: int,
@@ -391,20 +392,9 @@ def _random_fallen_labels(
     if fallen_count in {0, len(target_labels)}:
         return target_labels[:fallen_count]
 
-    rng_seed = (
-        (ARGS.seed + 1) * 1_000_003
-        + (layout_id + 1) * 10_007
-        + (target_group + 1) * 101
-        + fallen_count * 17
-    )
-    rng = np.random.default_rng(rng_seed)
-    sequential_prefix = set(range(fallen_count))
-    for _ in range(8):
-        selected_indices = sorted(rng.choice(len(target_labels), size=fallen_count, replace=False).tolist())
-        if set(selected_indices) != sequential_prefix:
-            break
-    else:
-        selected_indices = list(range(len(target_labels) - fallen_count, len(target_labels)))
+    index_combinations = list(combinations(range(len(target_labels)), fallen_count))
+    combo_index = (layout_id + target_group + ARGS.seed * len(KONG_GROUPS)) % len(index_combinations)
+    selected_indices = index_combinations[combo_index]
     return [target_labels[index] for index in selected_indices]
 
 
@@ -462,7 +452,7 @@ def _render_state(
     target_labels = _target_labels_left_to_right(env, target_group)
     robot_side_labels = _robot_side_labels_left_to_right(env)
     target_tile_ids = _tile_indices(robot_side_labels, target_labels)
-    fallen_labels = _random_fallen_labels(
+    fallen_labels = _balanced_fallen_labels(
         target_labels,
         layout_id=layout_id,
         target_group=target_group,
@@ -529,7 +519,7 @@ def _render_state(
         "target_labels": target_labels,
         "target_tile_ids": target_tile_ids,
         "fallen_count": fallen_count,
-        "fallen_selection_rule": "deterministic_random_subset" if 0 < fallen_count < len(target_labels) else "boundary_count",
+        "fallen_selection_rule": "balanced_deterministic_cycle" if 0 < fallen_count < len(target_labels) else "boundary_count",
         "fallen_labels": fallen_labels,
         "fallen_tile_ids": already_pushed_tile_ids,
         "already_pushed_tile_ids": already_pushed_tile_ids,
