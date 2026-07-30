@@ -23,6 +23,10 @@ class PolicyV1BridgeStateError(RuntimeError):
     """EvalEnv called the policy bridge out of lifecycle order."""
 
 
+class PolicyV1ProvenanceError(RuntimeError):
+    """The HELLO_ACK policy identity did not match the required deployment."""
+
+
 class _PolicyClientLike(Protocol):
     def connect(self) -> PolicyProvenance: ...
 
@@ -152,10 +156,23 @@ class PolicyV1EvalBridge:
         connect_timeout_s: float = 30.0,
         request_timeout_s: float = 600.0,
         close_timeout_s: float = 10.0,
+        expected_checkpoint_id: str | None = None,
+        expected_checkpoint_digest: str | None = None,
+        expected_code_revision: str | None = None,
+        require_clean: bool = False,
         client_factory: PolicyClientFactory = PolicyClient,
     ) -> None:
         if not callable(client_factory):
             raise TypeError("client_factory must be callable")
+        for value, name in (
+            (expected_checkpoint_id, "expected_checkpoint_id"),
+            (expected_checkpoint_digest, "expected_checkpoint_digest"),
+            (expected_code_revision, "expected_code_revision"),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be None or a non-empty string")
+        if not isinstance(require_clean, bool):
+            raise TypeError("require_clean must be a bool")
         self._builder = ArxX5ObservationBuilder(
             spec=ARX_X5_SIM_PI05_PROFILE.observation_spec,
             expected_env_idx=expected_env_idx,
@@ -173,6 +190,24 @@ class PolicyV1EvalBridge:
         self._closed = False
         try:
             self._provenance = self._client.connect()
+            mismatches = []
+            for expected, actual, label in (
+                (expected_checkpoint_id, self._provenance.checkpoint_id, "checkpoint_id"),
+                (
+                    expected_checkpoint_digest,
+                    self._provenance.checkpoint_digest,
+                    "checkpoint_digest",
+                ),
+                (expected_code_revision, self._provenance.code_revision, "code_revision"),
+            ):
+                if expected is not None and actual != expected:
+                    mismatches.append(f"{label}: expected {expected!r}, got {actual!r}")
+            if require_clean and self._provenance.dirty:
+                mismatches.append("dirty: expected clean Kai0 worktree, got dirty=true")
+            if mismatches:
+                raise PolicyV1ProvenanceError(
+                    "policy HELLO provenance mismatch: " + "; ".join(mismatches)
+                )
         except BaseException:
             self._closed = True
             try:

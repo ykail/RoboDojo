@@ -227,6 +227,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     close_timeout_s=float(
                         self.deploy_cfg.get("policy_close_timeout_s", 10.0),
                     ),
+                    expected_checkpoint_id=self.deploy_cfg.get("expected_policy_checkpoint_id"),
+                    expected_checkpoint_digest=self.deploy_cfg.get(
+                        "expected_policy_checkpoint_digest"
+                    ),
+                    expected_code_revision=self.deploy_cfg.get("expected_policy_code_revision"),
+                    require_clean=bool(self.deploy_cfg.get("require_policy_clean", False)),
                 )
                 self.policy_provenance = self.model_client.provenance.to_payload()
                 resumed_provenance = (

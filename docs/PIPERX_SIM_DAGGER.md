@@ -110,11 +110,72 @@ The command launches the Kai0 server itself, waits for it to become ready, and
 then starts the RoboDojo evaluator. A third policy-server command is neither
 needed nor allowed on the same port.
 
+### External Kai0 on Coffee
+
+Start the strict server on Coffee with the clean Kai0 checkout and official
+checkpoint:
+
+```bash
+cd /home/ykail/vibe_code/RoboDojo/third_party/kai0
+
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=src \
+.venv/bin/python scripts/serve_robodojo_policy.py \
+  --checkpoint-dir /home/ykail/data/RoboDojo_hf/ckpt/RoboDojo/Pi_05/RoboDojo-sim-arx_x5-joint-0/59999 \
+  --checkpoint-id RoboDojo-sim-arx_x5-joint-0/59999 \
+  --host 127.0.0.1 \
+  --port 18080
+```
+
+On Hoo, create a fail-fast loopback tunnel in a separately supervised
+terminal:
+
+```bash
+ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=5 \
+  -o ServerAliveCountMax=2 \
+  -L 127.0.0.1:18080:127.0.0.1:18080 \
+  yikai
+```
+
+Then Terminal B on Hoo uses external mode:
+
+```bash
+cd /home/hoo/RoboDojo-piperx-dagger-v2
+
+OMNI_KIT_ACCEPT_EULA=YES \
+bash scripts/RoboDojo/collect_pi05_piperx_sim_dagger.sh \
+  --task make_toast \
+  --checkpoint-id RoboDojo-sim-arx_x5-joint-0/59999 \
+  --external-policy-server-url ws://127.0.0.1:18080 \
+  --expected-kai0-commit ecc1a7451c3156b1e5f7533851dbb0222896206f \
+  --expected-checkpoint-digest sha256:70bb68139ba717553d9a9d9c3055bb322b85046d729377ee46eaaf997c1eaac4 \
+  --lerobot-python /home/hoo/RoboDojo/third_party/kai0/.venv/bin/python \
+  --piperx-response-timeout 1.0 \
+  --piperx-arm-timeout 60 \
+  --piperx-transition-timeout 10 \
+  --lerobot-root /home/hoo/data/lerobot \
+  --lerobot-repo-id robodojo_piperx_make_toast_official_59999 \
+  --eval-num 10 \
+  --env-gpu 0
+```
+
+External mode never validates or loads a local checkpoint/JAX, and it never
+starts, signals, or kills a local Kai0 process. The launcher first requires the
+loopback tunnel to be reachable, then performs a no-Isaac/no-hardware HELLO
+preflight that checks checkpoint ID, digest, full Kai0 commit, and
+`dirty=false`. The evaluator verifies the same provenance again for its formal
+session before starting an episode or authorizing the hardware bridge. The
+client never reconnects a lost session; a broken tunnel therefore aborts and
+follows the existing four-arm fail-closed path.
+
 ## Operator workflow
 
 1. In policy mode, Pi0.5 moves the ARX X5 simulation. Followers mirror the last
    accepted simulated end poses, then leaders mirror fresh measured follower
-   joints. Do not pull a motor-driven leader.
+   joint deltas around runtime leader/follower anchors. Calibrated absolute
+   zero offsets are preserved. Do not pull a motor-driven leader.
 2. Press `i` once in Terminal A. Both followers take measured hold and both
    leaders remain held while RoboDojo freezes Isaac. Do not move until Terminal
    B prints `[PiPER-X DAgger] manual control ON`. Before printing it, RoboDojo
@@ -126,8 +187,9 @@ needed nor allowed on the same port.
    does Isaac execute and record the ARX action. If either IK/safety check
    fails, both followers and Isaac hold and no expert frame is recorded.
 4. Press `i` again. Both sides hold, the bridge anchors policy mapping at the
-   final manual state, and leaders safely reattach to fresh follower feedback.
-   RoboDojo discards the stale Pi0.5 action chunk and infers again from the
+   final manual state, latches fresh relative leader/follower anchors, and
+   leaders safely reattach without an absolute-coordinate jump. RoboDojo
+   discards the stale Pi0.5 action chunk and infers again from the
    post-correction observation.
 5. When the complete rollout can be judged, label it:
 

@@ -56,6 +56,7 @@ from src.eval_client.policy_runtime.errors import ErrorCode, ProtocolError
 from src.eval_client.policy_runtime.eval_bridge import (
     PolicyV1BridgeStateError,
     PolicyV1EvalBridge,
+    PolicyV1ProvenanceError,
     interrupted_trial_end,
     operator_trial_end,
     run_policy_v1_lifecycle,
@@ -159,6 +160,7 @@ __all__ = [
     "PolicyExecutionProfile",
     "PolicyV1BridgeStateError",
     "PolicyV1EvalBridge",
+    "PolicyV1ProvenanceError",
     "PolicyProvenance",
     "PolicySession",
     "ProtocolError",

@@ -1,3 +1,4 @@
+from dataclasses import replace
 import unittest
 
 import numpy as np
@@ -10,6 +11,7 @@ from src.eval_client.policy_runtime import (
     PolicyTransportError,
     PolicyV1BridgeStateError,
     PolicyV1EvalBridge,
+    PolicyV1ProvenanceError,
     ResetPayload,
     ResetReason,
     TrialEndPayload,
@@ -107,16 +109,17 @@ def _action_chunk():
 
 
 class _FakePolicyClient:
-    def __init__(self, url, **kwargs):
+    def __init__(self, url, *, provenance=None, **kwargs):
         self.url = url
         self.kwargs = kwargs
+        self.provenance = _provenance() if provenance is None else provenance
         self.resets = []
         self.observations = []
         self.outcomes = []
         self.closed = False
 
     def connect(self):
-        return _provenance()
+        return self.provenance
 
     def reset(self, episode_id, payload):
         self.resets.append((episode_id, payload))
@@ -133,11 +136,12 @@ class _FakePolicyClient:
 
 
 class _Factory:
-    def __init__(self):
+    def __init__(self, provenance=None):
         self.client = None
+        self.provenance = provenance
 
     def __call__(self, url, **kwargs):
-        self.client = _FakePolicyClient(url, **kwargs)
+        self.client = _FakePolicyClient(url, provenance=self.provenance, **kwargs)
         return self.client
 
 
@@ -189,6 +193,53 @@ class PolicyV1EvalBridgeTest(unittest.TestCase):
         self.assertEqual(self.client.resets, [("episode-1", _reset())])
         self.assertEqual(self.client.outcomes, [_trial_end()])
         self.assertFalse(self.bridge.episode_active)
+
+    def test_hello_provenance_requirements_fail_closed_before_episode(self):
+        cases = (
+            ({"expected_checkpoint_id": "wrong/59999"}, "checkpoint_id"),
+            ({"expected_checkpoint_digest": "sha256:" + "a" * 64}, "checkpoint_digest"),
+            ({"expected_code_revision": "f" * 40}, "code_revision"),
+        )
+        for requirements, label in cases:
+            factory = _Factory()
+            with self.subTest(label=label), self.assertRaisesRegex(
+                PolicyV1ProvenanceError,
+                label,
+            ):
+                PolicyV1EvalBridge(
+                    "ws://127.0.0.1:18080",
+                    client_factory=factory,
+                    **requirements,
+                )
+            self.assertTrue(factory.client.closed)
+            self.assertEqual(factory.client.resets, [])
+
+    def test_hello_accepts_exact_clean_policy_identity(self):
+        factory = _Factory()
+        bridge = PolicyV1EvalBridge(
+            "ws://127.0.0.1:18080",
+            expected_checkpoint_id="test/5000",
+            expected_checkpoint_digest="sha256:" + "1" * 64,
+            expected_code_revision="2" * 40,
+            require_clean=True,
+            client_factory=factory,
+        )
+        try:
+            self.assertEqual(bridge.provenance, _provenance())
+            self.assertEqual(factory.client.resets, [])
+        finally:
+            bridge.close()
+
+    def test_hello_rejects_dirty_kai0_before_episode(self):
+        factory = _Factory(replace(_provenance(), dirty=True))
+        with self.assertRaisesRegex(PolicyV1ProvenanceError, "dirty=true"):
+            PolicyV1EvalBridge(
+                "ws://127.0.0.1:18080",
+                require_clean=True,
+                client_factory=factory,
+            )
+        self.assertTrue(factory.client.closed)
+        self.assertEqual(factory.client.resets, [])
 
     def test_requires_one_fresh_observation_per_infer(self):
         self.bridge.start_episode("episode-1", _reset())

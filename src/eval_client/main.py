@@ -3,6 +3,7 @@ from datetime import datetime
 import importlib
 import json
 import os
+import re
 import sys
 
 from isaaclab.app import AppLauncher
@@ -62,6 +63,10 @@ parser.add_argument(
 parser.add_argument("--policy_connect_timeout_s", type=float, default=30.0)
 parser.add_argument("--policy_request_timeout_s", type=float, default=600.0)
 parser.add_argument("--policy_close_timeout_s", type=float, default=10.0)
+parser.add_argument("--expected_policy_checkpoint_id", type=str, default="")
+parser.add_argument("--expected_policy_checkpoint_digest", type=str, default="")
+parser.add_argument("--expected_policy_code_revision", type=str, default="")
+parser.add_argument("--require_policy_clean", action="store_true")
 parser.add_argument(
     "--policy_server_url",
     type=str,
@@ -99,6 +104,16 @@ if args_cli.policy_runtime == "robodojo_policy_v1":
     ):
         if getattr(args_cli, timeout_name) <= 0:
             parser.error(f"--{timeout_name} must be positive")
+    if args_cli.expected_policy_checkpoint_digest and re.fullmatch(
+        r"sha256:[0-9a-f]{64}",
+        args_cli.expected_policy_checkpoint_digest,
+    ) is None:
+        parser.error("--expected_policy_checkpoint_digest must be sha256:<64 lowercase hex>")
+    if args_cli.expected_policy_code_revision and re.fullmatch(
+        r"[0-9a-f]{40}",
+        args_cli.expected_policy_code_revision,
+    ) is None:
+        parser.error("--expected_policy_code_revision must be a full lowercase Git commit")
 
 # Safe to import before AppLauncher: env is a namespace package (no __init__)
 # and GLOBAL_CONFIGS only imports os, so this pulls in no app-dependent code.
@@ -392,6 +407,10 @@ def main():
     deploy_cfg["policy_connect_timeout_s"] = args_cli.policy_connect_timeout_s
     deploy_cfg["policy_request_timeout_s"] = args_cli.policy_request_timeout_s
     deploy_cfg["policy_close_timeout_s"] = args_cli.policy_close_timeout_s
+    deploy_cfg["expected_policy_checkpoint_id"] = args_cli.expected_policy_checkpoint_id or None
+    deploy_cfg["expected_policy_checkpoint_digest"] = args_cli.expected_policy_checkpoint_digest or None
+    deploy_cfg["expected_policy_code_revision"] = args_cli.expected_policy_code_revision or None
+    deploy_cfg["require_policy_clean"] = args_cli.require_policy_clean
     deploy_cfg["evaluation_id"] = os.environ["ROBODOJO_RUN_ID"]
     deploy_cfg["trial_id"] = f"{task_name}-{os.environ['ROBODOJO_RUN_ID']}"
     deploy_cfg["action_case_id"] = f"{task_name}_case"

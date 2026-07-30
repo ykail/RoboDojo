@@ -9,22 +9,30 @@ usage() {
 Usage:
   bash scripts/RoboDojo/eval_kai0_pi05.sh \
     --task TASK \
-    --checkpoint-dir PATH \
     --checkpoint-id ID \
+    [--checkpoint-dir PATH | --external-policy-server-url URL] \
     [options]
 
 Required:
   --task TASK                 RoboDojo simulation task name
-  --checkpoint-dir PATH       Kai0 JAX checkpoint step directory
   --checkpoint-id ID          Stable checkpoint identity recorded by policy-v1
 
 Kai0 policy server:
+  --checkpoint-dir PATH       Local-mode Kai0 JAX checkpoint step directory
+  --external-policy-server-url URL
+                              Existing loopback policy-v1 URL, normally an SSH
+                              tunnel such as ws://127.0.0.1:18080
+  --expected-kai0-commit REV  Required full Kai0 commit in external mode
+  --expected-checkpoint-digest DIGEST
+                              Optional sha256:<64 hex> HELLO provenance check
   --kai0-root PATH            Kai0 checkout (default: third_party/kai0)
   --kai0-python PATH          Kai0 Python executable
                               (default: KAI0_ROOT/.venv/bin/python)
   --policy-gpu ID             GPU visible to Kai0 (default: 0)
   --port NUM                  Local policy WebSocket port (default: 8000)
   --policy-seed NUM           Policy episode seed (default: --seed)
+  --lerobot-python PATH       Policy-client/recorder Python; required in
+                              external mode
 
 RoboDojo simulation:
   --eval-num NUM              Number of evaluation episodes (default: 10)
@@ -60,10 +68,9 @@ Other:
   --dry-run                   Validate inputs and print both commands only
   -h, --help                  Show this help
 
-The Kai0 server stays in the Kai0 submodule and uses its own Python
-environment. This launcher does not use an XPolicyLab policy environment.
-XLA_PYTHON_CLIENT_MEM_FRACTION defaults to 0.3 and may be overridden in the
-calling environment.
+Local mode keeps the Kai0 server in the Kai0 checkout. External mode never
+loads a checkpoint/JAX on this machine and never starts or stops a Kai0
+process. Both modes reject a dirty server through HELLO provenance.
 EOF
 }
 
@@ -89,8 +96,12 @@ print_command() {
 task=""
 checkpoint_dir=""
 checkpoint_id=""
+external_policy_server_url=""
+expected_checkpoint_digest=""
+expected_kai0_commit=""
 kai0_root="${ROOT_DIR}/third_party/kai0"
 kai0_python=""
+lerobot_python=""
 eval_num="10"
 port="8000"
 env_gpu="0"
@@ -131,6 +142,21 @@ while [[ $# -gt 0 ]]; do
       checkpoint_id="$2"
       shift 2
       ;;
+    --external-policy-server-url)
+      need_value "$@"
+      external_policy_server_url="$2"
+      shift 2
+      ;;
+    --expected-checkpoint-digest)
+      need_value "$@"
+      expected_checkpoint_digest="$2"
+      shift 2
+      ;;
+    --expected-kai0-commit)
+      need_value "$@"
+      expected_kai0_commit="$2"
+      shift 2
+      ;;
     --kai0-root)
       need_value "$@"
       kai0_root="$2"
@@ -139,6 +165,11 @@ while [[ $# -gt 0 ]]; do
     --kai0-python)
       need_value "$@"
       kai0_python="$2"
+      shift 2
+      ;;
+    --lerobot-python)
+      need_value "$@"
+      lerobot_python="$2"
       shift 2
       ;;
     --eval-num)
@@ -259,8 +290,22 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${task}" ]] || die "--task is required"
-[[ -n "${checkpoint_dir}" ]] || die "--checkpoint-dir is required"
 [[ -n "${checkpoint_id}" ]] || die "--checkpoint-id is required"
+if [[ -z "${external_policy_server_url}" ]]; then
+  [[ -n "${checkpoint_dir}" ]] || die "--checkpoint-dir is required in local policy mode"
+else
+  [[ -z "${checkpoint_dir}" ]] \
+    || die "--checkpoint-dir cannot be combined with --external-policy-server-url"
+  [[ -n "${expected_kai0_commit}" ]] \
+    || die "--expected-kai0-commit is required in external policy mode"
+fi
+if [[ -n "${expected_checkpoint_digest}" \
+  && ! "${expected_checkpoint_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  die "--expected-checkpoint-digest must be sha256:<64 lowercase hex>"
+fi
+if [[ -n "${expected_kai0_commit}" && ! "${expected_kai0_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+  die "--expected-kai0-commit must be a full lowercase Git commit"
+fi
 checkpoint_id_normalized="${checkpoint_id//\\//}"
 if [[ "${checkpoint_id_normalized}" == /* \
   || "${checkpoint_id_normalized}" == "~/"* \
@@ -288,6 +333,18 @@ if [[ -z "${policy_seed}" ]]; then
 fi
 [[ "${policy_seed}" =~ ^[0-9]+$ ]] || die "--policy-seed must be a non-negative integer"
 (( policy_seed <= 4294967295 )) || die "--policy-seed must be in [0, 2^32 - 1]"
+
+external_policy_port=""
+if [[ -n "${external_policy_server_url}" ]]; then
+  if [[ "${external_policy_server_url}" =~ ^ws://(127[.]0[.]0[.]1|localhost):([0-9]+)(/[^[:space:]]*)?$ ]]; then
+    external_policy_port="${BASH_REMATCH[2]}"
+  else
+    die "--external-policy-server-url must be a loopback ws:// URL with an explicit port"
+  fi
+  (( external_policy_port >= 1 && external_policy_port <= 65535 )) \
+    || die "external policy server port must be in [1, 65535]"
+  port="${external_policy_port}"
+fi
 
 case "${control_mode}" in
   policy|keyboard_intervention|keyboard_observe|piperx_sim_dagger) ;;
@@ -322,27 +379,51 @@ if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   done
 fi
 
-if [[ "${kai0_root}" != /* ]]; then
-  kai0_root="${LAUNCH_DIR}/${kai0_root}"
-fi
-[[ -d "${kai0_root}" ]] || die "Kai0 root does not exist: ${kai0_root}"
-kai0_root="$(cd "${kai0_root}" && pwd -P)"
-
-server_script="${kai0_root}/scripts/serve_robodojo_policy.py"
-[[ -f "${server_script}" ]] || die "Kai0 policy server not found: ${server_script}"
-
-if [[ -z "${kai0_python}" ]]; then
-  kai0_python="${kai0_root}/.venv/bin/python"
-elif [[ "${kai0_python}" == */* ]]; then
-  if [[ "${kai0_python}" != /* ]]; then
-    kai0_python="${LAUNCH_DIR}/${kai0_python}"
+server_script=""
+if [[ -z "${external_policy_server_url}" ]]; then
+  if [[ "${kai0_root}" != /* ]]; then
+    kai0_root="${LAUNCH_DIR}/${kai0_root}"
   fi
-else
-  kai0_python="$(command -v "${kai0_python}")" \
-    || die "Kai0 Python is not on PATH: ${kai0_python}"
+  [[ -d "${kai0_root}" ]] || die "Kai0 root does not exist: ${kai0_root}"
+  kai0_root="$(cd "${kai0_root}" && pwd -P)"
+
+  server_script="${kai0_root}/scripts/serve_robodojo_policy.py"
+  [[ -f "${server_script}" ]] || die "Kai0 policy server not found: ${server_script}"
+
+  if [[ -z "${kai0_python}" ]]; then
+    kai0_python="${kai0_root}/.venv/bin/python"
+  elif [[ "${kai0_python}" == */* ]]; then
+    if [[ "${kai0_python}" != /* ]]; then
+      kai0_python="${LAUNCH_DIR}/${kai0_python}"
+    fi
+  else
+    kai0_python="$(command -v "${kai0_python}")" \
+      || die "Kai0 Python is not on PATH: ${kai0_python}"
+  fi
+  [[ -x "${kai0_python}" ]] || die "Kai0 Python is not executable: ${kai0_python}"
+  kai0_python="$(cd "$(dirname "${kai0_python}")" && pwd -P)/$(basename "${kai0_python}")"
 fi
-[[ -x "${kai0_python}" ]] || die "Kai0 Python is not executable: ${kai0_python}"
-kai0_python="$(cd "$(dirname "${kai0_python}")" && pwd -P)/$(basename "${kai0_python}")"
+
+if [[ -n "${external_policy_server_url}" && -z "${lerobot_python}" ]]; then
+  die "--lerobot-python is required in external policy mode"
+fi
+if [[ -z "${lerobot_python}" \
+  && ( "${control_mode}" == "keyboard_intervention" \
+    || "${control_mode}" == "piperx_sim_dagger" ) ]]; then
+  lerobot_python="${kai0_python}"
+fi
+if [[ -n "${lerobot_python}" ]]; then
+  if [[ "${lerobot_python}" == */* ]]; then
+    if [[ "${lerobot_python}" != /* ]]; then
+      lerobot_python="${LAUNCH_DIR}/${lerobot_python}"
+    fi
+  else
+    lerobot_python="$(command -v "${lerobot_python}")" \
+      || die "LeRobot Python is not on PATH: ${lerobot_python}"
+  fi
+  [[ -x "${lerobot_python}" ]] || die "LeRobot Python is not executable: ${lerobot_python}"
+  lerobot_python="$(cd "$(dirname "${lerobot_python}")" && pwd -P)/$(basename "${lerobot_python}")"
+fi
 
 if [[ "${control_mode}" == "keyboard_intervention" \
   || "${control_mode}" == "piperx_sim_dagger" ]]; then
@@ -378,17 +459,19 @@ if [[ "${control_mode}" == "keyboard_intervention" \
       -u CONDA_DEFAULT_ENV \
       CUDA_VISIBLE_DEVICES="" \
       PYTHONNOUSERSITE="1" \
-      "${kai0_python}" -c 'import numpy; import lerobot' >/dev/null; then
-      die "Kai0 environment cannot import numpy/lerobot: ${kai0_python}"
+      "${lerobot_python}" -c 'import numpy; import lerobot' >/dev/null; then
+      die "Recorder environment cannot import numpy/lerobot: ${lerobot_python}"
     fi
   fi
 fi
 
-if [[ "${checkpoint_dir}" != /* ]]; then
-  checkpoint_dir="${LAUNCH_DIR}/${checkpoint_dir}"
+if [[ -z "${external_policy_server_url}" ]]; then
+  if [[ "${checkpoint_dir}" != /* ]]; then
+    checkpoint_dir="${LAUNCH_DIR}/${checkpoint_dir}"
+  fi
+  [[ -d "${checkpoint_dir}" ]] || die "Checkpoint directory does not exist: ${checkpoint_dir}"
+  checkpoint_dir="$(cd "${checkpoint_dir}" && pwd -P)"
 fi
-[[ -d "${checkpoint_dir}" ]] || die "Checkpoint directory does not exist: ${checkpoint_dir}"
-checkpoint_dir="$(cd "${checkpoint_dir}" && pwd -P)"
 
 eval_script="${ROOT_DIR}/scripts/eval_policy.sh"
 [[ -f "${eval_script}" ]] || die "RoboDojo evaluator not found: ${eval_script}"
@@ -399,25 +482,28 @@ ready_timeout_s="${ROBODOJO_POLICY_READY_TIMEOUT_S:-600}"
 
 server_host="127.0.0.1"
 policy_mem_fraction="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.3}"
-policy_url="ws://${server_host}:${port}"
+policy_url="${external_policy_server_url:-ws://${server_host}:${port}}"
 
-server_cmd=(
-  env
-  -u PYTHONHOME
-  -u VIRTUAL_ENV
-  -u CONDA_PREFIX
-  -u CONDA_DEFAULT_ENV
-  "CUDA_VISIBLE_DEVICES=${policy_gpu}"
-  "XLA_PYTHON_CLIENT_MEM_FRACTION=${policy_mem_fraction}"
-  "PYTHONNOUSERSITE=1"
-  "PYTHONPATH=${kai0_root}/src"
-  "${kai0_python}"
-  "${server_script}"
-  --checkpoint-dir "${checkpoint_dir}"
-  --checkpoint-id "${checkpoint_id}"
-  --host "${server_host}"
-  --port "${port}"
-)
+server_cmd=()
+if [[ -z "${external_policy_server_url}" ]]; then
+  server_cmd=(
+    env
+    -u PYTHONHOME
+    -u VIRTUAL_ENV
+    -u CONDA_PREFIX
+    -u CONDA_DEFAULT_ENV
+    "CUDA_VISIBLE_DEVICES=${policy_gpu}"
+    "XLA_PYTHON_CLIENT_MEM_FRACTION=${policy_mem_fraction}"
+    "PYTHONNOUSERSITE=1"
+    "PYTHONPATH=${kai0_root}/src"
+    "${kai0_python}"
+    "${server_script}"
+    --checkpoint-dir "${checkpoint_dir}"
+    --checkpoint-id "${checkpoint_id}"
+    --host "${server_host}"
+    --port "${port}"
+  )
+fi
 
 eval_environment=(
   "EVAL_NUM=${eval_num}"
@@ -432,7 +518,7 @@ if [[ "${control_mode}" == "keyboard_intervention" \
     "ROBODOJO_OPERATOR_DRIVEN=1"
     "ROBODOJO_REALTIME=1"
     "ROBODOJO_HIDE_ISAACLAB_WINDOW=1"
-    "ROBODOJO_LEROBOT_PYTHON=${kai0_python}"
+    "ROBODOJO_LEROBOT_PYTHON=${lerobot_python}"
     "ROBODOJO_LEROBOT_ROOT=${lerobot_root}"
     "ROBODOJO_LEROBOT_REPO_ID=${lerobot_repo_id}"
     "ROBODOJO_LEROBOT_RESUME=${resume}"
@@ -457,6 +543,42 @@ if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   )
 fi
 
+provenance_args=(
+  --expected_policy_checkpoint_id "${checkpoint_id}"
+  --require_policy_clean
+)
+if [[ -n "${expected_checkpoint_digest}" ]]; then
+  provenance_args+=(--expected_policy_checkpoint_digest "${expected_checkpoint_digest}")
+fi
+if [[ -n "${expected_kai0_commit}" ]]; then
+  provenance_args+=(--expected_policy_code_revision "${expected_kai0_commit}")
+fi
+
+preflight_cmd=()
+if [[ -n "${external_policy_server_url}" ]]; then
+  preflight_script="${ROOT_DIR}/scripts/RoboDojo/preflight_policy_v1.py"
+  [[ -f "${preflight_script}" ]] || die "Policy-v1 preflight script not found: ${preflight_script}"
+  preflight_cmd=(
+    env
+    -u PYTHONHOME
+    -u VIRTUAL_ENV
+    -u CONDA_PREFIX
+    -u CONDA_DEFAULT_ENV
+    "CUDA_VISIBLE_DEVICES="
+    "PYTHONNOUSERSITE=1"
+    "PYTHONPATH=${ROOT_DIR}"
+    "${lerobot_python}"
+    "${preflight_script}"
+    --url "${policy_url}"
+    --expected-checkpoint-id "${checkpoint_id}"
+    --expected-code-revision "${expected_kai0_commit}"
+    --require-clean
+  )
+  if [[ -n "${expected_checkpoint_digest}" ]]; then
+    preflight_cmd+=(--expected-checkpoint-digest "${expected_checkpoint_digest}")
+  fi
+fi
+
 eval_cmd=(
   env
   "${eval_environment[@]}"
@@ -475,11 +597,20 @@ eval_cmd=(
   --policy_runtime robodojo_policy_v1
   --policy_seed "${policy_seed}"
   --action_type joint
+  "${provenance_args[@]}"
 )
 
 echo "[eval_kai0_pi05] task=${task} eval_num=${eval_num} control_mode=${control_mode}"
-echo "[eval_kai0_pi05] checkpoint=${checkpoint_dir} checkpoint_id=${checkpoint_id}"
-echo "[eval_kai0_pi05] Kai0=${kai0_root} policy_gpu=${policy_gpu} env_gpu=${env_gpu}"
+if [[ -n "${external_policy_server_url}" ]]; then
+  echo "[eval_kai0_pi05] policy_mode=external checkpoint_id=${checkpoint_id}"
+  echo "[eval_kai0_pi05] expected_kai0_commit=${expected_kai0_commit} clean=required"
+else
+  echo "[eval_kai0_pi05] checkpoint=${checkpoint_dir} checkpoint_id=${checkpoint_id}"
+  echo "[eval_kai0_pi05] Kai0=${kai0_root} policy_gpu=${policy_gpu} env_gpu=${env_gpu}"
+fi
+if [[ -n "${expected_checkpoint_digest}" ]]; then
+  echo "[eval_kai0_pi05] expected_checkpoint_digest=${expected_checkpoint_digest}"
+fi
 echo "[eval_kai0_pi05] policy_url=${policy_url} headless=${headless}"
 if [[ "${control_mode}" == "keyboard_intervention" \
   || "${control_mode}" == "piperx_sim_dagger" ]]; then
@@ -492,8 +623,13 @@ if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
 fi
 
 if [[ "${dry_run}" == "1" ]]; then
-  echo "[dry-run] Kai0 working directory: ${kai0_root}"
-  print_command "Kai0 server" "${server_cmd[@]}"
+  if [[ -z "${external_policy_server_url}" ]]; then
+    echo "[dry-run] Kai0 working directory: ${kai0_root}"
+    print_command "Kai0 server" "${server_cmd[@]}"
+  else
+    echo "[dry-run] external policy server is never started or stopped by this launcher"
+    print_command "Policy HELLO preflight" "${preflight_cmd[@]}"
+  fi
   print_command "RoboDojo evaluator" "${eval_cmd[@]}"
   exit 0
 fi
@@ -516,6 +652,16 @@ server_is_ready() {
   fi
   tcp_is_open
 }
+
+if [[ -n "${external_policy_server_url}" ]]; then
+  if ! tcp_is_open; then
+    die "external policy tunnel is not reachable at ${server_host}:${port}"
+  fi
+  echo "[eval_kai0_pi05] external tunnel is reachable; verifying HELLO before Isaac startup"
+  "${preflight_cmd[@]}"
+  echo "[eval_kai0_pi05] HELLO provenance accepted; starting RoboDojo"
+  exec "${eval_cmd[@]}"
+fi
 
 if tcp_is_open; then
   die "TCP port ${server_host}:${port} is already in use"

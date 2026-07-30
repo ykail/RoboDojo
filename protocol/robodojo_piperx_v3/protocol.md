@@ -29,7 +29,7 @@ The two directions are deliberately asymmetric:
 policy:
   observation -> Kai0 -> ARX action -> Isaac Sim
   accepted ARX end poses -> relative SE(3) -> PiPER-X IK -> followers
-  fresh measured follower joints/grippers -> matching motor-driven leaders
+  fresh measured follower deltas -> runtime-relative matching leader targets
 
 manual:
   one cached bimanual leader joint sample
@@ -152,8 +152,18 @@ SAFE_LISTEN_ONLY
 any unrecoverable failure -> sticky FAULT
 ```
 
-In policy mode each follower tracks the last accepted simulator pose. Each
-leader tracks fresh measured state from its matching follower. Pulling a
+In policy mode each follower tracks the last accepted simulator pose. At every
+native-to-output attachment, the bridge latches fresh leader and follower
+states. Each leader then tracks its matching follower by relative joint and
+gripper displacement:
+
+```text
+q_leader_target = q_leader_anchor
+                + (q_follower_measured - q_follower_anchor)
+```
+
+This preserves runtime zero offsets such as a calibrated J2 difference instead
+of pulling a leader toward absolute follower coordinates. Pulling a
 motor-driven leader in this mode is forbidden.
 
 On the first local `i`, the bridge blocks new policy motion, places followers
@@ -177,9 +187,10 @@ held physical state. `i` is therefore not a substitute for the hard E-stop.
 On the second `i`, the bridge invalidates any unresolved sample and holds both
 followers. RoboDojo again freezes Isaac and sends `transition_ack` with the
 last executed manual state. The bridge anchors the policy mapping at this
-state, safely reattaches both motor-driven leaders to fresh follower feedback,
-increments generation, and returns `edge=exit`. RoboDojo discards the old
-policy chunk and requests new inference from the post-intervention observation.
+state, latches fresh leader/follower policy anchors, safely reattaches both
+motor-driven leaders without an absolute-coordinate jump, increments
+generation, and returns `edge=exit`. RoboDojo discards the old policy chunk and
+requests new inference from the post-intervention observation.
 
 No transition frame steps Isaac or enters the training dataset.
 

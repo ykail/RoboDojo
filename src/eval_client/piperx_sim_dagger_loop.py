@@ -68,9 +68,10 @@ def run_piperx_sim_dagger_episode(
     Policy actions drive the ARX X5 simulation.  Before every action, the
     latest accepted simulator pose is exchanged with the local hardware
     bridge so the two PiPER-X followers mirror it and the leaders follow fresh
-    follower feedback.  A bridge-side ``I`` edge immediately invalidates the
-    current policy chunk.  During the physical mode transition the simulator
-    is frozen and no frame is recorded.  While intervention is active,
+    follower deltas around runtime-relative anchors. A bridge-side ``I`` edge
+    immediately invalidates the current policy chunk. During the physical mode
+    transition the simulator is frozen and no frame is recorded. While
+    intervention is active,
     each synchronized leader sample is first checked by ARX IK, then explicitly
     committed as a calibration-free relative joint delta to the matching
     PiPER-X follower. The simulator executes only after that exact physical
