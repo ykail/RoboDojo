@@ -8,9 +8,11 @@ The source failure state is still deterministic pose injection: it represents
 the already-made policy error.  Recovery is then executed in the simulator.
 cuRobo plans every free-space transfer (home/approach/retreat); deliberate
 tile-contact segments use IK targets, because collision avoidance would make
-the required push/grasp impossible.  Tile pose changes at contact are made
-explicitly and recorded in ``meta/recovery_manifest.json`` so that this does
-not misrepresent synthetic recovery supervision as unassisted grasp physics.
+the required push/grasp impossible.  Route poses are expressed as gripper TCP
+poses and translated to the planner's link6 tool frame immediately before
+planning/IK.  Tile pose changes at contact are made explicitly and recorded in
+``meta/recovery_manifest.json`` so that this does not misrepresent synthetic
+recovery supervision as unassisted grasp physics.
 """
 
 import argparse
@@ -52,6 +54,7 @@ simulation_app = app_launcher.app
 import numpy as np
 from omegaconf import OmegaConf
 import torch
+import transforms3d as t3d
 
 from env.global_configs import BENCHMARK, ENV_CONFIG_PATH, ROOT_DIR
 from env.observation_manager.obs_manager import ObsManager
@@ -208,10 +211,36 @@ def _normalized_gripper(env, robot) -> float:
     return float(np.clip((upper - value) / (upper - lower), 0.0, 1.0))
 
 
+def _gripper_tcp_offset(robot) -> np.ndarray:
+    bias = np.asarray(getattr(robot, "gripper_bias", 0.0), dtype=np.float32)
+    if bias.ndim == 0:
+        return np.asarray([float(bias), 0.0, 0.0], dtype=np.float32)
+    if bias.shape == (3,):
+        return bias.astype(np.float32)
+    raise ValueError(f"{robot.robot_name} gripper_bias must be a scalar or 3-D local offset, got {bias!r}")
+
+
+def _offset_pose_position(pose: np.ndarray, local_offset: np.ndarray) -> np.ndarray:
+    pose = np.asarray(pose, dtype=np.float32)
+    result = pose.copy()
+    result[:3] = pose[:3] + t3d.quaternions.quat2mat(pose[3:7]) @ np.asarray(local_offset, dtype=np.float32)
+    return result.astype(np.float32)
+
+
+def _tcp_pose_from_planner_pose(robot, planner_pose: np.ndarray) -> np.ndarray:
+    return _offset_pose_position(planner_pose, _gripper_tcp_offset(robot))
+
+
+def _planner_pose_from_tcp_pose(robot, tcp_pose: np.ndarray) -> np.ndarray:
+    return _offset_pose_position(tcp_pose, -_gripper_tcp_offset(robot))
+
+
 def _state_vector(env) -> np.ndarray:
     left, right = _target_robots(env)
-    left_pose = _as_numpy(env.robot_manager.get_real_endpose(left, env_idx_list=[0])[0], dtype=np.float32)
-    right_pose = _as_numpy(env.robot_manager.get_real_endpose(right, env_idx_list=[0])[0], dtype=np.float32)
+    left_planner_pose = _as_numpy(env.robot_manager.get_real_endpose(left, env_idx_list=[0])[0], dtype=np.float32)
+    right_planner_pose = _as_numpy(env.robot_manager.get_real_endpose(right, env_idx_list=[0])[0], dtype=np.float32)
+    left_pose = _tcp_pose_from_planner_pose(left, left_planner_pose)
+    right_pose = _tcp_pose_from_planner_pose(right, right_planner_pose)
     return np.concatenate([left_pose, [_normalized_gripper(env, left)], right_pose, [_normalized_gripper(env, right)]]).astype(
         np.float32
     )
@@ -252,6 +281,13 @@ def _set_label_pose(env, label: str, position: np.ndarray, orientation: np.ndarr
     obj.set_local_pose(translation=np.asarray(position, dtype=np.float32), orientation=np.asarray(orientation, dtype=np.float32))
 
 
+def _set_label_pose_callback(env, label: str, position: np.ndarray, orientation: np.ndarray) -> Callable[[], None]:
+    def callback() -> None:
+        _set_label_pose(env, label, position, orientation)
+
+    return callback
+
+
 def _tile_labels() -> tuple[str, ...]:
     return tuple([f"mahjong{group}_{index}" for group in range(4) for index in range(3)] + [f"mahjong{group}_0" for group in range(5, 9)])
 
@@ -265,10 +301,21 @@ def _restore_tile_poses(env, poses: dict[str, tuple[np.ndarray, np.ndarray]]) ->
         _set_label_pose(env, label, position, orientation)
 
 
+def _settle_pose_injection_before_recording(env, *, frames: int = 3) -> None:
+    for _ in range(_sim_steps_per_frame(env) * frames):
+        env.sim_step(render=False)
+    for _ in range(frames):
+        env.render()
+    env.obs_manager.reset()
+
+
 def _apply_failure_state(env, scenario: RecoveryScenario) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict[str, np.ndarray]]:
-    labels = [f"mahjong{scenario.target_group}_{index}" for index in range(3)] if scenario.failure_kind == "partial_correct_stop" else list(scenario.pushed_correct_labels)
-    if scenario.wrong_label is not None:
-        labels.append(scenario.wrong_label)
+    labels = (
+        [f"mahjong{scenario.target_group}_{index}" for index in range(3)]
+        if scenario.failure_kind == "partial_correct_stop"
+        else list(scenario.pushed_correct_labels)
+    )
+    labels.extend(scenario.wrong_labels)
     labels.append(scenario.discard_label)
     original: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     positions: dict[str, np.ndarray] = {}
@@ -281,11 +328,10 @@ def _apply_failure_state(env, scenario: RecoveryScenario) -> tuple[dict[str, tup
     for label in scenario.pushed_correct_labels:
         position, _ = original[label]
         _set_label_pose(env, label, position, PUSHED_TILE_QUATERNION)
-    if scenario.wrong_label is not None:
-        position, _ = original[scenario.wrong_label]
-        _set_label_pose(env, scenario.wrong_label, position, PUSHED_TILE_QUATERNION)
-    for _ in range(8):
-        env.sim_step(render=False)
+    for label in scenario.wrong_labels:
+        position, _ = original[label]
+        _set_label_pose(env, label, position, PUSHED_TILE_QUATERNION)
+    _settle_pose_injection_before_recording(env)
     return original, positions
 
 
@@ -379,9 +425,10 @@ def _execute_plan(env, episode: LeRobotEpisode, phase: MotionPhase) -> None:
     if planner is None:
         raise PlanningError(f"No cuRobo planner is configured for {robot.robot_name}.")
     current_joint = env.robot_manager.get_joint(robot, env_idx_list=[0])[0]
+    planner_target_pose = _planner_pose_from_tcp_pose(robot, phase.target_pose)
     result = planner.plan_path(
         curr_joint_pos=current_joint,
-        target_ee_pose=phase.target_pose.tolist(),
+        target_ee_pose=planner_target_pose.tolist(),
         real_robot_pose=robot.entity_origin_pose,
     )
     if result.get("status") != "Success" or result.get("position") is None:
@@ -397,7 +444,8 @@ def _execute_ik(env, episode: LeRobotEpisode, phase: MotionPhase) -> None:
     if phase.arm is None or phase.target_pose is None:
         raise ValueError(f"IK phase {phase.name} needs an arm and target pose.")
     robot = _target_robots(env)[0] if phase.arm == "left" else _target_robots(env)[1]
-    result = env.robot_manager.solve_ik(target_pose=phase.target_pose.tolist(), env_idx=0, robot=robot)
+    planner_target_pose = _planner_pose_from_tcp_pose(robot, phase.target_pose)
+    result = env.robot_manager.solve_ik(target_pose=planner_target_pose.tolist(), env_idx=0, robot=robot)
     if result.get("status") != "Success":
         raise PlanningError(f"IK failed {phase.name} for {phase.arm}: {result.get('status')}")
     for _ in range(phase.frames):
@@ -451,12 +499,14 @@ def _push_route(env, scenario: RecoveryScenario, positions: dict[str, np.ndarray
         phases.extend(
             [
                 MotionPhase(f"plan_approach_{label}", "plan", arm, approach, 1.0, 0, task),
-                MotionPhase(f"ik_contact_{label}", "ik", arm, contact, 1.0, 8, task),
+                MotionPhase(f"close_before_push_{label}", "hold", arm, None, 0.0, 8, task),
+                MotionPhase(f"ik_contact_{label}", "ik", arm, contact, 0.0, 8, task),
                 MotionPhase(
-                    f"ik_push_{label}", "ik", arm, sweep, 1.0, 10, task,
-                    on_complete=lambda label=label, position=position: _set_label_pose(env, label, position, PUSHED_TILE_QUATERNION),
+                    f"ik_push_{label}", "ik", arm, sweep, 0.0, 10, task,
+                    on_complete=_set_label_pose_callback(env, label, position, PUSHED_TILE_QUATERNION),
                 ),
-                MotionPhase(f"plan_retreat_{label}", "plan", arm, retreat, 1.0, 0, task),
+                MotionPhase(f"plan_retreat_{label}", "plan", arm, retreat, 0.0, 0, task),
+                MotionPhase(f"release_after_push_{label}", "hold", arm, None, 1.0, 6, task),
             ]
         )
     left_home, right_home = home[:7], home[8:15]
@@ -473,33 +523,47 @@ def _push_route(env, scenario: RecoveryScenario, positions: dict[str, np.ndarray
 def _upright_route(
     env, scenario: RecoveryScenario, positions: dict[str, np.ndarray], original: dict[str, tuple[np.ndarray, np.ndarray]], home: np.ndarray
 ) -> list[MotionPhase]:
-    if scenario.wrong_label is None:
-        raise ValueError("wrong-tile route needs scenario.wrong_label")
+    if not scenario.wrong_labels:
+        raise ValueError("wrong-tile route needs at least one scenario.wrong_labels entry")
     task = scenario.prompt
-    label = scenario.wrong_label
-    position = positions[label]
-    arm = _active_arm(position)
-    orientation = home[3:7] if arm == "left" else home[11:15]
-    approach = _pose(position, (0.0, -0.080, 0.145), orientation)
-    grasp = _pose(position, (0.0, -0.020, 0.052), orientation)
-    lift = _pose(position, (0.0, -0.020, 0.165), orientation)
-    retreat = _pose(position, (0.0, -0.085, 0.160), orientation)
-    original_position, original_orientation = original[label]
+    phases: list[MotionPhase] = []
+    for label in scenario.wrong_labels:
+        position = positions[label]
+        arm = _active_arm(position)
+        orientation = home[3:7] if arm == "left" else home[11:15]
+        approach = _pose(position, (0.0, -0.080, 0.145), orientation)
+        grasp = _pose(position, (0.0, -0.020, 0.052), orientation)
+        lift = _pose(position, (0.0, -0.020, 0.165), orientation)
+        retreat = _pose(position, (0.0, -0.085, 0.160), orientation)
+        original_position, original_orientation = original[label]
+        phases.extend(
+            [
+                MotionPhase(f"plan_approach_{label}", "plan", arm, approach, 1.0, 0, task),
+                MotionPhase(f"ik_grasp_{label}", "ik", arm, grasp, 1.0, 10, task),
+                MotionPhase(
+                    f"close_and_upright_{label}",
+                    "hold",
+                    arm,
+                    None,
+                    0.0,
+                    8,
+                    task,
+                    on_complete=_set_label_pose_callback(env, label, original_position, original_orientation),
+                ),
+                MotionPhase(f"ik_lift_{label}", "ik", arm, lift, 0.0, 10, task),
+                MotionPhase(f"plan_retreat_{label}", "plan", arm, retreat, 0.0, 0, task),
+                MotionPhase(f"release_{label}", "hold", arm, None, 1.0, 6, task),
+            ]
+        )
     left_home, right_home = home[:7], home[8:15]
-    return [
-        MotionPhase(f"plan_approach_{label}", "plan", arm, approach, 1.0, 0, task),
-        MotionPhase(f"ik_grasp_{label}", "ik", arm, grasp, 1.0, 10, task),
-        MotionPhase(
-            f"close_and_upright_{label}", "hold", arm, None, 0.0, 8, task,
-            on_complete=lambda: _set_label_pose(env, label, original_position, original_orientation),
-        ),
-        MotionPhase(f"ik_lift_{label}", "ik", arm, lift, 0.0, 10, task),
-        MotionPhase(f"plan_retreat_{label}", "plan", arm, retreat, 0.0, 0, task),
-        MotionPhase(f"release_{label}", "hold", arm, None, 1.0, 6, task),
-        MotionPhase("plan_left_home", "plan", "left", left_home, 1.0, 0, SOP_TASK),
-        MotionPhase("plan_right_home", "plan", "right", right_home, 1.0, 0, SOP_TASK),
-        MotionPhase("sop_hold", "hold", None, None, None, 5, SOP_TASK),
-    ]
+    phases.extend(
+        [
+            MotionPhase("plan_left_home", "plan", "left", left_home, 1.0, 0, SOP_TASK),
+            MotionPhase("plan_right_home", "plan", "right", right_home, 1.0, 0, SOP_TASK),
+            MotionPhase("sop_hold", "hold", None, None, None, 5, SOP_TASK),
+        ]
+    )
+    return phases
 
 
 def _collect_one_episode(
@@ -511,7 +575,7 @@ def _collect_one_episode(
         "seed": seed,
         "layout_id": layout_id,
         "scenario": scenario.to_dict(),
-        "recovery_execution": "curobo_planned_free_space + IK_contact + explicit_tile_pose_at_contact",
+        "recovery_execution": "TCP_targets_to_link6 + curobo_planned_free_space + IK_contact + explicit_tile_pose_at_contact",
     }
     episode = writer.start_episode(episode_index, source=source)
     try:

@@ -7,6 +7,7 @@ text labels or scenario enumeration.
 """
 
 from dataclasses import asdict, dataclass
+from itertools import combinations
 from typing import Iterable
 
 import numpy as np
@@ -19,7 +20,7 @@ DEFAULT_TAIL_STEPS = 4
 CANONICAL_PROMPTS = {
     "sop.default": "[SOP]",
     "recovery.push_remaining_matching_tiles": "[Recovery] Push down the remaining matching mahjong tiles.",
-    "recovery.upright_wrong_tile": "[Recovery] Upright the incorrectly pushed mahjong tile.",
+    "recovery.upright_wrong_tile": "[Recovery] Upright the incorrectly pushed mahjong tile(s).",
 }
 
 KONG_GROUPS = (
@@ -49,7 +50,7 @@ class RecoveryScenario:
     target_group: int
     pushed_correct_count: int
     pushed_correct_labels: tuple[str, ...]
-    wrong_label: str | None
+    wrong_labels: tuple[str, ...]
     subtask_id: str
 
     @property
@@ -60,30 +61,62 @@ class RecoveryScenario:
     def discard_label(self) -> str:
         return DISCARD_LABELS[self.target_group]
 
+    @property
+    def wrong_label(self) -> str | None:
+        return self.wrong_labels[0] if self.wrong_labels else None
+
     def to_dict(self) -> dict:
         data = asdict(self)
+        data["wrong_label"] = self.wrong_label
         data["prompt"] = self.prompt
         data["discard_label"] = self.discard_label
         return data
 
 
-def wrong_candidates(target_group: int) -> tuple[str, ...]:
-    """All nine front-row tiles that are wrong for ``target_group``."""
+def adjacent_wrong_candidates(target_group: int) -> tuple[str, ...]:
+    """Wrong front-row tiles from the immediate neighboring group(s)."""
 
-    return tuple(label for idx, group in enumerate(KONG_GROUPS) if idx != target_group for label in group)
+    neighbor_groups = [idx for idx in (target_group - 1, target_group + 1) if 0 <= idx < len(KONG_GROUPS)]
+    return tuple(label for idx in neighbor_groups for label in KONG_GROUPS[idx])
+
+
+def wrong_candidates(target_group: int) -> tuple[str, ...]:
+    """Backward-compatible alias for the now-scoped adjacent wrong tiles."""
+
+    return adjacent_wrong_candidates(target_group)
 
 
 def enumerate_recovery_scenarios() -> list[RecoveryScenario]:
-    """Cover the requested 116 failure states for one layout.
+    """Cover the scoped make_kong recovery states for one layout.
 
-    * 8 early-stop states: 4 matching triples × {one, two} already pushed.
-    * 108 wrong-tile states: 4 targets × 9 possible wrong tiles × {one, two,
-      three} correct tiles already pushed.
-
-    Correct tiles always use their physical left-to-right order.  This models
-    a policy that stopped after a prefix of its sequential pushing behavior,
-    without introducing artificial permutations of the same error.
+    Each state starts after the policy error has already happened: one, two,
+    or three correct matching tiles are pushed down, and one or two immediately
+    neighboring wrong tiles are also pushed down.  Recovery only uprights those
+    wrong neighboring tiles.
     """
+
+    scenarios: list[RecoveryScenario] = []
+    for target_group, group in enumerate(KONG_GROUPS):
+        for count in (1, 2, 3):
+            for wrong_count in (1, 2):
+                for wrong_labels in combinations(adjacent_wrong_candidates(target_group), wrong_count):
+                    wrong_id = "__".join(wrong_labels)
+                    scenarios.append(
+                        RecoveryScenario(
+                            scenario_id=f"adjacent_wrong_g{target_group}_{wrong_id}_c{count}",
+                            failure_kind="adjacent_wrong_tiles_pushed",
+                            target_group=target_group,
+                            pushed_correct_count=count,
+                            pushed_correct_labels=group[:count],
+                            wrong_labels=tuple(wrong_labels),
+                            subtask_id="recovery.upright_wrong_tile",
+                        )
+                    )
+    return scenarios
+
+
+def enumerate_legacy_recovery_scenarios() -> list[RecoveryScenario]:
+    """Return the older broad coverage, kept for offline compatibility."""
 
     scenarios: list[RecoveryScenario] = []
     for target_group, group in enumerate(KONG_GROUPS):
@@ -95,11 +128,11 @@ def enumerate_recovery_scenarios() -> list[RecoveryScenario]:
                     target_group=target_group,
                     pushed_correct_count=count,
                     pushed_correct_labels=group[:count],
-                    wrong_label=None,
+                    wrong_labels=(),
                     subtask_id="recovery.push_remaining_matching_tiles",
                 )
             )
-        for wrong_label in wrong_candidates(target_group):
+        for wrong_label in tuple(label for idx, wrong_group in enumerate(KONG_GROUPS) if idx != target_group for label in wrong_group):
             for count in (1, 2, 3):
                 scenarios.append(
                     RecoveryScenario(
@@ -108,7 +141,7 @@ def enumerate_recovery_scenarios() -> list[RecoveryScenario]:
                         target_group=target_group,
                         pushed_correct_count=count,
                         pushed_correct_labels=group[:count],
-                        wrong_label=wrong_label,
+                        wrong_labels=(wrong_label,),
                         subtask_id="recovery.upright_wrong_tile",
                     )
                 )
