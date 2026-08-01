@@ -11,6 +11,7 @@ scene snapshots per layout):
     python scripts/internal/generate_fill_pen_holder_vqa.py \
         --headless --enable_cameras --seed 0 --max-layouts 5 \
         --scene-count 30 --scenario layout gripper_content visible_counts \
+        --gripper-position-jitter 0.10 --gripper-height-jitter 0.05 \
         --output-dir ./output/RoboDojo_vqa_v1/fill_pen_holder_seed0
 
 The output directory must be new. To deliberately replace an existing batch,
@@ -58,8 +59,15 @@ SCENARIOS = ("layout", "gripper_content", "visible_counts")
 X5_FINGER_ZERO_GAP = 0.0008
 GRIPPER_CLEARANCE = 0.003
 HOLDER_GRASP_HEIGHT = 0.085
+DEFAULT_GRIPPER_POSITION_JITTER_M = 0.10
+DEFAULT_GRIPPER_HEIGHT_JITTER_M = 0.05
+RENDER_STABILIZATION_FRAMES = 4
 HOLDER_VISIBILITY = VisibilityThresholds(64, 1, 0.05, 0.5)
 PEN_VISIBILITY = VisibilityThresholds(12, 6, 0.03, 0.5)
+# Count questions require an instance to be readily distinguishable, not just
+# represented by a small visible fragment. Keep this stricter than the nib and
+# gripper-object thresholds because the answer is an integer a human must count.
+COUNT_PEN_VISIBILITY = VisibilityThresholds(48, 12, 0.03, 0.5)
 NIB_PATCH_RADIUS_PX = 3
 NIB_MIN_MATCHING_PIXELS = 3
 NIB_DEPTH_TOLERANCE_M = 0.01
@@ -68,6 +76,19 @@ LOGGER = logging.getLogger("fill_pen_holder_vqa")
 
 class AnnotationMappingError(RuntimeError):
     """The renderer could not prove a one-to-one object/mask association."""
+
+
+def _configure_logging() -> None:
+    """Emit collector progress without enabling verbose dependency loggers."""
+
+    if not LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+        LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    for dependency in ("curobo", "matplotlib", "PIL"):
+        logging.getLogger(dependency).setLevel(logging.WARNING)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -104,6 +125,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--camera-jitter", type=float, default=0.0, help="Uniform head-camera position jitter in metres; default 0."
+    )
+    parser.add_argument(
+        "--gripper-position-jitter",
+        type=float,
+        default=DEFAULT_GRIPPER_POSITION_JITTER_M,
+        help="Maximum independent XY TCP perturbation for gripper_content snapshots, in metres.",
+    )
+    parser.add_argument(
+        "--gripper-height-jitter",
+        type=float,
+        default=DEFAULT_GRIPPER_HEIGHT_JITTER_M,
+        help="Maximum independent Z TCP perturbation for gripper_content snapshots, in metres.",
     )
     parser.add_argument("--sim-gpu-id", type=int, default=0, help="GPU index used in the RoboDojo sim config.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing VQA sidecar output directory.")
@@ -191,6 +224,13 @@ def _load_config(args: argparse.Namespace):
     sim["scene"]["num_envs"] = 1
     sim["seed"] = [args.seed]
     sim["device"] = f"cuda:{args.sim_gpu_id}"
+    # Keep DLAA for high-quality training images. Fresh renders after every
+    # direct pose teleport let its temporal history converge before capture.
+    sim["render"] = {
+        "rendering_mode": "quality",
+        "antialiasing_mode": "DLAA",
+        "samples_per_pixel": 1024,
+    }
     scene = load_yaml(Path(ENV_CONFIG_PATH) / "scene" / "default.yml")
     robot = load_yaml(Path(ENV_CONFIG_PATH) / "robot" / "dual_x5.yml")
     camera_source = load_yaml(Path(ENV_CONFIG_PATH) / "camera" / "camera_config.yml")
@@ -364,7 +404,33 @@ def _pen_gripper_joint(layout: dict[str, Any], label: str, robot) -> float:
     return _x5_gripper_joint_for_width(robot, float(np.max(extents[:2])))
 
 
-def _stage_robot_objects(env, layout: dict[str, Any], scenario: str, index: int, rng: random.Random) -> dict[str, Any]:
+def _sample_gripper_tcp(
+    side: str,
+    rng: random.Random,
+    position_jitter: float,
+    height_jitter: float,
+) -> tuple[tuple[float, float], float]:
+    """Sample a deterministic, camera-visible TCP target for one X5 arm."""
+
+    base_xy = (-0.10, -0.12) if side == "left" else (0.10, -0.12)
+    return (
+        (
+            base_xy[0] + rng.uniform(-position_jitter, position_jitter),
+            base_xy[1] + rng.uniform(-position_jitter, position_jitter),
+        ),
+        0.95 + rng.uniform(-height_jitter, height_jitter),
+    )
+
+
+def _stage_robot_objects(
+    env,
+    layout: dict[str, Any],
+    scenario: str,
+    index: int,
+    rng: random.Random,
+    gripper_position_jitter: float,
+    gripper_height_jitter: float,
+) -> dict[str, Any]:
     robots = {robot.arm_name.split("_")[0]: robot for robot in env.robot_manager.robot_list if robot.type == "target"}
     if set(robots) != {"left", "right"}:
         raise RuntimeError(f"expected left/right target robots, got {sorted(robots)}")
@@ -396,21 +462,24 @@ def _stage_robot_objects(env, layout: dict[str, Any], scenario: str, index: int,
     else:
         return {}
 
-    # The target TCPs are in front of each robot and remain inside the fixed
-    # head-camera crop.  Use a fixed side-grasp frame, rather than retaining
-    # the reset pose orientation, so local +X is the finger direction and
-    # local Y is the finger-closing axis for every generated frame.
+    # The target TCPs remain inside the fixed head-camera crop. For
+    # gripper_content, both arms receive independent deterministic perturbations
+    # (including an empty gripper), so VQA does not learn a fixed arm pose.
+    sampled_tcp: dict[str, tuple[tuple[float, float], float]] = {}
     for side, value in hand_values.items():
-        if value == "nothing":
+        if value == "nothing" and scenario != "gripper_content":
             continue
         robot = robots[side]
-        tcp_xy = (-0.10, -0.12) if side == "left" else (0.10, -0.12)
-        target_pose = _horizontal_side_grasp_pose(robot, tcp_xy, tcp_z=0.95)
-        gripper_joint = (
-            _holder_gripper_joint(layout, robot)
-            if value == "pen_holder"
-            else _pen_gripper_joint(layout, "target0", robot)
-        )
+        position_jitter = gripper_position_jitter if scenario == "gripper_content" else 0.0
+        height_jitter = gripper_height_jitter if scenario == "gripper_content" else 0.0
+        tcp_xy, tcp_z = _sample_gripper_tcp(side, rng, position_jitter, height_jitter)
+        sampled_tcp[side] = (tcp_xy, tcp_z)
+        target_pose = _horizontal_side_grasp_pose(robot, tcp_xy, tcp_z=tcp_z)
+        gripper_joint = {
+            "nothing": float(robot.gripper_scale[1]),
+            "pen": _pen_gripper_joint(layout, "target0", robot),
+            "pen_holder": _holder_gripper_joint(layout, robot),
+        }[value]
         _set_robot_pose(env, robot, target_pose, gripper_joint=gripper_joint)
 
     # Forward kinematics/body-link buffers are refreshed by a physics step.
@@ -436,6 +505,10 @@ def _stage_robot_objects(env, layout: dict[str, Any], scenario: str, index: int,
         return {
             "left_hand": hand_values["left"],
             "right_hand": hand_values["right"],
+            "gripper_tcp_positions": {
+                side: [float(tcp_xy[0]), float(tcp_xy[1]), float(tcp_z)]
+                for side, (tcp_xy, tcp_z) in sampled_tcp.items()
+            },
         }
 
     holder_hand = "left" if hand_values["left"] == "pen_holder" else "right"
@@ -921,7 +994,12 @@ def _add_case_records(
                 "occlusion_ratio": occlusion if held != "nothing" else None,
                 "gt_source": "dedicated_stable_grasp_generator",
                 "audit_metadata_json": json_dumps(
-                    {"gripper_side": side, "grasp_class": answer_text[held], "stable_grasp_frames": 3}
+                    {
+                        "gripper_side": side,
+                        "grasp_class": answer_text[held],
+                        "stable_grasp_frames": 3,
+                        "tcp_position": scene_state["gripper_tcp_positions"][side],
+                    }
                 ),
             }
             writer.add(record)
@@ -946,8 +1024,8 @@ def _add_case_records(
         )
         counted = []
         for label in qualifying:
-            status, _, _ = classify_mask_visibility(masks[label], PEN_VISIBILITY)
-            if status in {"visible", "partially_visible"}:
+            status, _, _ = classify_mask_visibility(masks[label], COUNT_PEN_VISIBILITY)
+            if status == "visible":
                 counted.append(label)
         record = candidate(family, "table_count" if relation == "ON_TABLE" else "holder_count") | {
             "prompt_text": prompt,
@@ -991,9 +1069,13 @@ def _manifest(
         "visibility_thresholds": {
             "holder": HOLDER_VISIBILITY.__dict__,
             "pen": PEN_VISIBILITY.__dict__,
+            "count_pen": COUNT_PEN_VISIBILITY.__dict__,
             "nib_patch_radius_px": NIB_PATCH_RADIUS_PX,
             "nib_depth_tolerance_m": NIB_DEPTH_TOLERANCE_M,
         },
+        "gripper_position_jitter_m": args.gripper_position_jitter,
+        "gripper_height_jitter_m": args.gripper_height_jitter,
+        "render": {"antialiasing_mode": "DLAA", "stabilization_frames": RENDER_STABILIZATION_FRAMES},
         "command": " ".join(sys.argv),
         "run_status": "failed" if failure is not None else "completed",
     }
@@ -1007,10 +1089,14 @@ def main() -> None:
     args = _parse_args()
     if args.scene_count <= 0 or args.start_index < 0:
         raise ValueError("--scene-count must be positive and --start-index must be non-negative")
+    # if not 0.0 <= args.gripper_position_jitter <= 0.08:
+    #     raise ValueError("--gripper-position-jitter must be within [0.0, 0.08] metres")
+    # if not 0.0 <= args.gripper_height_jitter <= 0.05:
+    #     raise ValueError("--gripper-height-jitter must be within [0.0, 0.05] metres")
     writer = SidecarWriter(args.output_dir, overwrite=args.overwrite)
     image_dir = writer.prepare_images_dir()
     audit_dir = writer.prepare_audit_dir()
-    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+    _configure_logging()
     simulation_app = None
     selected_layouts: list[tuple[int, Path, dict[str, Any]]] = []
     failure: BaseException | None = None
@@ -1053,12 +1139,37 @@ def main() -> None:
                     _apply_camera_jitter(env, args.camera_jitter, rng, base_pose=base_camera_pose)
                     if scenario == "layout":
                         _restore_layout_holder_pose(env, layout)
-                    scene_state = _stage_robot_objects(env, layout, scenario, scenario_index, rng)
+                    try:
+                        scene_state = _stage_robot_objects(
+                            env,
+                            layout,
+                            scenario,
+                            scenario_index,
+                            rng,
+                            args.gripper_position_jitter,
+                            args.gripper_height_jitter,
+                        )
+                    except RuntimeError as error:
+                        writer.reject(
+                            base_record(
+                                sample_id=(
+                                    f"fill_pen_holder_seed{args.seed}_layout{layout_index:03d}_{scenario}_{index:06d}"
+                                ),
+                                task_name="fill_pen_holder",
+                                question_family="scene_staging",
+                                source_layout=str(source_path),
+                            ),
+                            f"scene_staging: {error}",
+                        )
+                        LOGGER.warning("rejected layout=%s sample=%s during staging: %s", layout_index, index, error)
+                        continue
                     # Apply labels after every object/robot placement so a
                     # scene reload or asset-level semantic relationship cannot
                     # silently replace the VQA object identities.
                     semantic_labels, semantic_prim_paths = _label_scene_instances(env)
-                    for _ in range(3):
+                    # Let DLAA converge after teleports before sampling camera
+                    # buffers.
+                    for _ in range(RENDER_STABILIZATION_FRAMES):
                         env.render()
                     try:
                         LOGGER.info("capturing layout=%s sample=%s scenario=%s", layout_index, index, scenario)
