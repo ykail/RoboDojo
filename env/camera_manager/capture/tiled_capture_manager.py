@@ -93,6 +93,13 @@ class TiledCaptureManager:
             else:
                 capture_config = annotator_config.get("common", None)  # check if there is common annotator config
 
+            # RobotManager may add mounted cameras after the task camera
+            # config is assembled.  A collector that intentionally captures
+            # only a subset of cameras must be able to leave those cameras
+            # without an annotator entry.
+            if capture_config is None:
+                capture_config = {"enabled": False}
+
             if capture_config.get("enabled", False):
                 annotators = deepcopy(capture_config)
                 annotators.pop("enabled")
