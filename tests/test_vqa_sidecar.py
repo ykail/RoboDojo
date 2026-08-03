@@ -84,6 +84,18 @@ class VqaSidecarTests(unittest.TestCase):
         fraction = np.clip(np.dot(protected - start, direction) / np.dot(direction, direction), 0.0, 1.0)
         self.assertGreater(float(np.linalg.norm(protected - (start + fraction * direction))), clearance)
 
+    def test_overlay_keeps_badge_and_leader_line_off_object_mask(self) -> None:
+        image = np.zeros((120, 120, 3), dtype=np.uint8)
+        tile_mask = np.zeros((120, 120), dtype=bool)
+        tile_mask[50:75, 45:75] = True
+        result = numbered_overlay(
+            image,
+            {"1": (60, 62)},
+            object_masks_by_mark={"1": tile_mask},
+        )
+        self.assertEqual(set(result.mark_boxes_xyxy), {"1"})
+        self.assertFalse(np.any(result.image[tile_mask] != image[tile_mask]))
+
     def test_writer_keeps_invalid_rows_in_rejected_parquet(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             writer = SidecarWriter(Path(directory) / "sidecar")

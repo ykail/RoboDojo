@@ -603,13 +603,24 @@ def _label_matches(value: Any, semantic_label: str) -> bool:
         return any(_label_matches(item, semantic_label) for item in value.values())
     if isinstance(value, (list, tuple, set)):
         return any(_label_matches(item, semantic_label) for item in value)
-    return semantic_label in str(value)
+    text = str(value)
+    return text == semantic_label or (not text.startswith("/") and semantic_label in text)
+
+
+def _prim_path_matches(value: Any, prim_path: str) -> bool:
+    """Match an instance identity path exactly, never by a shared prefix."""
+
+    if isinstance(value, dict):
+        return any(_prim_path_matches(item, prim_path) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_prim_path_matches(item, prim_path) for item in value)
+    return str(value) == prim_path
 
 
 def _renderer_identity_matches(value: Any, semantic_label: str, prim_path: str) -> bool:
     """Match either a renderer semantic label or its unique object prim path."""
 
-    return _label_matches(value, semantic_label) or _label_matches(value, prim_path)
+    return _label_matches(value, semantic_label) or _prim_path_matches(value, prim_path)
 
 
 def _mask_for_semantic(instance: np.ndarray, info: dict[str, Any], semantic_label: str, prim_path: str) -> np.ndarray:
@@ -725,7 +736,9 @@ def _mask_anchor(mask: np.ndarray) -> tuple[int, int]:
     ys, xs = np.nonzero(mask)
     if len(xs) == 0:
         raise AnnotationMappingError("cannot anchor an empty instance mask")
-    return int(round(float(xs.mean()))), int(round(float(ys.mean())))
+    center_x, center_y = float(xs.mean()), float(ys.mean())
+    nearest = int(np.argmin((xs - center_x) ** 2 + (ys - center_y) ** 2))
+    return int(xs[nearest]), int(ys[nearest])
 
 
 def _project_world_point(env, point_world: np.ndarray, cam_id: int = 0) -> tuple[float, float, float] | None:

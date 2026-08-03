@@ -2,9 +2,9 @@
 
 For each selected layout and target group, the collector holds robots at home,
 enumerates the eight matching-tile fallen bitmasks, and writes only numbered
-``cam_head`` images with physical Parquet annotations.  The two outputs
-are fixed-answer boolean VQA families; no custom variable-length answer string
-or wrist image is generated.
+``cam_head`` images with physical Parquet annotations. Each scene asks whether
+the leftmost or rightmost matching tile still needs to be knocked down; no
+custom variable-length answer string or wrist image is generated.
 
 Example:
     python scripts/internal/generate_make_kong_vqa.py \
@@ -15,10 +15,10 @@ Example:
 
 import argparse
 from copy import deepcopy
-from itertools import combinations
+import json
+import logging
 from pathlib import Path
 import sys
-import traceback
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -83,24 +83,15 @@ from task.RoboDojo import task_registry
 from utils.load_file import load_yaml
 from utils.pipeline_utils import process_config, process_randomization
 
-# Robot-side tiles are pushed away from the robot. The opponent tile is pushed
-# from the opposite side, so it moves toward the robot and needs a 180-degree
-# yaw to keep the printed face orientation consistent.
+# Robot-side tiles are pushed away from the robot and rotate onto the table.
+# The opponent discard moves toward the robot and turns face-up first, which is
+# the sole visual reference for deciding the matching robot-side tile group.
 ROBOT_SIDE_FALLEN_QUATERNION = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-OPPONENT_SIDE_FALLEN_QUATERNION = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+REFERENCE_TILE_FALLEN_QUATERNION = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 ROBOT_SIDE_PUSH_DIRECTION = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
-OPPONENT_SIDE_PUSH_DIRECTION = np.asarray([0.0, -1.0, 0.0], dtype=np.float32)
+REFERENCE_TILE_PUSH_DIRECTION = np.asarray([0.0, -1.0, 0.0], dtype=np.float32)
 FALLEN_FORWARD_OFFSET_M = 0.045
 FALLEN_Z_OFFSET_M = -0.016
-CAMERA_ALIASES = {
-    "cam_high": "cam_head",
-    "cam_head": "cam_head",
-    "head": "cam_head",
-    "cam_left_wrist": "cam_left_wrist",
-    "left_wrist": "cam_left_wrist",
-    "cam_right_wrist": "cam_right_wrist",
-    "right_wrist": "cam_right_wrist",
-}
 KONG_GROUPS = (
     ("mahjong0_0", "mahjong0_1", "mahjong0_2"),
     ("mahjong1_0", "mahjong1_1", "mahjong1_2"),
@@ -110,6 +101,21 @@ KONG_GROUPS = (
 DISTRACTOR_ROBOT_SIDE_GROUP = ("mahjong4_0", "mahjong4_1")
 DISCARD_LABELS = ("mahjong5_0", "mahjong6_0", "mahjong7_0", "mahjong8_0")
 TILE_VISIBILITY = VisibilityThresholds(32, 4, 0.05, 0.5)
+RENDER_STABILIZATION_FRAMES = 12
+LOGGER = logging.getLogger("make_kong_vqa")
+
+
+def _configure_logging() -> None:
+    """Keep collector progress while suppressing verbose dependencies."""
+
+    if not LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+        LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    for dependency in ("curobo", "matplotlib", "PIL"):
+        logging.getLogger(dependency).setLevel(logging.WARNING)
 
 
 def _parse_int_csv(value: str, *, valid: set[int] | None = None, flag: str) -> list[int]:
@@ -138,19 +144,6 @@ def _parse_layout_ids(value: str, seed_manager: SeedManager) -> list[int]:
     if not layout_ids:
         raise ValueError("No layout IDs selected.")
     return layout_ids
-
-
-def _parse_cameras(value: str) -> list[str]:
-    cameras = []
-    for item in [part.strip() for part in value.split(",") if part.strip()]:
-        if item not in CAMERA_ALIASES:
-            raise ValueError(f"Unknown camera {item!r}; valid values are {sorted(CAMERA_ALIASES)}.")
-        camera = CAMERA_ALIASES[item]
-        if camera not in cameras:
-            cameras.append(camera)
-    if not cameras:
-        raise ValueError("--cameras must contain at least one camera.")
-    return cameras
 
 
 def _as_numpy(value: Any, *, dtype=None) -> np.ndarray:
@@ -277,9 +270,18 @@ def _ensure_layout_scene_objects(env) -> None:
 
 
 def _restore_robot_home(env) -> None:
+    """Teleport target robots home with zero velocity for a static snapshot."""
+
+    env.robot_manager.reset()
+    for robot, key in zip(env.robot_manager.robot_list, env.robot_manager.robot_key, strict=True):
+        if robot.type != "target":
+            continue
+        default_joint_pos = key.data.default_joint_pos.clone()
+        zero_joint_vel = torch.zeros_like(key.data.default_joint_vel)
+        key.write_joint_state_to_sim(default_joint_pos, zero_joint_vel)
+        key.set_joint_position_target(default_joint_pos)
+    env.sim_step(render=False)
     env.robot_manager.set_robot_init_pose()
-    for _ in range(40):
-        env.sim_step(render=False)
     env.robot_manager.set_robot_init_state()
 
 
@@ -300,14 +302,18 @@ def _set_label_pose(env, label: str, position: np.ndarray, orientation: np.ndarr
     obj.set_local_pose(
         translation=np.asarray(position, dtype=np.float32), orientation=np.asarray(orientation, dtype=np.float32)
     )
+    if hasattr(obj, "set_velocities"):
+        obj.set_velocities(np.zeros((1, 6), dtype=np.float32))
 
 
 def _robot_side_labels() -> tuple[str, ...]:
-    return tuple(label for group in (*KONG_GROUPS, DISTRACTOR_ROBOT_SIDE_GROUP) for label in group)
+    """Return the 12 robot-side tiles that receive numbered overlay marks."""
+
+    return tuple(label for group in KONG_GROUPS for label in group)
 
 
 def _tile_labels() -> tuple[str, ...]:
-    return tuple(list(_robot_side_labels()) + list(DISCARD_LABELS) + ["mahjong9_0"])
+    return tuple(list(_robot_side_labels()) + list(DISTRACTOR_ROBOT_SIDE_GROUP) + list(DISCARD_LABELS) + ["mahjong9_0"])
 
 
 def _snapshot_tile_poses(env) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -323,25 +329,10 @@ def _restore_tile_poses(env, poses: dict[str, tuple[np.ndarray, np.ndarray]]) ->
         _set_label_pose(env, label, position, orientation)
 
 
-def _settle(env, *, sim_steps: int = 20, render_frames: int = 12) -> None:
+def _settle(env, *, sim_steps: int = 20) -> None:
     for _ in range(sim_steps):
         env.sim_step(render=False)
-    for _ in range(render_frames):
-        env.render()
     env.obs_manager.reset()
-
-
-def _capture_images(env, cameras: list[str]) -> dict[str, np.ndarray]:
-    env.render()
-    observation = env.obs_manager.get_obs(env_idx_list=[0])[0]
-    vision = observation.get("vision", {})
-    images = {}
-    for camera in cameras:
-        color = vision.get(camera, {}).get("color")
-        if color is None:
-            raise RuntimeError(f"Expected {camera} image, found cameras {sorted(vision)}")
-        images[camera] = _as_numpy(color, dtype=np.uint8).copy()
-    return images
 
 
 class AnnotationMappingError(RuntimeError):
@@ -364,8 +355,22 @@ def _capture_ego_annotations(env) -> tuple[np.ndarray, np.ndarray, np.ndarray, d
     return rgb, depth, instance, data["instance_segmentation_fast"][0].get("info", {})
 
 
-def _set_semantic_label(entity: Any, semantic_label: str) -> None:
-    from isaacsim.core.utils.semantics import add_labels
+def _reset_ego_render_product(env) -> None:
+    """Discard tiled-camera DLAA history after a static-scene teleport."""
+
+    import omni.usd
+
+    camera_names = env.camera_manager.camera_names[0]
+    if "cam_head" not in camera_names:
+        raise AnnotationMappingError(f"cam_head is unavailable; cameras={camera_names}")
+    omni.usd.get_context().reset_renderer_accumulation()
+    env.capture_manager.recreate_render_products([camera_names.index("cam_head")])
+    for _ in range(RENDER_STABILIZATION_FRAMES):
+        env.render()
+
+
+def _set_semantic_label(entity: Any, semantic_label: str) -> str:
+    from isaacsim.core.utils.semantics import add_labels, remove_labels
     import omni.usd
 
     prim = getattr(entity, "prim", None)
@@ -374,7 +379,9 @@ def _set_semantic_label(entity: Any, semantic_label: str) -> None:
         prim = omni.usd.get_context().get_stage().GetPrimAtPath(str(prim_path)) if prim_path else None
     if not prim or not prim.IsValid():
         raise AnnotationMappingError(f"invalid prim for {semantic_label!r}")
+    remove_labels(prim, include_descendants=True)
     add_labels(prim, [semantic_label])
+    return str(prim.GetPath())
 
 
 def _label_matches(value: Any, semantic_label: str) -> bool:
@@ -382,55 +389,121 @@ def _label_matches(value: Any, semantic_label: str) -> bool:
         return any(_label_matches(item, semantic_label) for item in value.values())
     if isinstance(value, (list, tuple, set)):
         return any(_label_matches(item, semantic_label) for item in value)
-    return semantic_label in str(value)
+    text = str(value)
+    return text == semantic_label or (not text.startswith("/") and semantic_label in text)
 
 
-def _mask_for_semantic(instance: np.ndarray, info: dict[str, Any], semantic_label: str) -> np.ndarray:
+def _prim_path_matches(value: Any, prim_path: str) -> bool:
+    """Match an instance identity path exactly, never by a shared prefix."""
+
+    if isinstance(value, dict):
+        return any(_prim_path_matches(item, prim_path) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_prim_path_matches(item, prim_path) for item in value)
+    return str(value) == prim_path
+
+
+def _renderer_identity_matches(value: Any, semantic_label: str, prim_path: str) -> bool:
+    return _label_matches(value, semantic_label) or _prim_path_matches(value, prim_path)
+
+
+def _semantic_id_map(
+    info: dict[str, Any], semantic_labels: dict[str, str], semantic_prim_paths: dict[str, str]
+) -> dict[str, list[int]]:
     labels = info.get("idToLabels") or info.get("id_to_labels") or info.get("labels")
     if not isinstance(labels, dict):
         raise AnnotationMappingError("instance segmentation did not provide idToLabels")
-    ids = [int(key) for key, value in labels.items() if _label_matches(value, semantic_label)]
+    return {
+        label: [
+            int(key)
+            for key, value in labels.items()
+            if _renderer_identity_matches(value, semantic_label, semantic_prim_paths[label])
+        ]
+        for label, semantic_label in semantic_labels.items()
+    }
+
+
+def _mask_for_semantic(
+    instance: np.ndarray,
+    info: dict[str, Any],
+    semantic_label: str,
+    prim_path: str,
+) -> np.ndarray:
+    labels = info.get("idToLabels") or info.get("id_to_labels") or info.get("labels")
+    if not isinstance(labels, dict):
+        raise AnnotationMappingError("instance segmentation did not provide idToLabels")
+    ids = [
+        int(key)
+        for key, value in labels.items()
+        if _renderer_identity_matches(value, semantic_label, prim_path)
+    ]
     if len(ids) != 1:
-        raise AnnotationMappingError(f"semantic label {semantic_label!r} resolves to {len(ids)} IDs")
+        raise AnnotationMappingError(
+            f"renderer identity for {semantic_label!r} at {prim_path!r} resolves to {len(ids)} instance IDs"
+        )
     return instance == ids[0]
 
 
-def _label_tile_instances(env) -> dict[str, str]:
+def _write_segmentation_audit(
+    audit_dir: Path,
+    scene_id: str,
+    instance: np.ndarray,
+    info: dict[str, Any],
+    semantic_labels: dict[str, str],
+    semantic_prim_paths: dict[str, str],
+) -> dict[str, list[int]]:
+    """Persist renderer identity evidence before accepting any tile label."""
+
+    semantic_ids = _semantic_id_map(info, semantic_labels, semantic_prim_paths)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    (audit_dir / f"{scene_id}_instance_ids.json").write_text(
+        json.dumps(
+            {
+                "semantic_labels": semantic_labels,
+                "semantic_prim_paths": semantic_prim_paths,
+                "matched_instance_ids": semantic_ids,
+                "id_to_labels": info.get("idToLabels") or info.get("id_to_labels") or info.get("labels"),
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    color = np.zeros((*instance.shape, 3), dtype=np.uint8)
+    for identifier in np.unique(instance):
+        identifier = int(identifier)
+        if identifier == 0:
+            continue
+        color[instance == identifier] = (
+            (identifier * 37) % 251 + 4,
+            (identifier * 73) % 251 + 4,
+            (identifier * 109) % 251 + 4,
+        )
+    Image.fromarray(color).save(audit_dir / f"{scene_id}_instance_ids.png")
+    return semantic_ids
+
+
+def _label_tile_instances(env) -> tuple[dict[str, str], dict[str, str]]:
     layout = env.scene_manager.layout_manager
     labels = (*_robot_side_labels(), *DISCARD_LABELS)
     semantic = {label: f"vqa_make_kong_{label}" for label in labels}
+    prim_paths = {}
     for label, semantic_label in semantic.items():
         entity = layout.get_scene_object(0, layout.get_instance_name(0, label))
         if entity is None:
             raise AnnotationMappingError(f"missing tile {label}")
-        _set_semantic_label(entity, semantic_label)
-    return semantic
+        prim_paths[label] = _set_semantic_label(entity, semantic_label)
+    return semantic, prim_paths
 
 
 def _mask_anchor(mask: np.ndarray) -> tuple[int, int]:
     ys, xs = np.nonzero(mask)
     if len(xs) == 0:
         raise AnnotationMappingError("cannot anchor empty tile mask")
-    return int(round(float(xs.mean()))), int(round(float(ys.mean())))
-
-
-def _category_index(env, label: str) -> int | None:
-    saved_layout = env.scene_manager.layout_manager.saved_layouts[0]
-    if saved_layout is not None:
-        for object_group in saved_layout.values():
-            if not isinstance(object_group, dict):
-                continue
-            for instances in object_group.values():
-                if not isinstance(instances, list):
-                    continue
-                for instance in instances:
-                    if instance.get("label") == label and instance.get("category_idx") is not None:
-                        return int(instance["category_idx"])
-    metadata = env.scene_manager.layout_manager.get_instance_metadata(env_idx=0, label=label)
-    if metadata is None:
-        return None
-    value = metadata.get("category_idx")
-    return None if value is None else int(value)
+    center_x, center_y = float(xs.mean()), float(ys.mean())
+    nearest = int(np.argmin((xs - center_x) ** 2 + (ys - center_y) ** 2))
+    return int(xs[nearest]), int(ys[nearest])
 
 
 def _target_labels_left_to_right(env, target_group: int) -> list[str]:
@@ -449,29 +522,6 @@ def _robot_side_labels_left_to_right(env) -> list[str]:
     return [label for label, _ in sorted(labels_with_x, key=lambda item: item[1])]
 
 
-def _tile_indices(robot_side_labels: list[str], labels: list[str]) -> list[int]:
-    label_to_index = {label: idx + 1 for idx, label in enumerate(robot_side_labels)}
-    return sorted(label_to_index[label] for label in labels)
-
-
-def _balanced_fallen_labels(
-    target_labels: list[str],
-    *,
-    layout_id: int,
-    target_group: int,
-    fallen_count: int,
-) -> list[str]:
-    if fallen_count < 0 or fallen_count > len(target_labels):
-        raise ValueError(f"fallen_count must be between 0 and {len(target_labels)}, got {fallen_count}.")
-    if fallen_count in {0, len(target_labels)}:
-        return target_labels[:fallen_count]
-
-    index_combinations = list(combinations(range(len(target_labels)), fallen_count))
-    combo_index = (layout_id + target_group + ARGS.seed * len(KONG_GROUPS)) % len(index_combinations)
-    selected_indices = index_combinations[combo_index]
-    return [target_labels[index] for index in selected_indices]
-
-
 def _fallen_tile_position(position: np.ndarray, direction: np.ndarray) -> np.ndarray:
     fallen_position = np.asarray(position, dtype=np.float32).copy()
     fallen_position += np.asarray(direction, dtype=np.float32) * FALLEN_FORWARD_OFFSET_M
@@ -483,8 +533,8 @@ def _robot_side_fallen_quaternion() -> np.ndarray:
     return ROBOT_SIDE_FALLEN_QUATERNION.copy()
 
 
-def _opponent_side_fallen_quaternion() -> np.ndarray:
-    return OPPONENT_SIDE_FALLEN_QUATERNION.copy()
+def _reference_tile_fallen_quaternion() -> np.ndarray:
+    return REFERENCE_TILE_FALLEN_QUATERNION.copy()
 
 
 def _parse_state_patterns(value: str) -> list[int]:
@@ -502,7 +552,7 @@ def _render_state(
     *,
     writer: SidecarWriter,
     image_dir: Path,
-    semantic_labels: dict[str, str],
+    audit_dir: Path,
     layout_id: int,
     target_group: int,
     state_pattern: int,
@@ -510,14 +560,16 @@ def _render_state(
     target_labels = _target_labels_left_to_right(env, target_group)
     robot_side_labels = _robot_side_labels_left_to_right(env)
     fallen_labels = _fallen_labels_for_pattern(target_labels, state_pattern)
-    fallen_label_set = set(fallen_labels)
     discard_label = DISCARD_LABELS[target_group]
     robot_side_fallen_quaternion = _robot_side_fallen_quaternion()
-    opponent_side_fallen_quaternion = _opponent_side_fallen_quaternion()
+    reference_tile_fallen_quaternion = _reference_tile_fallen_quaternion()
 
-    _, discard_position, _ = _label_object(env, discard_label)
-    discard_fallen_position = _fallen_tile_position(discard_position, OPPONENT_SIDE_PUSH_DIRECTION)
-    _set_label_pose(env, discard_label, discard_fallen_position, opponent_side_fallen_quaternion)
+    # The opponent declares the type first by knocking its discard down with
+    # the face visible from cam_head. The robot-side matching relationship is
+    # then determined from this rendered reference, not from a hidden prompt.
+    _, reference_position, _ = _label_object(env, discard_label)
+    reference_fallen_position = _fallen_tile_position(reference_position, REFERENCE_TILE_PUSH_DIRECTION)
+    _set_label_pose(env, discard_label, reference_fallen_position, reference_tile_fallen_quaternion)
 
     for label in fallen_labels:
         _, position, _ = _label_object(env, label)
@@ -528,10 +580,27 @@ def _render_state(
 
     scene_id = f"make_kong_seed{ARGS.seed}_layout{layout_id:03d}_group{target_group}_pattern{state_pattern:03b}"
     try:
+        semantic_labels, semantic_prim_paths = _label_tile_instances(env)
+        _reset_ego_render_product(env)
         rgb, _, instance, info = _capture_ego_annotations(env)
-        masks = {label: _mask_for_semantic(instance, info, semantic) for label, semantic in semantic_labels.items()}
+        semantic_ids = _write_segmentation_audit(
+            audit_dir, scene_id, instance, info, semantic_labels, semantic_prim_paths
+        )
+        required_labels = set(robot_side_labels) | {discard_label}
+        invalid_mappings = {label: semantic_ids[label] for label in required_labels if len(semantic_ids[label]) != 1}
+        if invalid_mappings:
+            details = ", ".join(f"{label}={ids}" for label, ids in sorted(invalid_mappings.items()))
+            raise AnnotationMappingError(f"semantic-to-instance mapping is not one-to-one: {details}")
+        masks = {
+            label: _mask_for_semantic(instance, info, semantic_labels[label], semantic_prim_paths[label])
+            for label in required_labels
+        }
         mark_to_label = {str(index): label for index, label in enumerate(robot_side_labels, start=1)}
-        overlay = numbered_overlay(rgb, {mark: _mask_anchor(masks[label]) for mark, label in mark_to_label.items()})
+        overlay = numbered_overlay(
+            rgb,
+            {mark: _mask_anchor(masks[label]) for mark, label in mark_to_label.items()},
+            object_masks_by_mark={mark: masks[label] for mark, label in mark_to_label.items()},
+        )
     except (AnnotationMappingError, OverlayError) as error:
         writer.reject(
             base_record(
@@ -563,11 +632,12 @@ def _render_state(
             answer_bool=answer,
             world_state_valid=True,
             image_answerable=(
-                status in {"visible", "partially_visible"} and reference_status in {"visible", "partially_visible"}
+                status == "visible" and reference_status == "visible"
             ),
             visibility_status=status,
             visible_fraction=fraction,
             occlusion_ratio=occlusion,
+            target_view="ego",
             gt_source="simulated_tile_identity_and_pose",
             overlay_type="numbered_object_marks",
             overlay_version="make_kong_v1",
@@ -580,6 +650,8 @@ def _render_state(
                     "query_mark": int(label_to_mark[query_label]),
                     "reference_label": discard_label,
                     "reference_visible_fraction": reference_fraction,
+                    "reference_visibility_status": reference_status,
+                    "semantic_instance_ids": {label: semantic_ids[label][0] for label in sorted(required_labels)},
                     "target_group": target_group,
                     "state_pattern": state_pattern,
                     "fallen_labels": fallen_labels,
@@ -587,80 +659,72 @@ def _render_state(
             ),
         )
 
-    non_matching = [
-        label for label in robot_side_labels if label not in fallen_label_set and label not in target_labels
-    ]
-    # Every state has three positive and three deterministically rotated negative identity questions.
-    selected_negative = [non_matching[(layout_id + state_pattern + offset) % len(non_matching)] for offset in range(3)]
-    for query_label in [*target_labels, *selected_negative]:
+    # Use only the matching group's two outer tiles. This leaves the middle
+    # tile as visual context and prevents one reference group from producing
+    # redundant questions for all three matching tiles.
+    query_labels = (target_labels[0], target_labels[-1])
+    for query_label in query_labels:
         mark = label_to_mark[query_label]
         writer.add(
             record(
-                "tile_matches_reference",
-                f"matches_{mark}",
+                "matching_tile_needs_to_be_pushed",
+                f"needs_push_{mark}",
                 query_label,
-                query_label in target_labels,
-                f"Does the robot-side tile marked {mark} match the face-up reference tile? Answer yes or no.",
-            )
-        )
-    for query_label in target_labels:
-        mark = label_to_mark[query_label]
-        writer.add(
-            record(
-                "matching_tile_already_pushed",
-                f"pushed_{mark}",
-                query_label,
-                query_label in fallen_label_set,
+                query_label not in fallen_labels,
                 (
-                    f"The tile marked {mark} matches the face-up reference tile. "
-                    "Is it already lying down? Answer yes or no."
+                    f"Based on the face-up reference tile, does the tile marked {mark} "
+                    "still need to be knocked down? Answer yes or no."
                 ),
             )
         )
 
 
 def main() -> None:
+    _configure_logging()
     target_groups = _parse_int_csv(ARGS.target_groups, valid={0, 1, 2, 3}, flag="--target-groups")
     state_patterns = _parse_state_patterns(ARGS.state_patterns)
     if ARGS.fps <= 0:
         raise ValueError("--fps must be positive.")
     writer = SidecarWriter(ARGS.output_dir, overwrite=ARGS.overwrite)
     image_dir = writer.prepare_images_dir()
+    audit_dir = writer.prepare_audit_dir()
 
     env = None
     try:
         config = _build_env_config(ARGS.device_id, ARGS.seed)
         planner_flags = [(cfg.get("robot_name"), cfg.get("need_planner")) for cfg in config.robot.robots]
-        print(f"[make_kong_vqa] planner flags={planner_flags}", flush=True)
+        LOGGER.info("planner flags=%s", planner_flags)
         seed_manager = SeedManager(config.eval_cfg)
         seed_manager.init_eval()
         layout_ids = _parse_layout_ids(ARGS.layout_ids, seed_manager)
-        print(
-            f"[make_kong_vqa] seed={ARGS.seed} layouts={layout_ids} groups={target_groups} "
-            f"state_patterns={state_patterns} output={ARGS.output_dir}",
-            flush=True,
+        LOGGER.info(
+            "seed=%s layouts=%s groups=%s state_patterns=%s output=%s",
+            ARGS.seed,
+            layout_ids,
+            target_groups,
+            state_patterns,
+            ARGS.output_dir,
         )
         for layout_id in layout_ids:
             env = _create_env(deepcopy(config))
             try:
+                LOGGER.info("creating and resetting layout=%s", layout_id)
                 _reset_layout(env, layout_id)
-                semantic_labels = _label_tile_instances(env)
                 base_poses = _snapshot_tile_poses(env)
                 for target_group in target_groups:
                     for state_pattern in state_patterns:
                         _restore_tile_poses(env, base_poses)
+                        LOGGER.info(
+                            "capturing layout=%s group=%s pattern=%s", layout_id, target_group, state_pattern
+                        )
                         _render_state(
                             env,
                             writer=writer,
                             image_dir=image_dir,
-                            semantic_labels=semantic_labels,
+                            audit_dir=audit_dir,
                             layout_id=layout_id,
                             target_group=target_group,
                             state_pattern=state_pattern,
-                        )
-                        print(
-                            f"[make_kong_vqa] rendered layout={layout_id} group={target_group} pattern={state_pattern}",
-                            flush=True,
                         )
             finally:
                 env.close()
@@ -678,14 +742,20 @@ def main() -> None:
                 "state_patterns": state_patterns,
                 "camera": "cam_head",
                 "fps": ARGS.fps,
+                "numbered_robot_side_tiles": len(_robot_side_labels()),
                 "fallen_forward_offset_m": FALLEN_FORWARD_OFFSET_M,
                 "fallen_z_offset_m": FALLEN_Z_OFFSET_M,
+                "render": {
+                    "antialiasing_mode": "DLAA",
+                    "stabilization_frames": RENDER_STABILIZATION_FRAMES,
+                    "ego_render_product_recreated_per_snapshot": True,
+                },
                 "command": " ".join(sys.argv),
             }
         )
-        print(f"[make_kong_vqa] wrote {report['accepted_records']} accepted records to {ARGS.output_dir}", flush=True)
-    except Exception:
-        traceback.print_exc()
+        LOGGER.info("wrote %s accepted records to %s", report["accepted_records"], ARGS.output_dir)
+    except Exception as error:
+        LOGGER.exception("generation failed: %s", error)
         raise
     finally:
         if env is not None:
