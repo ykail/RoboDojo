@@ -16,6 +16,7 @@ class OverlayResult:
     image: np.ndarray
     mark_boxes_xyxy: dict[str, tuple[int, int, int, int]]
     anchors_xy: dict[str, tuple[int, int]]
+    leader_segments_xyxy: dict[str, tuple[int, int, int, int]]
 
 
 def _intersects(first: tuple[int, int, int, int], second: tuple[int, int, int, int], padding: int = 2) -> bool:
@@ -27,23 +28,49 @@ def _intersects(first: tuple[int, int, int, int], second: tuple[int, int, int, i
     )
 
 
+def _squared_distance_to_segment(point: tuple[float, float], start: tuple[int, int], end: tuple[int, int]) -> float:
+    """Return the squared distance from ``point`` to a finite 2D segment."""
+
+    start_array = np.asarray(start, dtype=np.float64)
+    end_array = np.asarray(end, dtype=np.float64)
+    point_array = np.asarray(point, dtype=np.float64)
+    direction = end_array - start_array
+    length_squared = float(np.dot(direction, direction))
+    if length_squared == 0.0:
+        return float(np.dot(point_array - start_array, point_array - start_array))
+    fraction = float(np.clip(np.dot(point_array - start_array, direction) / length_squared, 0.0, 1.0))
+    closest = start_array + fraction * direction
+    return float(np.dot(point_array - closest, point_array - closest))
+
+
+def _point_overlaps_box(point: tuple[float, float], box: tuple[int, int, int, int], clearance: int) -> bool:
+    """Whether a protected point lies in a badge box expanded by ``clearance``."""
+
+    return box[0] - clearance <= point[0] <= box[2] + clearance and box[1] - clearance <= point[1] <= box[3] + clearance
+
+
 def numbered_overlay(
     image: np.ndarray,
     anchors_xy: Mapping[str, Sequence[float]],
     *,
     protected_points_xy: Sequence[Sequence[float]] = (),
     badge_size: int = 20,
+    protected_point_clearance_px: int = 6,
 ) -> OverlayResult:
     """Draw uniform numbered badges and leader lines after image geometry.
 
     The caller supplies a body anchor for every mark.  Candidate badge
     locations are deterministic and reject overlap with another badge or a
-    protected target point such as a pen nib.
+    protected target point such as a pen nib.  Both the badge and its leader
+    line remain outside the protected-point clearance disc, so a mark cannot
+    obscure a point-grounding answer.
     """
 
     rgb = np.asarray(image, dtype=np.uint8)
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise OverlayError("image must be HxWx3 uint8")
+    if badge_size <= 0 or protected_point_clearance_px < 0:
+        raise OverlayError("badge_size must be positive and protected-point clearance must be non-negative")
     canvas = Image.fromarray(rgb.copy())
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
@@ -63,7 +90,17 @@ def numbered_overlay(
                 continue
             if any(_intersects(box, other) for other in placed.values()):
                 continue
-            if any(box[0] <= point[0] <= box[2] and box[1] <= point[1] <= box[3] for point in protected_points_xy):
+            if any(
+                _point_overlaps_box((float(point[0]), float(point[1])), box, protected_point_clearance_px)
+                for point in protected_points_xy
+            ):
+                continue
+            center = ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+            if any(
+                _squared_distance_to_segment((float(point[0]), float(point[1])), anchor, center)
+                <= protected_point_clearance_px**2
+                for point in protected_points_xy
+            ):
                 continue
             selected = box
             break
@@ -77,4 +114,8 @@ def numbered_overlay(
         text_y = center[1] - (text_box[3] - text_box[1]) // 2
         draw.text((text_x, text_y), str(mark), fill=(255, 255, 255), font=font)
         placed[str(mark)] = selected
-    return OverlayResult(np.asarray(canvas), placed, normalized_anchors)
+    leader_segments = {
+        mark: (*normalized_anchors[mark], (box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+        for mark, box in placed.items()
+    }
+    return OverlayResult(np.asarray(canvas), placed, normalized_anchors, leader_segments)

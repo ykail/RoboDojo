@@ -67,6 +67,23 @@ class VqaSidecarTests(unittest.TestCase):
             self.assertLessEqual(y1, 100)
             self.assertFalse(x0 <= 50 <= x1 and y0 <= 20 <= y1)
 
+    def test_overlay_leader_line_keeps_clear_of_protected_point(self) -> None:
+        image = np.zeros((100, 100, 3), dtype=np.uint8)
+        protected = np.asarray((50.0, 65.0))
+        clearance = 6
+        result = numbered_overlay(
+            image,
+            {"1": (50, 80)},
+            protected_points_xy=[protected],
+            protected_point_clearance_px=clearance,
+        )
+        start_x, start_y, end_x, end_y = result.leader_segments_xyxy["1"]
+        start = np.asarray((start_x, start_y), dtype=np.float64)
+        end = np.asarray((end_x, end_y), dtype=np.float64)
+        direction = end - start
+        fraction = np.clip(np.dot(protected - start, direction) / np.dot(direction, direction), 0.0, 1.0)
+        self.assertGreater(float(np.linalg.norm(protected - (start + fraction * direction))), clearance)
+
     def test_writer_keeps_invalid_rows_in_rejected_parquet(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             writer = SidecarWriter(Path(directory) / "sidecar")

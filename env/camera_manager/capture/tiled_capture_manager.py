@@ -136,6 +136,44 @@ class TiledCaptureManager:
 
                 self._output_buffers[cam_id][annotator_name] = wp.zeros(shape, dtype=spec["dtype"], device="cuda:0")
 
+    def recreate_render_products(self, cam_ids: List[int]) -> None:
+        """Recreate selected tiled render products without rebuilding cameras.
+
+        RTX temporal anti-aliasing state belongs to a render product.  Synthetic
+        snapshot collectors may teleport scene state between captures, so they
+        need a narrow way to discard that history for a single camera while
+        retaining all camera prims and unrelated render products.
+        """
+
+        import warp as wp
+
+        from env.camera_manager.capture.camera_view import ANNOTATOR_SPEC
+
+        for cam_id in cam_ids:
+            if cam_id < 0 or cam_id >= len(self.tiled_cameras):
+                raise IndexError(f"camera index {cam_id} is outside [0, {len(self.tiled_cameras) - 1}]")
+            previous = self.tiled_cameras[cam_id]
+            for annotator in previous._annotators.values():
+                annotator.detach(previous._render_product_path)
+            previous._render_product.destroy()
+
+            camera_resolution = self.cameras[0][cam_id]._resolution
+            height, width = camera_resolution[1], camera_resolution[0]
+            refreshed = CameraView(
+                [row[cam_id] for row in self.camera_prim_paths],
+                camera_resolution=[width, height],
+                output_annotators=self.annotator_type[cam_id],
+            )
+            self.tiled_cameras[cam_id] = refreshed
+            self.tiled_render_products[cam_id] = refreshed._render_product
+            self._output_buffers[cam_id] = {}
+            for annotator_name in self.annotator_type[cam_id]:
+                spec = ANNOTATOR_SPEC.get(annotator_name)
+                if spec is None:
+                    continue
+                shape = (self.num_envs, height, width, spec["channels"])
+                self._output_buffers[cam_id][annotator_name] = wp.zeros(shape, dtype=spec["dtype"], device="cuda:0")
+
     def step(self, env_ids: List[int] = None, cam_ids: List[int] = None) -> List[List[List[any]]]:
         """
         Step the annotator. When env_id and cam_id is given, use the given. Otherwise apply to all cameras.

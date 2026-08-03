@@ -61,7 +61,10 @@ GRIPPER_CLEARANCE = 0.003
 HOLDER_GRASP_HEIGHT = 0.085
 DEFAULT_GRIPPER_POSITION_JITTER_M = 0.10
 DEFAULT_GRIPPER_HEIGHT_JITTER_M = 0.05
-RENDER_STABILIZATION_FRAMES = 4
+# DLAA is temporal. The tiled camera's first buffer after a pose write can
+# still contain a prior render-product frame, so retain enough clean frames
+# after the reset for both that buffer and DLAA history to settle.
+RENDER_STABILIZATION_FRAMES = 12
 HOLDER_VISIBILITY = VisibilityThresholds(64, 1, 0.05, 0.5)
 PEN_VISIBILITY = VisibilityThresholds(12, 6, 0.03, 0.5)
 # Count questions require an instance to be readily distinguishable, not just
@@ -89,6 +92,29 @@ def _configure_logging() -> None:
     LOGGER.propagate = False
     for dependency in ("curobo", "matplotlib", "PIL"):
         logging.getLogger(dependency).setLevel(logging.WARNING)
+
+
+def _reset_renderer_accumulation() -> None:
+    """Discard DLAA history after direct robot/object teleports.
+
+    Direct pose writes do not advance animation time, so DLAA cannot always
+    infer that its temporal history is invalid.  Resetting the renderer makes
+    the following stabilization frames independent of a previous layout or
+    sample while preserving DLAA image quality.
+    """
+
+    import omni.usd
+
+    omni.usd.get_context().reset_renderer_accumulation()
+
+
+def _reset_ego_render_product(env) -> None:
+    """Recreate only cam_head's tiled render product after a snapshot teleport."""
+
+    camera_names = env.camera_manager.camera_names[0]
+    if "cam_head" not in camera_names:
+        raise AnnotationMappingError(f"cam_head is unavailable; cameras={camera_names}")
+    env.capture_manager.recreate_render_products([camera_names.index("cam_head")])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -273,7 +299,10 @@ def _set_robot_pose(env, robot, target_pose: np.ndarray, gripper_joint: float) -
         raise RuntimeError(f"IK failed for {robot.arm_name}: {result}")
     key = env.robot_manager.robot_key[env.robot_manager.robot_list.index(robot)]
     joint_pos = key.data.joint_pos.clone()
-    joint_vel = key.data.joint_vel.clone()
+    # This is a snapshot teleport, not a trajectory command.  Retaining a
+    # prior sample's joint velocity produces a real transition frame and
+    # invalid motion vectors for DLAA.
+    joint_vel = torch.zeros_like(key.data.joint_vel)
     arm_joints = np.asarray(result["joint_value"], dtype=np.float32).reshape(-1)
     joint_pos[0, robot.arm_joint_indices] = torch.as_tensor(arm_joints, device=joint_pos.device)
     gripper_value = float(np.clip(gripper_joint, robot.gripper_scale[0], robot.gripper_scale[1]))
@@ -287,6 +316,11 @@ def _set_local_pose(obj, position: np.ndarray, quaternion: np.ndarray | list[flo
     obj.set_local_pose(
         translation=np.asarray(position, dtype=np.float32), orientation=np.asarray(quaternion, dtype=np.float32)
     )
+    if hasattr(obj, "set_velocities"):
+        # RigidObject inherits Isaac Sim's SingleRigidPrim API, which expects
+        # one [linear_xyz, angular_xyz] row.  A pose snapshot must not carry
+        # velocity from the preceding synthetic scene.
+        obj.set_velocities(np.zeros((1, 6), dtype=np.float32))
 
 
 def _x5_grasp_center(end_link_pose: np.ndarray, gripper_bias: float) -> np.ndarray:
@@ -786,8 +820,16 @@ def _restore_layout_object_poses(env, layout: dict[str, Any]) -> None:
 
 
 def _restore_robot_targets(env) -> None:
-    """Return both robot arms to their configured default joint targets."""
+    """Teleport both arms to default state instead of only changing targets."""
+
     env.robot_manager.reset()
+    for robot, key in zip(env.robot_manager.robot_list, env.robot_manager.robot_key, strict=True):
+        if robot.type != "target":
+            continue
+        default_joint_pos = key.data.default_joint_pos.clone()
+        zero_joint_vel = torch.zeros_like(key.data.default_joint_vel)
+        key.write_joint_state_to_sim(default_joint_pos, zero_joint_vel)
+        key.set_joint_position_target(default_joint_pos)
     env.sim_step(render=False)
 
 
@@ -865,13 +907,24 @@ def _add_case_records(
     Image.fromarray(rgb).save(image_dir / clean_name)
     clean_ref = str(Path("images") / clean_name)
     semantic_ids = _write_segmentation_audit(audit_dir, scene_id, instance, info, semantic_labels, semantic_prim_paths)
-    invalid_mappings = {label: ids for label, ids in semantic_ids.items() if len(ids) != 1}
+    if scenario == "gripper_content":
+        required_labels = {
+            "pen_holder" if held == "pen_holder" else "target0"
+            for held in (scene_state["left_hand"], scene_state["right_hand"])
+            if held != "nothing"
+        }
+    else:
+        # The layout and count families need every object mask: they either
+        # mark every pen or derive a per-instance visible count.
+        required_labels = set(semantic_labels)
+    invalid_mappings = {label: semantic_ids[label] for label in required_labels if len(semantic_ids[label]) != 1}
     if invalid_mappings:
         details = ", ".join(f"{label}={ids}" for label, ids in sorted(invalid_mappings.items()))
         raise AnnotationMappingError(f"semantic-to-instance mapping is not one-to-one: {details}")
     masks = {
         label: _mask_for_semantic(instance, info, semantic, semantic_prim_paths[label])
         for label, semantic in semantic_labels.items()
+        if label in required_labels
     }
 
     def candidate(family: str, suffix: str, image_ref: str = clean_ref) -> dict[str, Any]:
@@ -936,6 +989,7 @@ def _add_case_records(
                     for point, status in nib_results.values()
                     if point is not None and status == "visible"
                 ],
+                protected_point_clearance_px=NIB_PATCH_RADIUS_PX + 3,
             )
         except (AnnotationMappingError, OverlayError) as error:
             for mark, label in mark_to_label.items():
@@ -975,11 +1029,14 @@ def _add_case_records(
         answer_text = {"pen": "pen", "pen_holder": "pen holder", "nothing": "nothing"}
         for side in ("left", "right"):
             held = scene_state[f"{side}_hand"]
-            held_label = "pen_holder" if held == "pen_holder" else "target0"
-            status, fraction, occlusion = classify_mask_visibility(
-                masks[held_label], PEN_VISIBILITY if held == "pen" else HOLDER_VISIBILITY
-            )
-            visible = status in {"visible", "partially_visible"} if held != "nothing" else True
+            if held == "nothing":
+                status, fraction, occlusion, visible = "not_applicable", None, None, True
+            else:
+                held_label = "pen_holder" if held == "pen_holder" else "target0"
+                status, fraction, occlusion = classify_mask_visibility(
+                    masks[held_label], PEN_VISIBILITY if held == "pen" else HOLDER_VISIBILITY
+                )
+                visible = status in {"visible", "partially_visible"}
             record = candidate(f"{side}_gripper_content", f"{side}_gripper") | {
                 "prompt_text": (
                     f"What is the {side} gripper directly holding? "
@@ -989,15 +1046,15 @@ def _add_case_records(
                 "answer_text": answer_text[held],
                 "world_state_valid": True,
                 "image_answerable": visible,
-                "visibility_status": status if held != "nothing" else "not_applicable",
-                "visible_fraction": fraction if held != "nothing" else None,
-                "occlusion_ratio": occlusion if held != "nothing" else None,
+                "visibility_status": status,
+                "visible_fraction": fraction,
+                "occlusion_ratio": occlusion,
                 "gt_source": "dedicated_stable_grasp_generator",
                 "audit_metadata_json": json_dumps(
                     {
                         "gripper_side": side,
                         "grasp_class": answer_text[held],
-                        "stable_grasp_frames": 3,
+                        "render_stabilization_frames": RENDER_STABILIZATION_FRAMES,
                         "tcp_position": scene_state["gripper_tcp_positions"][side],
                     }
                 ),
@@ -1075,7 +1132,11 @@ def _manifest(
         },
         "gripper_position_jitter_m": args.gripper_position_jitter,
         "gripper_height_jitter_m": args.gripper_height_jitter,
-        "render": {"antialiasing_mode": "DLAA", "stabilization_frames": RENDER_STABILIZATION_FRAMES},
+        "render": {
+            "antialiasing_mode": "DLAA",
+            "stabilization_frames": RENDER_STABILIZATION_FRAMES,
+            "ego_render_product_recreated_per_snapshot": True,
+        },
         "command": " ".join(sys.argv),
         "run_status": "failed" if failure is not None else "completed",
     }
@@ -1167,8 +1228,12 @@ def main() -> None:
                     # scene reload or asset-level semantic relationship cannot
                     # silently replace the VQA object identities.
                     semantic_labels, semantic_prim_paths = _label_scene_instances(env)
-                    # Let DLAA converge after teleports before sampling camera
-                    # buffers.
+                    # DLAA history is owned by the tiled render product. A
+                    # stage-level reset alone may leave a previous snapshot in
+                    # cam_head's GPU history, so recreate only that product
+                    # before its fixed stabilization renders.
+                    _reset_renderer_accumulation()
+                    _reset_ego_render_product(env)
                     for _ in range(RENDER_STABILIZATION_FRAMES):
                         env.render()
                     try:
