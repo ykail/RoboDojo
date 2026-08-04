@@ -10,6 +10,7 @@ import atexit
 from dataclasses import dataclass, replace
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -62,6 +63,13 @@ def _git_revision(path: Path) -> str:
             stderr=subprocess.DEVNULL,
         ).strip()
     except Exception:
+        return "unknown"
+
+
+def _package_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
         return "unknown"
 
 
@@ -318,7 +326,14 @@ class _WriterSidecar:
         response = self._exchange({"command": "frame", **message}, "frame")
         return int(response["frame_count"])
 
-    def finish(self, *, accepted: bool, success: bool, reason: str) -> dict[str, Any]:
+    def finish(
+        self,
+        *,
+        accepted: bool,
+        success: bool,
+        reason: str,
+        terminal_sim_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not self.active:
             raise LeRobotStreamError("No active LeRobot candidate episode")
         expected = "committed" if accepted else "discarded"
@@ -328,6 +343,7 @@ class _WriterSidecar:
                 "accepted": bool(accepted),
                 "success": bool(success),
                 "reason": str(reason),
+                "terminal_sim_state": terminal_sim_state,
             },
             expected,
         )
@@ -450,12 +466,19 @@ def _drop_sidecar(sidecar: _WriterSidecar) -> None:
 class LeRobotStreamRecorder:
     """One candidate episode with the same append/finalize API as EpisodeRecorder."""
 
-    def __init__(self, config: StreamConfig, metadata: dict[str, Any]):
+    def __init__(
+        self,
+        config: StreamConfig,
+        metadata: dict[str, Any],
+        *,
+        snapshotter: Any | None = None,
+    ):
         self.config = config
         self.metadata = dict(metadata)
         self._sidecar = _acquire_sidecar(config, self.metadata)
         self._frame_count = 0
         self._finished = False
+        self._snapshotter = snapshotter
 
     @property
     def frame_count(self) -> int:
@@ -479,6 +502,11 @@ class LeRobotStreamRecorder:
         if self._finished:
             raise LeRobotStreamError("Cannot append to a finished LeRobot episode")
         try:
+            sim_state = (
+                self._snapshotter.capture(self._frame_count)
+                if self._snapshotter is not None
+                else None
+            )
             self._frame_count = self._sidecar.append(
                 {
                     "obs": obs,
@@ -486,6 +514,7 @@ class LeRobotStreamRecorder:
                     "executed_action": executed_action,
                     "control": control,
                     "task": self.metadata.get("task_name", ""),
+                    "sim_state": sim_state,
                 }
             )
         except Exception:
@@ -502,12 +531,25 @@ class LeRobotStreamRecorder:
         # loop still interprets ESC as an exit request.
         commit = bool(accepted) and self._frame_count > 0
         try:
+            terminal_sim_state = None
+            if commit and self._snapshotter is not None:
+                terminal_sim_state = self._snapshotter.capture(self._frame_count)
             result = self._sidecar.finish(
-                accepted=commit, success=bool(success), reason=str(reason)
+                accepted=commit,
+                success=bool(success),
+                reason=str(reason),
+                terminal_sim_state=terminal_sim_state,
             )
-        except Exception:
+        except BaseException as exc:
+            # A terminal capture failure must not leave a live candidate in the
+            # writer. shutdown() discards it before the causal error is wrapped.
+            self._sidecar.shutdown()
             _drop_sidecar(self._sidecar)
-            raise
+            if isinstance(exc, LeRobotStreamError) or not isinstance(exc, Exception):
+                raise
+            raise LeRobotStreamError(
+                f"Could not finalize LeRobot episode: {type(exc).__name__}: {exc}"
+            ) from exc
         if not commit:
             return None
         _drop_sidecar(self._sidecar)
@@ -531,12 +573,22 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         policy_provenance = {}
     checkpoint_id = policy_provenance.get("checkpoint_id")
     control_mode = getattr(task_env, "control_mode", "keyboard_intervention")
+    runtime_provenance = {
+        "robodojo_commit": _git_revision(project_root),
+        "kai0_commit": _git_revision(project_root / "third_party" / "kai0"),
+        "xpolicylab_commit": _git_revision(project_root / "XPolicyLab"),
+        "isaaclab_commit": _git_revision(project_root / "third_party" / "IsaacLab"),
+        "assets_commit": _git_revision(project_root / "Assets"),
+        "isaacsim_version": _package_version("isaacsim"),
+        "isaaclab_version": _package_version("isaaclab"),
+    }
     metadata = {
         "task_name": getattr(task_env, "task_name", os.environ.get("ROBODOJO_TASK_NAME", "")),
         "env_config": getattr(task_env, "config_name", os.environ.get("ROBODOJO_ENV_CFG", "")),
         "layout_id": int(layout_id),
         "layout_cycle": int(layout_cycle),
         "eval_seed": int(getattr(task_env, "eval_seed", -1)),
+        "policy_seed": int(getattr(task_env, "policy_seed", -1)),
         "policy_name": getattr(task_env, "policy_name", "Pi_05"),
         "base_checkpoint": str(
             checkpoint_id
@@ -547,11 +599,40 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         ),
         "policy_runtime": getattr(task_env, "policy_runtime", "xpolicy_ws_v0"),
         "policy_provenance": dict(policy_provenance),
-        "robodojo_commit": _git_revision(project_root),
-        "xpolicylab_commit": _git_revision(project_root / "XPolicyLab"),
+        "robodojo_commit": runtime_provenance["robodojo_commit"],
+        "xpolicylab_commit": runtime_provenance["xpolicylab_commit"],
+        "runtime_provenance": runtime_provenance,
         "run_id": os.environ.get("ROBODOJO_RUN_ID", ""),
         "control_mode": control_mode,
+        "recording_kind": (
+            "policy_rollout"
+            if bool(getattr(task_env, "record_policy_rollouts", False))
+            else "intervention"
+        ),
+        "collection_id": str(getattr(task_env, "collection_id", "")),
+        "collection_plan_hash": str(
+            getattr(task_env, "collection_plan_hash", "")
+        ),
+        "collection_plan_index": int(
+            getattr(task_env, "collection_plan_index", -1)
+        ),
     }
+    collection_manifest = getattr(task_env, "collection_manifest", None)
+    if isinstance(collection_manifest, dict):
+        metadata["collection_manifest"] = dict(collection_manifest)
+    if bool(getattr(task_env, "record_policy_rollouts", False)):
+        if not isinstance(collection_manifest, dict):
+            raise LeRobotStreamStartupError(
+                "automatic rollout recording requires a signed collection manifest"
+            )
+        if collection_manifest.get("task") != metadata["task_name"]:
+            raise LeRobotStreamStartupError(
+                "connected task does not match the signed collection manifest"
+            )
+        if checkpoint_id != collection_manifest.get("checkpoint_id"):
+            raise LeRobotStreamStartupError(
+                "connected policy checkpoint does not match the signed collection manifest"
+            )
     if control_mode == "piperx_sim_dagger":
         metadata["piperx_embodiment_profile"] = "arx_x5_piperx_relative_v1"
         metadata["piperx_bridge_protocol"] = "robodojo_piperx_v3"
@@ -569,9 +650,17 @@ def recorder_for_env(task_env: Any, record_dir: str | None = None) -> LeRobotStr
         raise LeRobotStreamStartupError(
             f"Invalid direct LeRobot collection configuration: {exc}"
         ) from exc
+    metadata = _task_metadata(task_env)
+    snapshotter = None
+    if _env_bool("ROBODOJO_RECORD_SIM_STATE", False):
+        from src.eval_client.sim_state_snapshot import SimulatorStateSnapshotter
+
+        snapshotter = SimulatorStateSnapshotter(task_env)
+        metadata.update(snapshotter.metadata())
     return LeRobotStreamRecorder(
         config=config,
-        metadata=_task_metadata(task_env),
+        metadata=metadata,
+        snapshotter=snapshotter,
     )
 
 

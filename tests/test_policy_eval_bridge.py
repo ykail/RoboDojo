@@ -338,6 +338,20 @@ class PolicyV1EvalLoopTest(unittest.TestCase):
                 return self.actions
             return None
 
+    class _Recorder:
+        def __init__(self, events):
+            self.events = events
+            self.frames = []
+            self.finalize_calls = []
+
+        def append(self, **frame):
+            self.events.append(("record", frame["obs"]["index"]))
+            self.frames.append(frame)
+
+        def finalize(self, **outcome):
+            self.events.append(("finalize", outcome["reason"]))
+            self.finalize_calls.append(outcome)
+
     def test_local_terminal_preempts_chunk_and_keeps_per_step_observations(self):
         env = self._Env(stop_after=3)
         client = self._Client(list(range(10)))
@@ -358,6 +372,71 @@ class PolicyV1EvalLoopTest(unittest.TestCase):
                 self._Env(stop_after=1),
                 self._Client([]),
             )
+
+    def test_recording_is_pre_action_and_commits_timeout_failures(self):
+        events = []
+
+        class RecordingEnv(self._Env):
+            success = [False]
+            step_lim = 3
+            take_action_cnt = [0]
+            unstable_envs = set()
+
+            def take_action(inner_self, action):
+                events.append(("action", action))
+                super().take_action(action)
+                inner_self.take_action_cnt[0] += 1
+
+        env = RecordingEnv(stop_after=3)
+        recorder = self._Recorder(events)
+
+        run_single_env_policy_episode(
+            env,
+            self._Client(["a", "b", "c", "unused"]),
+            recorder=recorder,
+        )
+
+        self.assertEqual(
+            events[:6],
+            [
+                ("record", 1),
+                ("action", "a"),
+                ("record", 2),
+                ("action", "b"),
+                ("record", 3),
+                ("action", "c"),
+            ],
+        )
+        self.assertEqual(recorder.finalize_calls, [
+            {"accepted": True, "success": False, "reason": "step_limit"}
+        ])
+        self.assertEqual(
+            [frame["control"]["chunk_index"] for frame in recorder.frames],
+            [0, 1, 2],
+        )
+        self.assertTrue(
+            all(frame["control"]["intervention_mask"] == 0 for frame in recorder.frames)
+        )
+
+    def test_recording_discards_partial_episode_on_policy_error(self):
+        events = []
+        env = self._Env(stop_after=2)
+        env.success = [False]
+        env.step_lim = 2
+        env.take_action_cnt = [0]
+        env.unstable_envs = set()
+        recorder = self._Recorder(events)
+
+        with self.assertRaisesRegex(ValueError, "empty action chunk"):
+            run_single_env_policy_episode(
+                env,
+                self._Client([]),
+                recorder=recorder,
+            )
+
+        self.assertEqual(recorder.finalize_calls, [
+            {"accepted": False, "success": False, "reason": "rollout_exception"}
+        ])
 
 
 class PolicyV1LifecycleRunnerTest(unittest.TestCase):

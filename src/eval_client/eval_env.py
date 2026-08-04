@@ -71,6 +71,21 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.additional_info = self.eval_cfg.get("additional_info", "")
             self.eval_seed = self.eval_cfg.get("seed", 0)
             self.control_mode = self.eval_cfg.get("control_mode", "policy")
+            self.record_policy_rollouts = bool(
+                self.eval_cfg.get("record_policy_rollouts", False)
+            )
+            self.collection_id = str(self.eval_cfg.get("collection_id", ""))
+            self.collection_plan_hash = str(
+                self.eval_cfg.get("collection_plan_hash", "")
+            )
+            self.collection_manifest = self.eval_cfg.get("collection_manifest", None)
+            self.collection_plan_index_by_layout = {
+                int(layout_id): int(plan_index)
+                for layout_id, plan_index in dict(
+                    self.eval_cfg.get("collection_plan_index_by_layout", {})
+                ).items()
+            }
+            self.collection_plan_index = -1
             self.observation_mode = self.control_mode == "keyboard_observe"
             self.operator_driven = bool(
                 self.eval_cfg.get(
@@ -199,6 +214,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.seed_manager.init_eval(
                 completed_layout_ids=completed_layout_ids,
                 abandoned_layout_ids=abandoned_layout_ids,
+                selected_layout_ids=self.eval_cfg.get("selected_layout_ids", None),
             )
 
             self.deploy_cfg = config.deploy_cfg
@@ -290,6 +306,16 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             # Fill None positions with safe_seed so scene_manager can still load
             self.env_seeds = [s if s is not None else safe_seed for s in seed]
             self.layout_cycle = int(getattr(self.seed_manager, "cycle_index", 0))
+            if self.record_policy_rollouts and real_indices:
+                layout_id = int(self.env_seeds[real_indices[0]])
+                try:
+                    self.collection_plan_index = self.collection_plan_index_by_layout[
+                        layout_id
+                    ]
+                except KeyError as exc:
+                    raise ValueError(
+                        f"collection plan has no index for layout {layout_id}"
+                    ) from exc
 
             self.success = [True] * self.num_envs
             self.end_flag = [False] * self.num_envs
@@ -383,7 +409,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
             data_list = []
             for env_idx in env_idx_list:
-                if not self.operator_driven and not self.observation_mode and (not self.end_flag[env_idx] or last_frame):
+                if (
+                    not self.operator_driven
+                    and not self.observation_mode
+                    and not self.record_policy_rollouts
+                    and (not self.end_flag[env_idx] or last_frame)
+                ):
                     self._stream_vision(env_idx, data[env_idx])
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
@@ -409,7 +440,16 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 run_piperx_sim_dagger_episode(self, self.model_client)
                 return
             if self.policy_runtime == "robodojo_policy_v1":
-                run_single_env_policy_episode(self, self.model_client)
+                recorder = None
+                if self.record_policy_rollouts:
+                    from src.eval_client.lerobot_stream_recorder import recorder_for_env
+
+                    recorder = recorder_for_env(self)
+                run_single_env_policy_episode(
+                    self,
+                    self.model_client,
+                    recorder=recorder,
+                )
                 return
             policy_name = self.deploy_cfg["policy_name"]
             try:
@@ -1007,7 +1047,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     "success": bool(self.success[env_idx]),
                     "score": episode_score,
                 }
-                if not self.operator_driven:
+                if self.record_policy_rollouts:
+                    self.eval_result["details"][index]["collection_plan_index"] = int(
+                        self.collection_plan_index
+                    )
+                if not self.operator_driven and not self.record_policy_rollouts:
                     video_path = os.path.join(self.save_dir, f"episode_{index:07d}.mp4")
                     self.save_video(env_idx, video_path, tag)
 
@@ -1022,14 +1066,16 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 self.eval_result["success_rate"] = self.success_nums / eval_time
                 self.eval_result["score"] = self.total_score / eval_time * 100
             self.eval_result["eval_time"] = eval_time
-            save_json(self.eval_result, os.path.join(self.save_dir, "_result.json"))
+            if not self.record_policy_rollouts:
+                save_json(self.eval_result, os.path.join(self.save_dir, "_result.json"))
             # Refresh the resume manifest at the end of every batch so that a
             # downstream SIGABRT (which beats the in-process PhysXFatalError
             # handler) still recovers everything up to the previous batch.
-            try:
-                self.persist_resume_manifest()
-            except Exception as e:
-                print(f"[EvalEnv] persist_resume_manifest after run_eval failed: {e}")
+            if not self.record_policy_rollouts:
+                try:
+                    self.persist_resume_manifest()
+                except Exception as e:
+                    print(f"[EvalEnv] persist_resume_manifest after run_eval failed: {e}")
 
         def is_episode_end(self):
             if self.operator_driven:

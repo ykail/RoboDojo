@@ -35,6 +35,12 @@ RoboDojo simulation:
                               (default: policy)
   --headless                  Disable the Isaac Sim window (GUI is the default)
 
+Automatic policy rollout recording:
+  --record-rollouts           Save every normal policy rollout as LeRobot v3
+                              plus a frame-aligned simulator-state sidecar.
+                              Requires collection metadata supplied by
+                              collect_kai0_rollouts.sh.
+
 Intervention recording:
   --lerobot-root PATH         Dataset parent (default: $HOME/data/lerobot)
   --lerobot-repo-id ID        Dataset name
@@ -99,6 +105,7 @@ seed="0"
 policy_seed=""
 control_mode="policy"
 headless="0"
+record_rollouts="0"
 lerobot_root="${ROBODOJO_LEROBOT_ROOT:-${HOME}/data/lerobot}"
 lerobot_repo_id="${ROBODOJO_LEROBOT_REPO_ID:-}"
 resume="0"
@@ -178,6 +185,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --headless)
       headless="1"
+      shift
+      ;;
+    --record-rollouts)
+      record_rollouts="1"
       shift
       ;;
     --lerobot-root)
@@ -298,6 +309,20 @@ esac
 if [[ "${headless}" == "1" && "${control_mode}" != "policy" ]]; then
   die "--headless cannot be combined with an interactive/observation control mode"
 fi
+if [[ "${record_rollouts}" == "1" ]]; then
+  [[ "${control_mode}" == "policy" ]] \
+    || die "--record-rollouts requires --control-mode policy"
+  [[ -n "${ROBODOJO_ROLLOUT_LAYOUT_IDS:-}" ]] \
+    || die "--record-rollouts must be launched through collect_kai0_rollouts.sh (missing layout ids)"
+  [[ -n "${ROBODOJO_COLLECTION_ID:-}" ]] \
+    || die "--record-rollouts is missing ROBODOJO_COLLECTION_ID"
+  [[ -n "${ROBODOJO_COLLECTION_PLAN_HASH:-}" ]] \
+    || die "--record-rollouts is missing ROBODOJO_COLLECTION_PLAN_HASH"
+  [[ -n "${ROBODOJO_COLLECTION_PLAN_INDEX_MAP:-}" ]] \
+    || die "--record-rollouts is missing ROBODOJO_COLLECTION_PLAN_INDEX_MAP"
+  [[ -n "${ROBODOJO_COLLECTION_MANIFEST_JSON:-}" ]] \
+    || die "--record-rollouts is missing ROBODOJO_COLLECTION_MANIFEST_JSON"
+fi
 
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   case "${piperx_bridge_host}" in
@@ -344,10 +369,17 @@ fi
 [[ -x "${kai0_python}" ]] || die "Kai0 Python is not executable: ${kai0_python}"
 kai0_python="$(cd "$(dirname "${kai0_python}")" && pwd -P)/$(basename "${kai0_python}")"
 
+needs_lerobot="0"
 if [[ "${control_mode}" == "keyboard_intervention" \
-  || "${control_mode}" == "piperx_sim_dagger" ]]; then
+  || "${control_mode}" == "piperx_sim_dagger" \
+  || "${record_rollouts}" == "1" ]]; then
+  needs_lerobot="1"
   if [[ -z "${lerobot_repo_id}" ]]; then
-    lerobot_repo_id="robodojo_interventions_${task}"
+    if [[ "${record_rollouts}" == "1" ]]; then
+      lerobot_repo_id="robodojo_rollouts_${task}"
+    else
+      lerobot_repo_id="robodojo_interventions_${task}"
+    fi
   fi
   if [[ "${lerobot_repo_id}" == /* \
     || "${lerobot_repo_id}" == */ \
@@ -426,12 +458,9 @@ eval_environment=(
   "HEADLESS=${headless}"
   "LIVESTREAM=0"
 )
-if [[ "${control_mode}" == "keyboard_intervention" \
-  || "${control_mode}" == "piperx_sim_dagger" ]]; then
+additional_info="kai0_pi05_strict_v1"
+if [[ "${needs_lerobot}" == "1" ]]; then
   eval_environment+=(
-    "ROBODOJO_OPERATOR_DRIVEN=1"
-    "ROBODOJO_REALTIME=1"
-    "ROBODOJO_HIDE_ISAACLAB_WINDOW=1"
     "ROBODOJO_LEROBOT_PYTHON=${kai0_python}"
     "ROBODOJO_LEROBOT_ROOT=${lerobot_root}"
     "ROBODOJO_LEROBOT_REPO_ID=${lerobot_repo_id}"
@@ -442,6 +471,21 @@ if [[ "${control_mode}" == "keyboard_intervention" \
     "ROBODOJO_TASK_NAME=${task}"
     "ROBODOJO_ENV_CFG=arx_x5"
     "ROBODOJO_CHECKPOINT=${checkpoint_id}"
+  )
+fi
+if [[ "${control_mode}" == "keyboard_intervention" \
+  || "${control_mode}" == "piperx_sim_dagger" ]]; then
+  eval_environment+=(
+    "ROBODOJO_OPERATOR_DRIVEN=1"
+    "ROBODOJO_REALTIME=1"
+    "ROBODOJO_HIDE_ISAACLAB_WINDOW=1"
+  )
+fi
+if [[ "${record_rollouts}" == "1" ]]; then
+  additional_info="kai0_pi05_rollout_collection_${ROBODOJO_COLLECTION_ID}"
+  eval_environment+=(
+    "ROBODOJO_RECORD_POLICY_ROLLOUTS=1"
+    "ROBODOJO_RECORD_SIM_STATE=1"
   )
 fi
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
@@ -467,7 +511,7 @@ eval_cmd=(
   --device_id "${env_gpu}"
   --policy_name Kai0_Pi05
   --port "${port}"
-  --additional_info kai0_pi05_strict_v1
+  --additional_info "${additional_info}"
   --seed "${seed}"
   --host "${server_host}"
   --protocol ws
@@ -481,9 +525,11 @@ echo "[eval_kai0_pi05] task=${task} eval_num=${eval_num} control_mode=${control_
 echo "[eval_kai0_pi05] checkpoint=${checkpoint_dir} checkpoint_id=${checkpoint_id}"
 echo "[eval_kai0_pi05] Kai0=${kai0_root} policy_gpu=${policy_gpu} env_gpu=${env_gpu}"
 echo "[eval_kai0_pi05] policy_url=${policy_url} headless=${headless}"
-if [[ "${control_mode}" == "keyboard_intervention" \
-  || "${control_mode}" == "piperx_sim_dagger" ]]; then
+if [[ "${needs_lerobot}" == "1" ]]; then
   echo "[eval_kai0_pi05] LeRobot=${lerobot_root%/}/${lerobot_repo_id} resume=${resume}"
+fi
+if [[ "${record_rollouts}" == "1" ]]; then
+  echo "[eval_kai0_pi05] rollout_collection=${ROBODOJO_COLLECTION_ID} layouts=${ROBODOJO_ROLLOUT_LAYOUT_IDS}"
 fi
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   echo "[eval_kai0_pi05] PiPER-X bridge=${piperx_bridge_host}:${piperx_bridge_port}"

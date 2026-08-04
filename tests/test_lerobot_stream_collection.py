@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -14,6 +15,7 @@ import numpy as np
 from scripts.RoboDojo import lerobot_stream_writer as writer
 from src.eval_client.lerobot_stream_protocol import receive_message, send_message
 from src.eval_client.lerobot_stream_recorder import (
+    LeRobotStreamError,
     LeRobotStreamRecorder,
     LeRobotStreamStartupError,
     StreamConfig,
@@ -179,6 +181,16 @@ def _all_packets(stream):
 
 
 class LeRobotStreamWriterTest(unittest.TestCase):
+    def test_replay_buffer_rejects_equal_count_but_misaligned_frame_identity(self):
+        replay = writer._ReplayStateBuffer(enabled=True, fps=25)
+        with self.assertRaisesRegex(writer.ReplayStateError, "index mismatch"):
+            replay.append(
+                {
+                    "frame.index": np.asarray(1, dtype=np.int64),
+                    "frame.timestamp_s": np.asarray(0.0, dtype=np.float64),
+                }
+            )
+
     def test_episode_metadata_preserves_strict_policy_provenance(self):
         provenance = {
             "implementation": "kai0",
@@ -299,6 +311,96 @@ class LeRobotStreamWriterTest(unittest.TestCase):
             self.assertEqual(metadata["robodojo_layout_cycle"], 2)
             self.assertTrue(metadata["robodojo_success"])
             self.assertEqual(dataset.finalized, 1)
+
+    def test_policy_rollout_commit_writes_frame_aligned_replay_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp) / "test"
+            (dataset_root / "meta").mkdir(parents=True)
+            (dataset_root / "meta" / "info.json").write_text(
+                json.dumps({"total_episodes": 0, "total_frames": 0}),
+                encoding="utf-8",
+            )
+            dataset = _FakeDataset()
+            config = writer.WriterConfig(
+                repo_id="test", root=Path(tmp), fps=25, resume=False,
+                vcodec="h264", encoder_threads=1,
+            )
+            frame = _frame_message()
+            frame["sim_state"] = {
+                "frame.index": np.asarray(0, dtype=np.int64),
+                "frame.timestamp_s": np.asarray(0.0, dtype=np.float64),
+                "robot.000.joint_pos": np.asarray([1.0, 2.0], dtype=np.float32),
+            }
+            terminal = {
+                "frame.index": np.asarray(1, dtype=np.int64),
+                "frame.timestamp_s": np.asarray(1 / 25, dtype=np.float64),
+                "robot.000.joint_pos": np.asarray([3.0, 4.0], dtype=np.float32),
+            }
+            saved_layout = {"Rigid": []}
+            saved_layout_sha256 = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    saved_layout,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            output = io.BytesIO()
+            status = writer.serve(
+                config,
+                _packet_stream(
+                    [
+                        {
+                            "command": "begin",
+                            "metadata": {
+                                "task_name": "make_toast",
+                                "recording_kind": "policy_rollout",
+                                "record_sim_state": True,
+                                "replay_manifest": {"profile": "test"},
+                                "replay_saved_layout": saved_layout,
+                                "replay_layout_sha256": saved_layout_sha256,
+                            },
+                        },
+                        frame,
+                        {
+                            "command": "finish",
+                            "accepted": True,
+                            "success": False,
+                            "reason": "step_limit",
+                            "terminal_sim_state": terminal,
+                        },
+                    ]
+                ),
+                output,
+                dataset_opener=lambda _config: (dataset, True),
+            )
+
+            self.assertEqual(status, 0)
+            state_path = (
+                dataset_root
+                / "data"
+                / "robodojo_replay"
+                / "chunk-000"
+                / "episode_0000000.npz"
+            )
+            self.assertTrue(state_path.is_file())
+            with np.load(state_path, allow_pickle=False) as replay:
+                self.assertEqual(replay["frame_count"].item(), 1)
+                np.testing.assert_array_equal(
+                    replay["frame__robot.000.joint_pos"], [[1.0, 2.0]]
+                )
+                np.testing.assert_array_equal(
+                    replay["terminal__robot.000.joint_pos"], [3.0, 4.0]
+                )
+            metadata_path = (
+                dataset_root
+                / writer._ROBODOJO_EPISODE_METADATA_DIR
+                / "episode_0000000.json"
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertTrue(metadata["robodojo_replay"]["complete"])
+            self.assertEqual(metadata["robodojo_replay"]["snapshot_count"], 1)
+            self.assertEqual(metadata["robodojo_recording_kind"], "policy_rollout")
 
     def test_failed_later_commit_restores_exact_tree_and_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -626,10 +728,14 @@ class LeRobotStreamWriterTest(unittest.TestCase):
 class _FakeSidecar:
     def __init__(self):
         self.finish_calls = []
+        self.shutdown_calls = 0
 
     def finish(self, **kwargs):
         self.finish_calls.append(kwargs)
         return {"status": "discarded", "frame_count": 0}
+
+    def shutdown(self):
+        self.shutdown_calls += 1
 
 
 class LeRobotStreamRecorderTest(unittest.TestCase):
@@ -757,6 +863,32 @@ class LeRobotStreamRecorderTest(unittest.TestCase):
         self.assertEqual(recorder.record_dir, "/data/dataset")
         self.assertIsNone(recorder.finalize(accepted=True, success=False, reason="escape"))
         self.assertEqual(fake.finish_calls[0]["accepted"], False)
+
+    def test_terminal_snapshot_failure_discards_writer_candidate(self):
+        class FailingSnapshotter:
+            def capture(self, frame_index):
+                raise ValueError(f"injected terminal capture failure at {frame_index}")
+
+        fake = _FakeSidecar()
+        config = StreamConfig(
+            python=Path("/python"), project_root=Path("/repo"), repo_id="dataset",
+            root=Path("/data"), fps=25, resume=False, vcodec="h264",
+            encoder_threads=1, encoder_queue_maxsize=8, video_crf=18,
+        )
+        with mock.patch(
+            "src.eval_client.lerobot_stream_recorder._acquire_sidecar", return_value=fake
+        ):
+            recorder = LeRobotStreamRecorder(
+                config,
+                {"task_name": "make_toast"},
+                snapshotter=FailingSnapshotter(),
+            )
+        recorder._frame_count = 1
+
+        with self.assertRaisesRegex(LeRobotStreamError, "terminal capture failure"):
+            recorder.finalize(accepted=True, success=False, reason="step_limit")
+
+        self.assertEqual(fake.shutdown_calls, 1)
 
 
 if __name__ == "__main__":

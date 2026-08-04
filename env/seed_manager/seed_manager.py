@@ -33,6 +33,7 @@ class SeedManager:
         self,
         completed_layout_ids: Iterable[int] | None = None,
         abandoned_layout_ids: Iterable[int] | None = None,
+        selected_layout_ids: Iterable[int] | None = None,
     ):
         self.eval_seed = self.config.get("seed", 0)
         layout_dir = Path(ASSETS_PATH, "Eval_Layout", BENCHMARK, self.config_name, str(self.eval_seed))
@@ -44,10 +45,34 @@ class SeedManager:
 
         matching_files = [str(p) for p in matching_files]
         self.seed_info = {}
-        for idx, file_path in enumerate(matching_files):
-            self.seed_info[idx] = {"scene_layout": file_path}
-
-        all_layout_ids = list(range(len(matching_files)))
+        if selected_layout_ids is None:
+            # Preserve the benchmark's historical dense 0..N-1 indexing.
+            # Collection-only selection below uses the filename suffix so an
+            # explicit plan cannot silently point at the wrong sparse file.
+            for idx, file_path in enumerate(matching_files):
+                self.seed_info[idx] = {"scene_layout": file_path}
+            all_layout_ids = list(range(len(matching_files)))
+        else:
+            selected = [int(layout_id) for layout_id in selected_layout_ids]
+            if any(layout_id < 0 for layout_id in selected):
+                raise ValueError("selected layout ids must be non-negative")
+            if len(selected) != len(set(selected)):
+                raise ValueError(f"selected layout ids contain duplicates: {selected}")
+            file_by_suffix = {
+                int(Path(file_path).stem.rsplit("_", 1)[-1]): file_path
+                for file_path in matching_files
+            }
+            missing = [layout_id for layout_id in selected if layout_id not in file_by_suffix]
+            if missing:
+                raise ValueError(
+                    f"Requested {self.task_name} layout id(s) do not exist for "
+                    f"eval seed {self.eval_seed}: {missing}"
+                )
+            for layout_id in selected:
+                self.seed_info[layout_id] = {
+                    "scene_layout": file_by_suffix[layout_id]
+                }
+            all_layout_ids = selected
         excluded = set(int(s) for s in (completed_layout_ids or [])) | set(int(s) for s in (abandoned_layout_ids or []))
         if excluded:
             self.seed_list: List[int] = [s for s in all_layout_ids if s not in excluded]

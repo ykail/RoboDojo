@@ -172,6 +172,7 @@ from src.eval_client.intervention_loop import (
     InterventionSavedForRetry,
 )
 from src.eval_client.lerobot_stream_recorder import (
+    LeRobotStreamError,
     LeRobotStreamStartupError,
     close_lerobot_stream_session,
 )
@@ -181,11 +182,112 @@ from src.eval_client.piperx_bridge_client import (
     close_piperx_bridge_session,
 )
 from src.eval_client.policy_runtime import PolicyClientError, ResetReason
+from src.eval_client.rollout_collection import (
+    committed_plan_indices,
+    dataset_root as collection_dataset_root,
+    parse_layout_ids,
+    parse_plan_index_map,
+    validate_collection_manifest,
+)
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
 
 BENCHMARK_PATH = os.path.join(ROOT_DIR, "task", BENCHMARK)
+
+
+def _environment_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be 0/1 or true/false, got {value!r}")
+
+
+def _rollout_collection_settings(task_name, eval_seed, policy_seed):
+    layout_ids = parse_layout_ids(
+        os.environ.get("ROBODOJO_ROLLOUT_LAYOUT_IDS", "")
+    )
+    if not layout_ids:
+        raise ValueError(
+            "ROBODOJO_ROLLOUT_LAYOUT_IDS is required for policy rollout collection"
+        )
+    plan_index_by_layout = parse_plan_index_map(
+        os.environ.get("ROBODOJO_COLLECTION_PLAN_INDEX_MAP", "")
+    )
+    if set(plan_index_by_layout) != set(layout_ids):
+        raise ValueError(
+            "collection plan-index map keys must exactly match rollout layout ids"
+        )
+    try:
+        manifest = json.loads(
+            os.environ.get("ROBODOJO_COLLECTION_MANIFEST_JSON", "")
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("ROBODOJO_COLLECTION_MANIFEST_JSON is invalid") from exc
+    validate_collection_manifest(manifest)
+    if manifest.get("task") != task_name:
+        raise ValueError(
+            f"collection task mismatch: {manifest.get('task')!r} != {task_name!r}"
+        )
+    collection_id = os.environ.get("ROBODOJO_COLLECTION_ID", "")
+    plan_hash = os.environ.get("ROBODOJO_COLLECTION_PLAN_HASH", "")
+    if collection_id != manifest["collection_id"]:
+        raise ValueError("collection id does not match signed collection manifest")
+    if plan_hash != manifest["plan_hash"]:
+        raise ValueError("collection plan hash does not match signed manifest")
+    policy_seed_spec = manifest["policy_seed"]
+    expected_policy_seed = (
+        int(eval_seed)
+        if policy_seed_spec["mode"] == "eval_seed"
+        else int(policy_seed_spec["value"])
+    )
+    if int(policy_seed) != expected_policy_seed:
+        raise ValueError(
+            f"policy seed {policy_seed} does not match signed collection value "
+            f"{expected_policy_seed}"
+        )
+
+    expected = {
+        (int(entry["eval_seed"]), int(entry["layout_id"])): int(
+            entry["plan_index"]
+        )
+        for entry in manifest["entries"]
+    }
+    for layout_id, plan_index in plan_index_by_layout.items():
+        if expected.get((int(eval_seed), layout_id)) != plan_index:
+            raise ValueError(
+                f"seed={eval_seed} layout={layout_id} plan_index={plan_index} "
+                "does not match collection manifest"
+            )
+
+    root = collection_dataset_root(
+        os.environ.get("ROBODOJO_LEROBOT_ROOT", ""),
+        os.environ.get("ROBODOJO_LEROBOT_REPO_ID", ""),
+    )
+    completed = committed_plan_indices(root, manifest)
+    remaining = [
+        layout_id
+        for layout_id in layout_ids
+        if plan_index_by_layout[layout_id] not in completed
+    ]
+    skipped = len(layout_ids) - len(remaining)
+    if skipped:
+        print(
+            f"[Rollout] durable dataset metadata already completed {skipped}/"
+            f"{len(layout_ids)} requested layout(s); skipping them."
+        )
+    return {
+        "layout_ids": remaining,
+        "plan_index_by_layout": plan_index_by_layout,
+        "manifest": manifest,
+        "collection_id": collection_id,
+        "plan_hash": plan_hash,
+    }
 
 
 def _load_policy_deploy(policy_name):
@@ -328,6 +430,20 @@ def main():
         )
     operator_driven = control_mode in {"keyboard_intervention", "piperx_sim_dagger"}
     observation_mode = control_mode == "keyboard_observe"
+    record_policy_rollouts = _environment_bool(
+        "ROBODOJO_RECORD_POLICY_ROLLOUTS", False
+    )
+    if record_policy_rollouts:
+        if control_mode != "policy":
+            raise ValueError("policy rollout recording requires control_mode=policy")
+        if policy_runtime != "robodojo_policy_v1":
+            raise ValueError(
+                "policy rollout recording requires policy_runtime=robodojo_policy_v1"
+            )
+        if not _environment_bool("ROBODOJO_RECORD_SIM_STATE", False):
+            raise ValueError(
+                "policy rollout collection requires ROBODOJO_RECORD_SIM_STATE=1"
+            )
     if control_mode in {"keyboard_intervention", "keyboard_observe"}:
         if policy_runtime == "xpolicy_ws_v0" and args_cli.policy_name != "Pi_05":
             raise ValueError("Interactive keyboard modes are currently validated only for policy_name=Pi_05.")
@@ -380,6 +496,7 @@ def main():
     eval_cfg["operator_driven"] = operator_driven
     eval_cfg["observation_mode"] = observation_mode
     eval_cfg["policy_runtime"] = policy_runtime
+    eval_cfg["record_policy_rollouts"] = record_policy_rollouts
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
@@ -454,7 +571,27 @@ def main():
                 f"got {collect_freq}",
             )
 
-    if os.environ.get("EVAL_NUM") and not operator_driven:
+    collection_settings = None
+    if record_policy_rollouts:
+        collection_settings = _rollout_collection_settings(
+            task_name,
+            eval_cfg["seed"],
+            args_cli.policy_seed,
+        )
+        eval_num = len(collection_settings["layout_ids"])
+        eval_cfg["selected_layout_ids"] = collection_settings["layout_ids"]
+        eval_cfg["collection_plan_index_by_layout"] = collection_settings[
+            "plan_index_by_layout"
+        ]
+        eval_cfg["collection_manifest"] = collection_settings["manifest"]
+        eval_cfg["collection_id"] = collection_settings["collection_id"]
+        eval_cfg["collection_plan_hash"] = collection_settings["plan_hash"]
+        print(
+            f"[Rollout] collection={collection_settings['collection_id']} "
+            f"seed={eval_cfg['seed']} remaining={eval_num} "
+            f"layouts={collection_settings['layout_ids']}"
+        )
+    elif os.environ.get("EVAL_NUM") and not operator_driven:
         _env_eval_num = os.environ.get("EVAL_NUM")
         if str(_env_eval_num).lower() != "native":
             eval_num = min(int(_env_eval_num), int(eval_num))
@@ -469,7 +606,14 @@ def main():
 
     env_cfg.sim.seed = [0 for _ in range(num_envs)]
     run_id = os.environ["ROBODOJO_RUN_ID"]
-    resume_state = _load_resume_manifest(eval_cfg, run_id)
+    # The atomically committed LeRobot episode metadata is the only progress
+    # authority for automatic collections. Benchmark resume manifests can lag
+    # a successful dataset commit and would otherwise duplicate that layout.
+    resume_state = (
+        None
+        if record_policy_rollouts
+        else _load_resume_manifest(eval_cfg, run_id)
+    )
     env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
     eval_time = env.success_nums + env.fail_nums
     if operator_driven:
@@ -541,11 +685,11 @@ def main():
         except ObservationExit:
             print(f"[Observer] exit requested after {observed_count}/{eval_num} completed layout(s).")
             operator_stop_requested = True
-        except LeRobotStreamStartupError as e:
+        except (LeRobotStreamStartupError, LeRobotStreamError) as e:
             # Retrying cannot repair a bad codec, incompatible existing
             # dataset, missing environment, or a second writer holding the
             # dataset lock.  Stop cleanly instead of reloading Isaac forever.
-            print(f"[Intervention][FATAL] {e}", flush=True)
+            print(f"[LeRobot][FATAL] {e}", flush=True)
             env.close()
             operator_fatal_error = e
             operator_stop_requested = True

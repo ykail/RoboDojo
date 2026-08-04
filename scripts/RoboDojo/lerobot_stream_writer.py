@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-only LeRobot v3 streaming writer used by keyboard intervention.
+"""CPU-only LeRobot v3 streaming writer used by RoboDojo collection modes.
 
 The Isaac process deliberately does not import LeRobot.  It sends one frame at
 a time to this sidecar and waits for an acknowledgement.  Rejected candidates
@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import sys
@@ -51,6 +53,12 @@ _JOINT_PARTS = (
 _STAGING_MARKER = ".robodojo_lerobot_staging.json"
 _COLLECTION_SESSION_MARKER = ".robodojo_collection_session.json"
 _ROBODOJO_EPISODE_METADATA_DIR = Path("meta/robodojo/episodes")
+_ROBODOJO_COLLECTIONS_DIR = Path("meta/robodojo/collections")
+_ROBODOJO_REPLAY_LAYOUTS_DIR = Path("meta/robodojo/replay/layouts")
+_ROBODOJO_REPLAY_SCHEMA_PATH = Path("meta/robodojo/replay/schema.json")
+_ROBODOJO_REPLAY_DATA_DIR = Path("data/robodojo_replay")
+_REPLAY_FIELD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,191}")
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _ROLLBACK_FILE_PATHS = (
     Path("meta/info.json"),
     Path("meta/stats.json"),
@@ -65,6 +73,10 @@ class EpisodeCommitError(RuntimeError):
 
 class CommitRollbackError(EpisodeCommitError):
     """An accepted commit failed and its on-disk rollback was incomplete."""
+
+
+class ReplayStateError(EpisodeCommitError):
+    """A simulator-state stream is incomplete or changed schema mid-episode."""
 
 
 @dataclass(frozen=True)
@@ -638,6 +650,353 @@ def _wait_for_encoder_headroom(dataset: Any, timeout_s: float) -> None:
         time.sleep(0.005)
 
 
+class _ReplayStateBuffer:
+    """Validate and retain one small numeric simulator snapshot per frame."""
+
+    def __init__(self, *, enabled: bool, fps: int):
+        self.enabled = bool(enabled)
+        self.fps = int(fps)
+        if self.fps <= 0:
+            raise ValueError("replay state FPS must be positive")
+        self._field_schema: dict[str, tuple[tuple[int, ...], str]] | None = None
+        self._frames: dict[str, list[np.ndarray]] = {}
+        self._terminal: dict[str, np.ndarray] | None = None
+
+    @property
+    def frame_count(self) -> int:
+        if self._field_schema is None:
+            return 0
+        first_key = next(iter(self._field_schema), None)
+        return len(self._frames[first_key]) if first_key is not None else 0
+
+    @property
+    def field_schema(self) -> list[dict[str, Any]]:
+        if self._field_schema is None:
+            return []
+        return [
+            {"key": key, "shape": list(shape), "dtype": dtype}
+            for key, (shape, dtype) in self._field_schema.items()
+        ]
+
+    @staticmethod
+    def _normalise(state: Any) -> dict[str, np.ndarray]:
+        if not isinstance(state, dict) or not state:
+            raise ReplayStateError("sim_state must be a non-empty dictionary")
+        result: dict[str, np.ndarray] = {}
+        for key in sorted(state):
+            if not isinstance(key, str) or not _REPLAY_FIELD_RE.fullmatch(key):
+                raise ReplayStateError(f"invalid simulator-state field name: {key!r}")
+            array = np.asarray(state[key])
+            if array.dtype.kind not in "biuf":
+                raise ReplayStateError(
+                    f"simulator-state field {key!r} is not numeric: {array.dtype}"
+                )
+            if array.dtype.kind == "f" and not np.isfinite(array).all():
+                raise ReplayStateError(
+                    f"simulator-state field {key!r} contains non-finite values"
+                )
+            # np.ascontiguousarray promotes a scalar from shape () to (1,),
+            # which would destroy the frame-index/timestamp identity schema.
+            result[key] = np.array(array, copy=True, order="C")
+        return result
+
+    def _validate_schema(self, state: dict[str, np.ndarray]) -> None:
+        schema = {
+            key: (tuple(array.shape), array.dtype.str)
+            for key, array in state.items()
+        }
+        if self._field_schema is None:
+            self._field_schema = schema
+            self._frames = {key: [] for key in schema}
+        elif schema != self._field_schema:
+            raise ReplayStateError(
+                "simulator-state schema changed within an episode "
+                f"(expected={self._field_schema}, got={schema})"
+            )
+
+    def append(self, state: Any) -> None:
+        if not self.enabled:
+            if state is not None:
+                raise ReplayStateError("received sim_state while replay recording is disabled")
+            return
+        normalised = self._normalise(state)
+        self._validate_frame_identity(
+            normalised,
+            expected_index=self.frame_count,
+            label="frame",
+        )
+        self._validate_schema(normalised)
+        for key, array in normalised.items():
+            self._frames[key].append(array)
+
+    def set_terminal(self, state: Any) -> None:
+        if not self.enabled:
+            if state is not None:
+                raise ReplayStateError(
+                    "received terminal_sim_state while replay recording is disabled"
+                )
+            return
+        normalised = self._normalise(state)
+        self._validate_frame_identity(
+            normalised,
+            expected_index=self.frame_count,
+            label="terminal frame",
+        )
+        self._validate_schema(normalised)
+        self._terminal = normalised
+
+    def _validate_frame_identity(
+        self,
+        state: dict[str, np.ndarray],
+        *,
+        expected_index: int,
+        label: str,
+    ) -> None:
+        index = state.get("frame.index")
+        timestamp = state.get("frame.timestamp_s")
+        if index is None or index.shape != () or index.dtype.kind not in "iu":
+            raise ReplayStateError(f"{label} requires a scalar integer frame.index")
+        if int(index) != expected_index:
+            raise ReplayStateError(
+                f"{label} index mismatch: expected {expected_index}, got {int(index)}"
+            )
+        if timestamp is None or timestamp.shape != () or timestamp.dtype.kind != "f":
+            raise ReplayStateError(
+                f"{label} requires a scalar floating-point frame.timestamp_s"
+            )
+        expected_timestamp = expected_index / self.fps
+        if not np.isclose(float(timestamp), expected_timestamp, rtol=0.0, atol=1e-9):
+            raise ReplayStateError(
+                f"{label} timestamp mismatch: expected {expected_timestamp}, "
+                f"got {float(timestamp)}"
+            )
+
+    def npz_payload(self) -> dict[str, np.ndarray]:
+        if not self.enabled:
+            return {}
+        if self._field_schema is None or self.frame_count <= 0:
+            raise ReplayStateError("replay recording has no frame snapshots")
+        if self._terminal is None:
+            raise ReplayStateError("replay recording has no terminal snapshot")
+        payload: dict[str, np.ndarray] = {
+            "format_version": np.asarray(1, dtype=np.int64),
+            "frame_count": np.asarray(self.frame_count, dtype=np.int64),
+        }
+        for key in self._field_schema:
+            payload[f"frame__{key}"] = np.stack(self._frames[key], axis=0)
+            payload[f"terminal__{key}"] = self._terminal[key]
+        return payload
+
+
+def _ensure_real_directory(root: Path, relative: Path) -> Path:
+    root = root.expanduser().resolve(strict=True)
+    directory = root
+    for component in _validate_relative_path(relative).parts:
+        directory = directory / component
+        try:
+            path_stat = directory.lstat()
+        except FileNotFoundError:
+            try:
+                directory.mkdir(mode=0o755)
+            except FileExistsError:
+                pass
+            path_stat = directory.lstat()
+        if not stat.S_ISDIR(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode):
+            raise EpisodeCommitError(
+                f"RoboDojo sidecar directory must be a real directory: {directory}"
+            )
+    if directory.resolve(strict=True) != directory:
+        raise EpisodeCommitError(f"RoboDojo sidecar directory escapes dataset: {directory}")
+    return directory
+
+
+def _publish_json(
+    root: Path,
+    relative: Path,
+    payload: dict[str, Any],
+    *,
+    allow_identical: bool = False,
+) -> Path:
+    relative = _validate_relative_path(relative)
+    directory = _ensure_real_directory(root, relative.parent)
+    target = directory / relative.name
+    contents = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if os.path.lexists(target):
+        path_stat = target.lstat()
+        if (
+            allow_identical
+            and stat.S_ISREG(path_stat.st_mode)
+            and not stat.S_ISLNK(path_stat.st_mode)
+            and target.read_bytes() == contents
+        ):
+            return target
+        raise EpisodeCommitError(f"RoboDojo sidecar already exists or differs: {target}")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.tmp-", dir=directory
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, target, follow_symlinks=False)
+        temporary.unlink()
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def _publish_npz(root: Path, relative: Path, payload: dict[str, np.ndarray]) -> Path:
+    relative = _validate_relative_path(relative)
+    directory = _ensure_real_directory(root, relative.parent)
+    target = directory / relative.name
+    if os.path.lexists(target):
+        raise EpisodeCommitError(f"RoboDojo replay state already exists: {target}")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.tmp-", dir=directory
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            np.savez_compressed(stream, **payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, target, follow_symlinks=False)
+        temporary.unlink()
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _write_collection_manifest(
+    dataset_root: Path,
+    metadata: dict[str, Any],
+) -> Path | None:
+    plan = metadata.get("collection_manifest")
+    if plan is None:
+        return None
+    if not isinstance(plan, dict):
+        raise EpisodeCommitError("collection_manifest must be an object")
+    collection_id = str(plan.get("collection_id", ""))
+    if not _SAFE_ID_RE.fullmatch(collection_id):
+        raise EpisodeCommitError(f"unsafe collection id: {collection_id!r}")
+    payload = {
+        "format_version": 1,
+        "plan": plan,
+        "policy_provenance": metadata.get("policy_provenance", {}),
+        "runtime_provenance": metadata.get("runtime_provenance", {}),
+    }
+    return _publish_json(
+        dataset_root,
+        _ROBODOJO_COLLECTIONS_DIR / f"{collection_id}.json",
+        payload,
+        allow_identical=True,
+    )
+
+
+def _write_replay_bundle(
+    dataset_root: Path,
+    episode_index: int,
+    metadata: dict[str, Any],
+    replay: _ReplayStateBuffer,
+) -> dict[str, Any] | None:
+    if not replay.enabled:
+        return None
+    manifest = metadata.get("replay_manifest")
+    saved_layout = metadata.get("replay_saved_layout")
+    layout_sha256 = str(metadata.get("replay_layout_sha256", ""))
+    if not isinstance(manifest, dict) or saved_layout is None:
+        raise ReplayStateError("replay manifest and saved layout are required")
+    actual_layout_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(
+            saved_layout,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if layout_sha256 != actual_layout_sha256:
+        raise ReplayStateError(
+            "saved layout content does not match replay_layout_sha256"
+        )
+
+    schema_payload = {
+        "format_version": 1,
+        "container": "numpy_npz_compressed",
+        "allow_pickle": False,
+        "frame_key_prefix": "frame__",
+        "terminal_key_prefix": "terminal__",
+        "frame_semantics": "pre_action_observation_t_and_action_t",
+    }
+    schema_path = _publish_json(
+        dataset_root,
+        _ROBODOJO_REPLAY_SCHEMA_PATH,
+        schema_payload,
+        allow_identical=True,
+    )
+    schema_sha256 = _sha256_file(schema_path)
+
+    chunk = episode_index // 1000
+    state_relative = (
+        _ROBODOJO_REPLAY_DATA_DIR
+        / f"chunk-{chunk:03d}"
+        / f"episode_{episode_index:07d}.npz"
+    )
+    state_path = _publish_npz(dataset_root, state_relative, replay.npz_payload())
+    state_sha256 = _sha256_file(state_path)
+
+    layout_relative = (
+        _ROBODOJO_REPLAY_LAYOUTS_DIR / f"episode_{episode_index:07d}.json"
+    )
+    layout_payload = {
+        "format_version": 1,
+        "episode_index": int(episode_index),
+        "layout_sha256": layout_sha256,
+        "saved_layout": saved_layout,
+        "snapshot_manifest": manifest,
+        "field_schema": replay.field_schema,
+        "state_path": state_relative.as_posix(),
+        "state_sha256": state_sha256,
+        "schema_path": _ROBODOJO_REPLAY_SCHEMA_PATH.as_posix(),
+        "schema_sha256": schema_sha256,
+    }
+    layout_path = _publish_json(dataset_root, layout_relative, layout_payload)
+    return {
+        "complete": True,
+        "format_version": 1,
+        "snapshot_count": replay.frame_count,
+        "terminal_snapshot": True,
+        "state_path": state_relative.as_posix(),
+        "state_sha256": state_sha256,
+        "layout_path": layout_relative.as_posix(),
+        "layout_sha256": layout_sha256,
+        "layout_file_sha256": _sha256_file(layout_path),
+        "schema_path": _ROBODOJO_REPLAY_SCHEMA_PATH.as_posix(),
+        "schema_sha256": schema_sha256,
+    }
+
+
 def _episode_metadata(
     metadata: dict[str, Any],
     *,
@@ -645,6 +1004,7 @@ def _episode_metadata(
     reason: str,
     has_intervention: bool,
     frame_count: int,
+    replay_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     def integer(key: str, default: int = -1) -> int:
         try:
@@ -655,6 +1015,9 @@ def _episode_metadata(
     policy_provenance = metadata.get("policy_provenance", {})
     if not isinstance(policy_provenance, dict):
         policy_provenance = {}
+    runtime_provenance = metadata.get("runtime_provenance", {})
+    if not isinstance(runtime_provenance, dict):
+        runtime_provenance = {}
 
     return {
         "robodojo_task": str(metadata.get("task_name", "")),
@@ -665,6 +1028,7 @@ def _episode_metadata(
             metadata.get("policy_runtime", "xpolicy_ws_v0"),
         ),
         "robodojo_control_mode": str(metadata.get("control_mode", "")),
+        "robodojo_recording_kind": str(metadata.get("recording_kind", "")),
         "robodojo_piperx_bridge_protocol": str(
             metadata.get("piperx_bridge_protocol", ""),
         ),
@@ -672,9 +1036,19 @@ def _episode_metadata(
             metadata.get("piperx_embodiment_profile", ""),
         ),
         "robodojo_policy_provenance": dict(policy_provenance),
+        "robodojo_runtime_provenance": dict(runtime_provenance),
         "robodojo_layout_id": integer("layout_id"),
         "robodojo_layout_cycle": integer("layout_cycle", 0),
         "robodojo_eval_seed": integer("eval_seed"),
+        "robodojo_policy_seed": integer("policy_seed"),
+        "robodojo_collection_id": str(metadata.get("collection_id", "")),
+        "robodojo_collection_plan_hash": str(
+            metadata.get("collection_plan_hash", "")
+        ),
+        "robodojo_collection_plan_index": integer("collection_plan_index"),
+        "robodojo_layout_sha256": str(
+            metadata.get("replay_layout_sha256", "")
+        ),
         "robodojo_run_id": str(metadata.get("run_id", "")),
         "robodojo_commit": str(metadata.get("robodojo_commit", "unknown")),
         "xpolicylab_commit": str(metadata.get("xpolicylab_commit", "unknown")),
@@ -682,6 +1056,7 @@ def _episode_metadata(
         "robodojo_finish_reason": str(reason),
         "robodojo_has_intervention": bool(has_intervention),
         "robodojo_frame_count": int(frame_count),
+        "robodojo_replay": dict(replay_info or {"complete": False}),
     }
 
 
@@ -796,6 +1171,7 @@ def serve(
     frame_count = 0
     has_intervention = False
     metadata: dict[str, Any] = {}
+    replay = _ReplayStateBuffer(enabled=False, fps=config.fps)
     try:
         dataset, _created = dataset_opener(config)
         total_episodes = int(getattr(dataset.meta, "total_episodes", 0))
@@ -821,12 +1197,17 @@ def serve(
                 metadata = dict(message.get("metadata", {}))
                 frame_count = 0
                 has_intervention = False
+                replay = _ReplayStateBuffer(
+                    enabled=bool(metadata.get("record_sim_state", False)),
+                    fps=config.fps,
+                )
                 active = True
                 send_message(output_stream, {"status": "begun"})
             elif command == "frame":
                 if not active:
                     raise RuntimeError("Received frame without begin")
                 frame = build_frame(message)
+                replay.append(message.get("sim_state"))
                 dataset.add_frame(frame)
                 frame_count += 1
                 has_intervention = has_intervention or bool(
@@ -845,6 +1226,8 @@ def serve(
                 accepted = bool(message.get("accepted", False))
                 success = bool(message.get("success", False))
                 reason = str(message.get("reason", "operator"))
+                if replay.enabled and accepted:
+                    replay.set_terminal(message.get("terminal_sim_state"))
                 if not accepted:
                     _clear_episode(dataset)
                     active = False
@@ -852,6 +1235,11 @@ def serve(
                     continue
                 if frame_count <= 0:
                     raise RuntimeError("Refusing to commit an empty LeRobot episode")
+                if replay.enabled and replay.frame_count != frame_count:
+                    raise ReplayStateError(
+                        "LeRobot/replay frame count mismatch: "
+                        f"{frame_count} != {replay.frame_count}"
+                    )
                 drops = _dropped_frame_counts(dataset)
                 if drops:
                     raise RuntimeError(f"Refusing commit after video frame drop(s): {drops}")
@@ -870,6 +1258,13 @@ def serve(
                     dataset.save_episode()
                     _finalize_dataset(dataset)
                     dataset_finalized = True
+                    replay_info = _write_replay_bundle(
+                        config.dataset_root,
+                        episode_index,
+                        metadata,
+                        replay,
+                    )
+                    _write_collection_manifest(config.dataset_root, metadata)
                     robodojo_metadata_path = _write_robodojo_episode_metadata(
                         config.dataset_root,
                         episode_index,
@@ -879,6 +1274,7 @@ def serve(
                             reason=reason,
                             has_intervention=has_intervention,
                             frame_count=frame_count,
+                            replay_info=replay_info,
                         ),
                     )
                     marker = config.dataset_root / _STAGING_MARKER
