@@ -25,13 +25,11 @@ from typing import Any, BinaryIO, Callable
 
 import numpy as np
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.eval_client.lerobot_stream_protocol import receive_message, send_message
-
 
 CAMERA_SOURCES = {
     "cam_high": "cam_head",
@@ -124,7 +122,7 @@ class _CommitSnapshot:
         dataset_root: str | Path,
         *,
         transient_roots: tuple[Path, ...] = (),
-    ) -> "_CommitSnapshot":
+    ) -> _CommitSnapshot:
         root = Path(dataset_root).expanduser().resolve(strict=True)
         if not root.is_dir() or root.is_symlink():
             raise RuntimeError(f"LeRobot dataset root is not a real directory: {root}")

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
-import json
 import math
 import time
 from typing import Any
@@ -19,7 +18,6 @@ from typing import Any
 import numpy as np
 
 from .rollout_collection import canonical_json_bytes
-
 
 SNAPSHOT_FORMAT_VERSION = 1
 SNAPSHOT_PROFILE = "robodojo_rigid_articulation_v1"

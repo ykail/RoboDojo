@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 from typing import Any, Iterable
 
-
 _COLLECTION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _PLAN_HASH_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _EPISODE_METADATA_RE = re.compile(r"episode_\d{7}\.json")

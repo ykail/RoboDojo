@@ -11,7 +11,6 @@ import shlex
 import subprocess
 import sys
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -22,7 +21,6 @@ from src.eval_client.rollout_collection import (
     dataset_root,
     group_entries_by_seed,
     parse_layout_plan,
-    remaining_entries,
 )
 
 
