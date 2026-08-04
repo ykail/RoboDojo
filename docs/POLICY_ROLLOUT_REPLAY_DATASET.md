@@ -15,6 +15,11 @@
 ```bash
 ssh OneMoreCupofCoffee
 cd /home/ykail/vibe_code/RoboDojo
+git fetch origin
+git switch feat/policy-rollout-replay-dataset
+git pull --ff-only
+git submodule update --init --recursive
+
 source /home/ykail/miniconda3/etc/profile.d/conda.sh
 conda activate RoboDojo
 
