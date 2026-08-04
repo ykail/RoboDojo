@@ -161,7 +161,9 @@ def run(args: argparse.Namespace) -> int:
     args.kai0_root = str(Path(args.kai0_root).expanduser().resolve())
     args.lerobot_root = str(Path(args.lerobot_root).expanduser().resolve())
     if args.kai0_python:
-        args.kai0_python = str(Path(args.kai0_python).expanduser().resolve())
+        # Preserve the lexical venv interpreter path. Resolving its final
+        # symlink would bypass pyvenv.cfg and lose Kai0/LeRobot site-packages.
+        args.kai0_python = os.path.abspath(os.path.expanduser(args.kai0_python))
     entries = parse_layout_plan(args.layout_plan)
     if len(entries) != args.episodes:
         raise ValueError(
