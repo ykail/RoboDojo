@@ -82,7 +82,7 @@ def _plain_json_container(value: Any) -> Any:
             str(key): _plain_json_container(item) for key, item in value.items()
         }
     if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
+        value, str | bytes | bytearray
     ):
         return [_plain_json_container(item) for item in value]
     return value
