@@ -181,6 +181,39 @@ def _all_packets(stream):
 
 
 class LeRobotStreamWriterTest(unittest.TestCase):
+    def test_numpy2_singleton_numeric_features_are_scalarised_before_commit(self):
+        singleton_values = [
+            np.asarray([0.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+        ]
+        vector_values = [
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            np.asarray([3.0, 4.0], dtype=np.float32),
+        ]
+        dataset = SimpleNamespace(
+            features={
+                "singleton": {"dtype": "float32", "shape": (1,)},
+                "vector": {"dtype": "float32", "shape": (2,)},
+                "video": {"dtype": "video", "shape": (3, 480, 640)},
+            },
+            episode_buffer={
+                "singleton": list(singleton_values),
+                "vector": list(vector_values),
+                "video": [None, None],
+            },
+        )
+
+        writer._normalise_singleton_numeric_episode_features(dataset)
+
+        self.assertEqual(
+            [np.asarray(value).shape for value in dataset.episode_buffer["singleton"]],
+            [(), ()],
+        )
+        self.assertEqual(np.stack(dataset.episode_buffer["singleton"]).shape, (2,))
+        np.testing.assert_array_equal(
+            dataset.episode_buffer["vector"][0], vector_values[0]
+        )
+
     def test_replay_buffer_rejects_equal_count_but_misaligned_frame_identity(self):
         replay = writer._ReplayStateBuffer(enabled=True, fps=25)
         with self.assertRaisesRegex(writer.ReplayStateError, "index mismatch"):

@@ -21,6 +21,7 @@ import stat
 import sys
 import tempfile
 import time
+import traceback
 from typing import Any, BinaryIO, Callable
 
 import numpy as np
@@ -1135,6 +1136,57 @@ def _clear_episode(dataset: Any) -> None:
         clear(delete_images=True)
 
 
+def _normalise_singleton_numeric_episode_features(dataset: Any) -> None:
+    """Bridge LeRobot 0.4.4's singleton-feature contract on NumPy 2.
+
+    LeRobot 0.4.4 validates a numeric frame whose declared shape is ``(1,)``
+    as a one-element ``np.ndarray``.  During ``save_episode`` it maps that
+    same feature to a scalar Hugging Face ``Value`` and relies on
+    ``float(np.array([value]))`` (or ``int(...)``) to squeeze it.  NumPy 2
+    deliberately rejects that implicit conversion.
+
+    Preserve the public LeRobot feature schema and the values accepted by
+    ``add_frame``.  Immediately before the episode is stacked, replace only
+    buffered one-element arrays for singleton numeric features with NumPy
+    scalar values.  ``np.stack`` then produces the one-dimensional column
+    expected by Hugging Face datasets on both NumPy 1.x and 2.x.
+    """
+
+    episode_buffer = getattr(dataset, "episode_buffer", None)
+    features = getattr(dataset, "features", None)
+    if not isinstance(episode_buffer, dict) or not isinstance(features, dict):
+        return
+
+    for key, feature in features.items():
+        if not isinstance(feature, dict) or tuple(feature.get("shape", ())) != (1,):
+            continue
+        try:
+            dtype = np.dtype(feature.get("dtype"))
+        except (TypeError, ValueError):
+            continue
+        if dtype.kind not in "biuf":
+            continue
+        values = episode_buffer.get(key)
+        if not isinstance(values, list) or not values:
+            continue
+
+        normalised: list[Any] = []
+        changed = False
+        for value in values:
+            if isinstance(value, np.ndarray):
+                array = np.asarray(value, dtype=dtype)
+                if array.shape != (1,):
+                    raise ValueError(
+                        f"Buffered singleton feature {key!r} has shape {array.shape}, expected (1,)"
+                    )
+                normalised.append(array.reshape(())[()])
+                changed = True
+            else:
+                normalised.append(value)
+        if changed:
+            episode_buffer[key] = normalised
+
+
 def _finalize_dataset(dataset: Any) -> None:
     stop_image_writer = getattr(dataset, "stop_image_writer", None)
     if callable(stop_image_writer):
@@ -1253,6 +1305,7 @@ def serve(
                     # fields are already regular frame features; persist the
                     # remaining RoboDojo provenance in a version-independent
                     # sidecar immediately after the LeRobot commit.
+                    _normalise_singleton_numeric_episode_features(dataset)
                     dataset.save_episode()
                     _finalize_dataset(dataset)
                     dataset_finalized = True
@@ -1345,6 +1398,7 @@ def serve(
             except Exception as cleanup_exc:
                 print(f"[LEROBOT][CLEANUP ERROR] {cleanup_exc}", file=sys.stderr, flush=True)
             remove_safe_empty_staging(config.dataset_root)
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
         print(f"[LEROBOT][ERROR] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         try:
             send_message(
