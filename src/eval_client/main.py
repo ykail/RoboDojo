@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import sys
+import time
 
 from isaaclab.app import AppLauncher
 
@@ -18,6 +19,16 @@ parser.add_argument(
     required=True,
     help="config file name for evaluation",
 )
+parser.add_argument(
+    "--restore_dataset_root",
+    type=str,
+    default="",
+    help="Committed LeRobot v3 dataset containing RoboDojo replay sidecars.",
+)
+parser.add_argument("--restore_episode", type=int, default=None)
+restore_selection = parser.add_mutually_exclusive_group()
+restore_selection.add_argument("--restore_frame", type=int, default=None)
+restore_selection.add_argument("--restore_time_s", type=float, default=None)
 parser.add_argument("--device_id", type=int, required=True, help="the device id for current process")
 parser.add_argument(
     "--policy_name",
@@ -182,6 +193,7 @@ from src.eval_client.piperx_bridge_client import (
     close_piperx_bridge_session,
 )
 from src.eval_client.policy_runtime import PolicyClientError, ResetReason
+from src.eval_client.replay_bundle import load_replay_frame
 from src.eval_client.rollout_collection import (
     apply_rollout_collection_config,
     committed_plan_indices,
@@ -190,6 +202,7 @@ from src.eval_client.rollout_collection import (
     parse_plan_index_map,
     validate_collection_manifest,
 )
+from src.eval_client.sim_state_restore import restore_replay_frame
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
@@ -423,12 +436,49 @@ def main():
         "keyboard_intervention",
         "keyboard_observe",
         "piperx_sim_dagger",
+        "state_restore",
     }:
         raise ValueError(
             "ROBODOJO_CONTROL_MODE must be 'policy', 'keyboard_intervention', "
-            "'keyboard_observe', or 'piperx_sim_dagger', "
+            "'keyboard_observe', 'piperx_sim_dagger', or 'state_restore', "
             f"got {control_mode!r}."
         )
+    state_restore_mode = control_mode == "state_restore"
+    replay_frame = None
+    if state_restore_mode:
+        if not args_cli.restore_dataset_root or args_cli.restore_episode is None:
+            raise ValueError(
+                "state_restore requires --restore_dataset_root and --restore_episode"
+            )
+        if (args_cli.restore_frame is None) == (args_cli.restore_time_s is None):
+            raise ValueError(
+                "state_restore requires exactly one of --restore_frame or --restore_time_s"
+            )
+        replay_frame = load_replay_frame(
+            args_cli.restore_dataset_root,
+            args_cli.restore_episode,
+            frame_index=args_cli.restore_frame,
+            time_s=args_cli.restore_time_s,
+        )
+        if replay_frame.task_name != task_name:
+            raise ValueError(
+                f"replay task {replay_frame.task_name!r} does not match {task_name!r}"
+            )
+        if replay_frame.env_config and replay_frame.env_config != args_cli.env_cfg_type:
+            raise ValueError(
+                f"replay env config {replay_frame.env_config!r} does not match "
+                f"{args_cli.env_cfg_type!r}"
+            )
+        if replay_frame.layout_id < 0:
+            raise ValueError("replay metadata has no valid layout id")
+        launcher_headless = bool(
+            getattr(app_launcher, "_headless", getattr(args_cli, "headless", False))
+        )
+        if launcher_headless:
+            raise ValueError("state_restore needs an Isaac Sim window; disable --headless")
+        if num_envs != 1:
+            print(f"[main] state_restore forces num_envs {num_envs} -> 1")
+            num_envs = 1
     operator_driven = control_mode in {"keyboard_intervention", "piperx_sim_dagger"}
     observation_mode = control_mode == "keyboard_observe"
     record_policy_rollouts = _environment_bool(
@@ -491,13 +541,19 @@ def main():
     eval_cfg["eval_batch"] = eval_batch
     eval_cfg["policy_name"] = args_cli.policy_name
     eval_cfg["additional_info"] = args_cli.additional_info
-    eval_cfg["seed"] = args_cli.seed
+    eval_cfg["seed"] = (
+        replay_frame.eval_seed
+        if replay_frame is not None and replay_frame.eval_seed >= 0
+        else args_cli.seed
+    )
     eval_cfg["physx_monitor_enabled"] = enable_monitor
     eval_cfg["control_mode"] = control_mode
     eval_cfg["operator_driven"] = operator_driven
     eval_cfg["observation_mode"] = observation_mode
     eval_cfg["policy_runtime"] = policy_runtime
     eval_cfg["record_policy_rollouts"] = record_policy_rollouts
+    if replay_frame is not None:
+        eval_cfg["restore_saved_layout"] = replay_frame.saved_layout
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
@@ -594,6 +650,13 @@ def main():
         if str(_env_eval_num).lower() != "native":
             eval_num = min(int(_env_eval_num), int(eval_num))
     env_cfg["eval_cfg"]["eval_num"] = eval_num
+    if replay_frame is not None:
+        OmegaConf.update(
+            env_cfg,
+            "eval_cfg.restore_saved_layout",
+            replay_frame.saved_layout,
+            force_add=True,
+        )
 
     OmegaConf.update(
         env_cfg,
@@ -613,6 +676,37 @@ def main():
         else _load_resume_manifest(eval_cfg, run_id)
     )
     env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+    if replay_frame is not None:
+        try:
+            env.env_seeds = [replay_frame.layout_id]
+            print(
+                "[ReplayRestore] resetting saved layout "
+                f"episode={replay_frame.episode_index} "
+                f"layout={replay_frame.layout_id}"
+            )
+            env.reset(seed=env.env_seeds)
+            summary = restore_replay_frame(env, replay_frame)
+            print(
+                "[ReplayRestore] restored "
+                f"episode={replay_frame.episode_index} "
+                f"frame={replay_frame.frame_index}/{replay_frame.frame_count - 1} "
+                f"time={replay_frame.timestamp_s:.3f}s "
+                f"robots={summary.robots} rigid={summary.rigid_objects} "
+                f"articulations={summary.articulations}"
+            )
+            print(
+                "[ReplayRestore] simulation is paused at the restored frame; "
+                "close the Isaac window or press Ctrl+C to exit."
+            )
+            while simulation_app.is_running():
+                env.render()
+                time.sleep(1.0 / 60.0)
+        except KeyboardInterrupt:
+            print("[ReplayRestore] exit requested.")
+        finally:
+            env.close()
+            simulation_app.close()
+        return
     eval_time = env.success_nums + env.fail_nums
     if operator_driven:
         env.env_seeds = env.seed_manager.get_cyclic_seeds(max_count=1)

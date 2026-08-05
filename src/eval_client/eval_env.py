@@ -87,6 +87,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             }
             self.collection_plan_index = -1
             self.observation_mode = self.control_mode == "keyboard_observe"
+            self.state_restore_mode = self.control_mode == "state_restore"
+            self.restore_saved_layout = self.eval_cfg.get(
+                "restore_saved_layout", None
+            )
             self.operator_driven = bool(
                 self.eval_cfg.get(
                     "operator_driven",
@@ -225,7 +229,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             policy_server_url = self.deploy_cfg.get("policy_server_url") or f"ws://{self.host}:{self.port}"
             self._policy_episode_counter = 0
             self._next_policy_reset_reason = ResetReason.EPISODE_START
-            if self.policy_runtime == "robodojo_policy_v1":
+            if self.state_restore_mode:
+                # State restore is deliberately policy-free. It only needs the
+                # regular task reset path so the saved layout is instantiated
+                # before explicit physical state is written back.
+                self.model_client = None
+            elif self.policy_runtime == "robodojo_policy_v1":
                 if self.num_envs != 1 or self.eval_batch:
                     raise ValueError(
                         "robodojo_policy_v1 requires num_envs=1 and eval_batch=false",
@@ -328,9 +337,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
             self.current_env_seed_map = {}
             for idx in range(self.num_envs):
-                self.scene_manager.layout_manager.set_saved_layout(
-                    idx, self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
+                saved_layout = (
+                    deepcopy(self.restore_saved_layout)
+                    if self.state_restore_mode and self.restore_saved_layout is not None
+                    else self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
                 )
+                self.scene_manager.layout_manager.set_saved_layout(idx, saved_layout)
                 if seed[idx] is None:
                     self.success[idx] = False
                     self.end_flag[idx] = True
@@ -344,7 +356,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.robot_manager.set_robot_init_state()
             self.reward_manager.init_state()
 
-            if self.policy_runtime == "robodojo_policy_v1":
+            if self.state_restore_mode:
+                pass
+            elif self.policy_runtime == "robodojo_policy_v1":
                 self._start_policy_v1_episode()
             else:
                 self.model_client.call(func_name="reset")
