@@ -34,11 +34,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--protocol",
-    choices=("ws",),
+    choices=("ws", "openpi"),
     default="ws",
     help=(
-        "Env-to-policy transport. 'ws' is the default WebSocket protocol "
-        "(msgpack frames over ws://host:port); also set as protocol: ws in deploy.yml."
+        "Env-to-policy transport. 'ws' uses the XPolicyLab WebSocket protocol; "
+        "'openpi' connects directly to an OpenPI MsgPack WebSocket server."
     ),
 )
 parser.add_argument(

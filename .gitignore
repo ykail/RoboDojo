@@ -22,3 +22,6 @@ ignore/
 .cursor/
 .claude/
 Untitled
+output
+.vscode
+private

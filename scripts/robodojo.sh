@@ -339,6 +339,7 @@ run_client() {
   local env_gpu_ids=""
   local ckpt="external"
   local action_type="ee"
+  local protocol="ws"
   local eval_num="${EVAL_NUM:-}"
   local connect_timeout="5"
   local only_tasks=""
@@ -362,6 +363,7 @@ run_client() {
       --env-gpu-ids) need_value "$@"; env_gpu_ids="$2"; shift 2 ;;
       --ckpt) need_value "$@"; ckpt="$2"; shift 2 ;;
       --action-type) need_value "$@"; action_type="$2"; shift 2 ;;
+      --protocol) need_value "$@"; protocol="$2"; shift 2 ;;
       --eval-num) need_value "$@"; eval_num="$2"; shift 2 ;;
       --connect-timeout) need_value "$@"; connect_timeout="$2"; shift 2 ;;
       --only) need_value "$@"; only_tasks="$2"; shift 2 ;;
@@ -406,6 +408,7 @@ Common options:
   --env-gpu-ids IDS      Batch mode only: comma-separated client GPU ids
   --ckpt NAME            Checkpoint label recorded in result paths (default: external)
   --action-type NAME     Action type label recorded in result paths (default: ee)
+  --protocol ws|openpi   Transport: XPolicyLab WebSocket or native OpenPI WebSocket (default: ws)
   --connect-timeout SEC  Pre-flight policy-server reachability probe timeout (default: 5)
   --only a,b,c           Batch mode task subset
   --tasks-file PATH      Batch mode task subset file
@@ -447,6 +450,10 @@ EOF
   fi
 
   if [[ "${batch_mode}" == "true" ]]; then
+    if [[ "${protocol}" != "ws" ]]; then
+      echo "[robodojo client] batch mode currently supports only --protocol ws" >&2
+      exit 2
+    fi
     if [[ -z "${policy_host}" || -z "${policy_port}" ]]; then
       echo "[robodojo client] batch mode requires --policy-host and --policy-port" >&2
       exit 2
@@ -503,6 +510,10 @@ EOF
     echo "[robodojo client] comma-separated --policy-host/--policy-port are only supported in batch mode" >&2
     exit 2
   fi
+  if [[ "${protocol}" != "ws" && "${protocol}" != "openpi" ]]; then
+    echo "[robodojo client] --protocol must be ws or openpi" >&2
+    exit 2
+  fi
 
   local additional_info="ckpt_name=${ckpt},action_type=${action_type}"
 
@@ -517,7 +528,7 @@ EOF
     --policy_name "${policy_name}"
     --host "${policy_host}"
     --port "${policy_port}"
-    --protocol ws
+    --protocol "${protocol}"
     --root_dir "${ROOT_DIR}"
     --device_id "${env_gpu}"
     --additional_info "${additional_info}"
@@ -533,7 +544,9 @@ EOF
     return 0
   fi
 
-  if probe_tcp "${policy_host}" "${policy_port}" "${connect_timeout}"; then
+  if [[ "${protocol}" == "openpi" ]]; then
+    echo "[robodojo client] native OpenPI transport: skipping raw TCP pre-flight"
+  elif probe_tcp "${policy_host}" "${policy_port}" "${connect_timeout}"; then
     echo "[robodojo client] policy server reachable at ${policy_host}:${policy_port}"
   else
     echo "[robodojo client] WARNING: could not reach ${policy_host}:${policy_port} within ${connect_timeout}s" >&2

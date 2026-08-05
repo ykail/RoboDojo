@@ -14,6 +14,7 @@ from env.global_configs import *
 from env.global_configs import BENCHMARK
 from env.observation_manager.obs_manager import ObsManager
 from env.seed_manager.seed_manager import SeedManager
+from src.eval_client.openpi_model_client import OpenPiModelClient
 from utils.cluttered_generator import UnStableError
 from utils.pipeline_utils import get_robot_action_dim_info
 from utils.save_file import VideoStreamWriter, format_video_saved_message, save_json
@@ -179,21 +180,21 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             if self.port is None:
                 raise ValueError("Port must be specified in deploy_cfg for the policy server!")
             self.host = self.deploy_cfg.get("host", "localhost")
-            _patch_websockets_proxy_compat()
-
             policy_server_url = self.deploy_cfg.get("policy_server_url") or f"ws://{self.host}:{self.port}"
-            evaluation_id = self.deploy_cfg.get("evaluation_id", self.run_id)
-            trial_id = self.deploy_cfg.get("trial_id", f"{self.task_name}-{self.run_id}")
-            action_case_id = self.deploy_cfg.get("action_case_id", f"{self.task_name}_case")
-            self.model_client = WsModelClient(
-                url=policy_server_url,
-                evaluation_id=evaluation_id,
-                trial_id=trial_id,
-                action_case_id=action_case_id,
-                repeat_index=self.deploy_cfg.get("repeat_index"),
-                ws_ping_interval_s=self.deploy_cfg.get("ws_ping_interval_s", 20.0),
-                ws_ping_timeout_s=self.deploy_cfg.get("ws_ping_timeout_s", 20.0),
-            )
+            if self.deploy_cfg.get("protocol") == "openpi":
+                self.model_client = OpenPiModelClient(url=policy_server_url)
+            else:
+                _patch_websockets_proxy_compat()
+                evaluation_id = self.deploy_cfg.get("evaluation_id", self.run_id)
+                trial_id = self.deploy_cfg.get("trial_id", f"{self.task_name}-{self.run_id}")
+                action_case_id = self.deploy_cfg.get("action_case_id", f"{self.task_name}_case")
+                self.model_client = WsModelClient(
+                    url=policy_server_url,
+                    evaluation_id=evaluation_id,
+                    trial_id=trial_id,
+                    action_case_id=action_case_id,
+                    repeat_index=self.deploy_cfg.get("repeat_index"),
+                )
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
 
         def close(self):
