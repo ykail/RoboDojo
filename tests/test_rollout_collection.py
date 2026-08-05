@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from src.eval_client.rollout_collection import (
+    apply_rollout_collection_config,
     build_collection_manifest,
     committed_plan_indices,
     group_entries_by_seed,
@@ -18,6 +19,46 @@ from src.eval_client.rollout_collection import (
 
 
 class RolloutCollectionPlanTest(unittest.TestCase):
+    def test_collection_config_is_applied_to_runtime_mapping(self):
+        entries = parse_layout_plan("0:0-4")
+        manifest = build_collection_manifest(
+            task="make_toast", checkpoint_id="official/59999", entries=entries
+        )
+        runtime_config = {}
+        count = apply_rollout_collection_config(
+            runtime_config,
+            {
+                "layout_ids": [1, 3],
+                # A resumed segment keeps global plan indices and may retain
+                # mappings for layouts that were already committed.
+                "plan_index_by_layout": {0: 0, 1: 1, 2: 2, 3: 3, 4: 4},
+                "manifest": manifest,
+                "collection_id": manifest["collection_id"],
+                "plan_hash": manifest["plan_hash"],
+            },
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(runtime_config["eval_num"], 2)
+        self.assertEqual(runtime_config["selected_layout_ids"], [1, 3])
+        self.assertEqual(runtime_config["collection_plan_index_by_layout"][3], 3)
+        self.assertIs(runtime_config["collection_manifest"], manifest)
+        self.assertEqual(runtime_config["collection_id"], manifest["collection_id"])
+        self.assertEqual(runtime_config["collection_plan_hash"], manifest["plan_hash"])
+
+    def test_collection_config_rejects_selected_layout_without_plan_index(self):
+        with self.assertRaisesRegex(ValueError, "missing selected layout ids"):
+            apply_rollout_collection_config(
+                {},
+                {
+                    "layout_ids": [0, 1],
+                    "plan_index_by_layout": {0: 7},
+                    "manifest": {},
+                    "collection_id": "rollout-test",
+                    "plan_hash": "sha256:" + "0" * 64,
+                },
+            )
+
     def test_make_toast_plan_expands_to_ordered_70_plus_30(self):
         entries = parse_layout_plan("0:0-69,1:0-29")
 

@@ -7,6 +7,7 @@ CPU-only subprocess in the Pi_05 environment owns all dataset/video state.
 from __future__ import annotations
 
 import atexit
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import fcntl
 import hashlib
@@ -71,6 +72,20 @@ def _package_version(name: str) -> str:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
+
+
+def _plain_json_container(value: Any) -> Any:
+    """Convert OmegaConf and other mapping/sequence wrappers to builtins."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_json_container(item) for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return [_plain_json_container(item) for item in value]
+    return value
 
 
 def _resolve_dataset_root(base_root: Path, repo_id: str) -> Path:
@@ -618,10 +633,11 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         ),
     }
     collection_manifest = getattr(task_env, "collection_manifest", None)
-    if isinstance(collection_manifest, dict):
-        metadata["collection_manifest"] = dict(collection_manifest)
+    if isinstance(collection_manifest, Mapping):
+        collection_manifest = _plain_json_container(collection_manifest)
+        metadata["collection_manifest"] = collection_manifest
     if bool(getattr(task_env, "record_policy_rollouts", False)):
-        if not isinstance(collection_manifest, dict):
+        if not isinstance(collection_manifest, Mapping):
             raise LeRobotStreamStartupError(
                 "automatic rollout recording requires a signed collection manifest"
             )

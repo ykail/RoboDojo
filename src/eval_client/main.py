@@ -183,6 +183,7 @@ from src.eval_client.piperx_bridge_client import (
 )
 from src.eval_client.policy_runtime import PolicyClientError, ResetReason
 from src.eval_client.rollout_collection import (
+    apply_rollout_collection_config,
     committed_plan_indices,
     dataset_root as collection_dataset_root,
     parse_layout_ids,
@@ -578,14 +579,11 @@ def main():
             eval_cfg["seed"],
             args_cli.policy_seed,
         )
-        eval_num = len(collection_settings["layout_ids"])
-        eval_cfg["selected_layout_ids"] = collection_settings["layout_ids"]
-        eval_cfg["collection_plan_index_by_layout"] = collection_settings[
-            "plan_index_by_layout"
-        ]
-        eval_cfg["collection_manifest"] = collection_settings["manifest"]
-        eval_cfg["collection_id"] = collection_settings["collection_id"]
-        eval_cfg["collection_plan_hash"] = collection_settings["plan_hash"]
+        # OmegaConf.create() copied the original plain ``eval_cfg`` above.
+        # Mutate the embedded node that create_eval_env() will actually read.
+        eval_num = apply_rollout_collection_config(
+            env_cfg["eval_cfg"], collection_settings
+        )
         print(
             f"[Rollout] collection={collection_settings['collection_id']} "
             f"seed={eval_cfg['seed']} remaining={eval_num} "
@@ -595,7 +593,7 @@ def main():
         _env_eval_num = os.environ.get("EVAL_NUM")
         if str(_env_eval_num).lower() != "native":
             eval_num = min(int(_env_eval_num), int(eval_num))
-    eval_cfg["eval_num"] = eval_num
+    env_cfg["eval_cfg"]["eval_num"] = eval_num
 
     OmegaConf.update(
         env_cfg,

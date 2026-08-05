@@ -7,6 +7,7 @@ the policy server or Isaac Sim.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, MutableMapping
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -24,6 +25,42 @@ class RolloutPlanEntry:
     plan_index: int
     eval_seed: int
     layout_id: int
+
+
+def apply_rollout_collection_config(
+    eval_config: MutableMapping[str, Any],
+    settings: Mapping[str, Any],
+) -> int:
+    """Apply one collector segment to the config actually passed to EvalEnv.
+
+    ``OmegaConf.create`` copies the source dictionary.  Keeping this operation
+    here makes callers explicitly mutate ``env_cfg.eval_cfg`` instead of a
+    detached pre-OmegaConf dictionary.
+    """
+
+    if not isinstance(eval_config, MutableMapping):
+        raise TypeError("eval_config must be a mutable mapping")
+    if not isinstance(settings, Mapping):
+        raise TypeError("collection settings must be a mapping")
+
+    layout_ids = [int(layout_id) for layout_id in settings["layout_ids"]]
+    plan_index_by_layout = {
+        int(layout_id): int(plan_index)
+        for layout_id, plan_index in settings["plan_index_by_layout"].items()
+    }
+    missing = sorted(set(layout_ids) - set(plan_index_by_layout))
+    if missing:
+        raise ValueError(
+            f"collection plan-index map is missing selected layout ids: {missing}"
+        )
+
+    eval_config["selected_layout_ids"] = layout_ids
+    eval_config["collection_plan_index_by_layout"] = plan_index_by_layout
+    eval_config["collection_manifest"] = settings["manifest"]
+    eval_config["collection_id"] = str(settings["collection_id"])
+    eval_config["collection_plan_hash"] = str(settings["plan_hash"])
+    eval_config["eval_num"] = len(layout_ids)
+    return len(layout_ids)
 
 
 def _non_negative_int(value: str, label: str) -> int:

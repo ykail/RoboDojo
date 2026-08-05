@@ -6,7 +6,7 @@ from pathlib import Path
 import queue
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -739,6 +739,38 @@ class _FakeSidecar:
 
 
 class LeRobotStreamRecorderTest(unittest.TestCase):
+    def test_rollout_metadata_accepts_omegaconf_like_manifest_mapping(self):
+        manifest = MappingProxyType(
+            {
+                "task": "make_toast",
+                "checkpoint_id": "official/59999",
+                "entries": [MappingProxyType({"plan_index": 0, "layout_id": 0})],
+            }
+        )
+        task_env = SimpleNamespace(
+            env_seeds=[0],
+            layout_cycle=0,
+            task_name="make_toast",
+            config_name="arx_x5",
+            eval_seed=0,
+            policy_seed=0,
+            policy_name="Kai0_Pi05",
+            policy_runtime="robodojo_policy_v1",
+            policy_provenance={"checkpoint_id": "official/59999"},
+            additional_info="",
+            control_mode="policy",
+            record_policy_rollouts=True,
+            collection_manifest=manifest,
+        )
+
+        metadata = _task_metadata(task_env)
+
+        self.assertIs(type(metadata["collection_manifest"]), dict)
+        self.assertIs(type(metadata["collection_manifest"]["entries"]), list)
+        self.assertIs(
+            type(metadata["collection_manifest"]["entries"][0]), dict
+        )
+
     def test_piperx_metadata_attests_v3_and_fixed_embodiment_profile(self):
         task_env = SimpleNamespace(
             env_seeds=[7],
