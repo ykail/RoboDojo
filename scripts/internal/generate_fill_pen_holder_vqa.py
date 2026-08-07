@@ -2,7 +2,7 @@
 
 Source layouts are never modified.  Each selected layout is rendered in an
 independent Isaac environment and contributes Parquet physical VQA
-annotations plus clean and overlay ``cam_head`` images.  No policy rollout or
+annotations plus clean ``cam_head`` images. No policy rollout or
 LeRobot action-data mutation is required.
 
 Batch example (all ``fill_pen_holder`` layouts for seed 0, 30 deterministic
@@ -11,8 +11,7 @@ scene snapshots per layout):
     python scripts/internal/generate_fill_pen_holder_vqa.py \
         --headless --enable_cameras --seed 0 --max-layouts 5 \
         --scene-count 30 --scenario layout gripper_content visible_counts \
-        --gripper-position-jitter 0.10 --gripper-height-jitter 0.05 \
-        --output-dir ./output/RoboDojo_vqa_v1/fill_pen_holder_seed0
+        --output-dir ./output/RoboDojo_vqa_v2/fill_pen_holder_seed0
 
 The output directory must be new. To deliberately replace an existing batch,
 add ``--overwrite`` after reviewing the directory target.
@@ -37,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.internal.vqa.overlay import OverlayError, numbered_overlay
+from scripts.internal.vqa.robot_state_pool import RobotStatePoolError, load_robot_state_pool
 from scripts.internal.vqa.sidecar import (
     SidecarWriter,
     VisibilityThresholds,
@@ -46,21 +45,16 @@ from scripts.internal.vqa.sidecar import (
     classify_mask_visibility,
     json_dumps,
 )
+from scripts.internal.vqa.task_logic import holder_pose_condition, pen_descriptions_from_features
 
 DEFAULT_LAYOUT_ROOT = PROJECT_ROOT / "Assets" / "Eval_Layout" / "RoboDojo" / "arx_x5"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "RoboDojo_vqa_v1" / "fill_pen_holder"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "RoboDojo_vqa_v2" / "fill_pen_holder"
+DEFAULT_ROBOT_STATE_POOL = PROJECT_ROOT / "data" / "fill_pen_holder" / "meta" / "vqa_robot_state_pool.parquet"
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
 PEN_LABELS = ("target0", "target1", "target2", "target3")
 SCENARIOS = ("layout", "gripper_content", "visible_counts")
-# X5 geometry (metres). The inner finger gap is approximately 2*q + 0.0008
-# for the two prismatic joints. The TCP offset is read from
-# robot.gripper_bias (0.145 for X5), rather than duplicated here.
-X5_FINGER_ZERO_GAP = 0.0008
-GRIPPER_CLEARANCE = 0.003
 HOLDER_GRASP_HEIGHT = 0.085
-DEFAULT_GRIPPER_POSITION_JITTER_M = 0.10
-DEFAULT_GRIPPER_HEIGHT_JITTER_M = 0.05
 # DLAA is temporal. The tiled camera's first buffer after a pose write can
 # still contain a prior render-product frame, so retain enough clean frames
 # after the reset for both that buffer and DLAA history to settle.
@@ -141,28 +135,23 @@ def _parse_args() -> argparse.Namespace:
         dest="scenarios",
         nargs="+",
         choices=SCENARIOS,
-        default=list(SCENARIOS),
+        default=None,
         help=(
-            "Scenarios to cycle through: layout creates holder/nib/bbox questions; "
+            "Optional explicit scenarios. By default layout takes 50% of snapshots, and "
+            "gripper_content/visible_counts take 25% each. Layout creates holder/nib/bbox questions; "
             "gripper_content creates left/right holding questions; visible_counts creates table/holder counts."
         ),
     )
     parser.add_argument("--layout-root", type=Path, default=DEFAULT_LAYOUT_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
+        "--robot-state-pool",
+        type=Path,
+        default=DEFAULT_ROBOT_STATE_POOL,
+        help="Paired real-robot state pool produced by extract_fill_pen_holder_robot_states.py.",
+    )
+    parser.add_argument(
         "--camera-jitter", type=float, default=0.0, help="Uniform head-camera position jitter in metres; default 0."
-    )
-    parser.add_argument(
-        "--gripper-position-jitter",
-        type=float,
-        default=DEFAULT_GRIPPER_POSITION_JITTER_M,
-        help="Maximum independent XY TCP perturbation for gripper_content snapshots, in metres.",
-    )
-    parser.add_argument(
-        "--gripper-height-jitter",
-        type=float,
-        default=DEFAULT_GRIPPER_HEIGHT_JITTER_M,
-        help="Maximum independent Z TCP perturbation for gripper_content snapshots, in metres.",
     )
     parser.add_argument("--sim-gpu-id", type=int, default=0, help="GPU index used in the RoboDojo sim config.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing VQA sidecar output directory.")
@@ -197,14 +186,15 @@ def _load_source_layouts(layout_root: Path, seed: int) -> list[tuple[Path, dict[
     return [(path, json.loads(path.read_text(encoding="utf-8"))) for path in paths]
 
 
-def _set_holder_fallen(layout: dict[str, Any], fallen: bool, yaw_deg: float) -> None:
+def _set_holder_tipped_pose(layout: dict[str, Any], tipped: bool, yaw_deg: float) -> None:
     holders = layout.get("Rigid", {}).get("pen_holder", [])
     if len(holders) != 1:
         raise ValueError("expected exactly one Rigid.pen_holder instance")
     holder = holders[0]
-    holder["default_ori"] = _fallen_quat(yaw_deg) if fallen else [1.0, 0.0, 0.0, 0.0]
+    upright_quat = t3q.axangle2quat((0.0, 0.0, 1.0), math.radians(yaw_deg)).tolist()
+    holder["default_ori"] = _fallen_quat(yaw_deg) if tipped else upright_quat
     holder["qpos"] = list(holder["default_ori"])
-    if fallen:
+    if tipped:
         pos = list(holder["default_pos"])
         pos[2] = 0.805
         holder["default_pos"] = pos
@@ -216,10 +206,13 @@ def _set_record_pose(record: dict[str, Any], position: np.ndarray, quaternion: n
     record["qpos"] = list(record["default_ori"])
 
 
-def _make_case_layout(source: dict[str, Any], scenario: str, index: int, rng: random.Random) -> dict[str, Any]:
+def _make_case_layout(
+    source: dict[str, Any], scenario: str, index: int, rng: random.Random, *, seed: int, layout_index: int
+) -> dict[str, Any]:
     layout = deepcopy(source)
     if scenario == "layout":
-        _set_holder_fallen(layout, fallen=(index % 2 == 1), yaw_deg=90.0 + 45.0 * (index % 6))
+        tipped, yaw_deg = holder_pose_condition(index, seed, layout_index)
+        _set_holder_tipped_pose(layout, tipped=tipped, yaw_deg=yaw_deg)
         return layout
 
     # For cases 2 and 3, all object placement relative to the grippers is done
@@ -269,9 +262,8 @@ def _load_config(args: argparse.Namespace):
         "default_frequency": 25,
         "annotator": {
             # RobotManager adds wrist cameras to the camera map for dual-arm
-            # robots.  The explicit disabled fallback keeps this collector
-            # ego-only while allowing TiledCaptureManager to configure those
-            # cameras without trying to dereference a missing capture config.
+            # robots. Keep their capture disabled so this collector remains
+            # ego-only while TiledCaptureManager configures every camera.
             "common": {"enabled": False},
             "cam_head": {
                 "enabled": True,
@@ -312,6 +304,23 @@ def _set_robot_pose(env, robot, target_pose: np.ndarray, gripper_joint: float) -
     key.set_joint_position_target(joint_pos)
 
 
+def _apply_robot_state(env, state: dict[str, Any]) -> dict[str, Any]:
+    """Load one paired real robot state without synthesizing a substitute pose."""
+
+    robots = {robot.arm_name.split("_")[0]: robot for robot in env.robot_manager.robot_list if robot.type == "target"}
+    if set(robots) != {"left", "right"}:
+        raise RuntimeError(f"expected left/right target robots, got {sorted(robots)}")
+    for side in ("left", "right"):
+        _set_robot_pose(
+            env,
+            robots[side],
+            np.asarray(state[f"{side}_ee_pose_wxyz"], dtype=np.float64),
+            float(state[f"{side}_gripper"]),
+        )
+    env.sim_step(render=False)
+    return robots
+
+
 def _set_local_pose(obj, position: np.ndarray, quaternion: np.ndarray | list[float]) -> None:
     obj.set_local_pose(
         translation=np.asarray(position, dtype=np.float32), orientation=np.asarray(quaternion, dtype=np.float32)
@@ -327,28 +336,6 @@ def _x5_grasp_center(end_link_pose: np.ndarray, gripper_bias: float) -> np.ndarr
     """Convert the link6 origin returned by get_real_endpose to the X5 TCP."""
     rotation = _quat_matrix(end_link_pose[3:])
     return end_link_pose[:3] + rotation @ np.array([float(gripper_bias), 0.0, 0.0])
-
-
-def _horizontal_side_grasp_pose(robot, tcp_xy: tuple[float, float], tcp_z: float) -> np.ndarray:
-    """Return an X5 link6 pose for a horizontal side grasp at the requested TCP.
-
-    The X5 fingers extend along local +X and close along local Y.  Keeping
-    local Z world-up makes an upright holder sit between the fingers instead
-    of intersecting the wrist housing.  The link6 origin is derived by
-    subtracting the configured TCP bias along local X.
-    """
-    base_position = np.asarray(robot.entity_origin_pose[:3], dtype=np.float64)
-    tcp = np.array([tcp_xy[0], tcp_xy[1], tcp_z], dtype=np.float64)
-    forward = tcp[:2] - base_position[:2]
-    forward_norm = float(np.linalg.norm(forward))
-    if forward_norm < 1e-6:
-        raise ValueError(f"cannot construct side grasp at robot base for {robot.arm_name}")
-    forward /= forward_norm
-    yaw = math.atan2(forward[1], forward[0])
-    quaternion = np.array([math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)], dtype=np.float64)
-    rotation = _quat_matrix(quaternion)
-    link6_position = tcp - rotation @ np.array([float(robot.gripper_bias), 0.0, 0.0])
-    return np.concatenate((link6_position, quaternion))
 
 
 def _upright_orientation_for_closing_axis(closing_axis: np.ndarray) -> np.ndarray:
@@ -369,13 +356,6 @@ def _metadata_bbox_vertices(category: str, model_index: int) -> np.ndarray:
     )
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     return np.asarray(metadata["geometry"]["aligned_bbox"]["vertices"], dtype=np.float64)
-
-
-def _x5_gripper_joint_for_width(robot, object_width: float) -> float:
-    """Open the parallel jaws just wider than the selected object dimension."""
-    target_gap = float(object_width) + GRIPPER_CLEARANCE
-    joint_value = (target_gap - X5_FINGER_ZERO_GAP) * 0.5
-    return float(np.clip(joint_value, robot.gripper_scale[0], robot.gripper_scale[1]))
 
 
 def _pen_record(layout: dict[str, Any], label: str) -> tuple[str, dict[str, Any]]:
@@ -425,45 +405,12 @@ def _place_pen_in_holder(
     _set_local_pose(obj, position, quaternion)
 
 
-def _holder_gripper_joint(layout: dict[str, Any], robot) -> float:
-    holder_record = layout["Rigid"]["pen_holder"][0]
-    vertices = _metadata_bbox_vertices("pen_holder", int(holder_record["category_idx"]))
-    extents = vertices.max(axis=0) - vertices.min(axis=0)
-    return _x5_gripper_joint_for_width(robot, float(np.min(extents[:2])))
-
-
-def _pen_gripper_joint(layout: dict[str, Any], label: str, robot) -> float:
-    _, vertices = _upright_pen_geometry(layout, label)
-    extents = vertices.max(axis=0) - vertices.min(axis=0)
-    return _x5_gripper_joint_for_width(robot, float(np.max(extents[:2])))
-
-
-def _sample_gripper_tcp(
-    side: str,
-    rng: random.Random,
-    position_jitter: float,
-    height_jitter: float,
-) -> tuple[tuple[float, float], float]:
-    """Sample a deterministic, camera-visible TCP target for one X5 arm."""
-
-    base_xy = (-0.10, -0.12) if side == "left" else (0.10, -0.12)
-    return (
-        (
-            base_xy[0] + rng.uniform(-position_jitter, position_jitter),
-            base_xy[1] + rng.uniform(-position_jitter, position_jitter),
-        ),
-        0.95 + rng.uniform(-height_jitter, height_jitter),
-    )
-
-
 def _stage_robot_objects(
     env,
     layout: dict[str, Any],
     scenario: str,
     index: int,
     rng: random.Random,
-    gripper_position_jitter: float,
-    gripper_height_jitter: float,
 ) -> dict[str, Any]:
     robots = {robot.arm_name.split("_")[0]: robot for robot in env.robot_manager.robot_list if robot.type == "target"}
     if set(robots) != {"left", "right"}:
@@ -496,30 +443,9 @@ def _stage_robot_objects(
     else:
         return {}
 
-    # The target TCPs remain inside the fixed head-camera crop. For
-    # gripper_content, both arms receive independent deterministic perturbations
-    # (including an empty gripper), so VQA does not learn a fixed arm pose.
-    sampled_tcp: dict[str, tuple[tuple[float, float], float]] = {}
-    for side, value in hand_values.items():
-        if value == "nothing" and scenario != "gripper_content":
-            continue
-        robot = robots[side]
-        position_jitter = gripper_position_jitter if scenario == "gripper_content" else 0.0
-        height_jitter = gripper_height_jitter if scenario == "gripper_content" else 0.0
-        tcp_xy, tcp_z = _sample_gripper_tcp(side, rng, position_jitter, height_jitter)
-        sampled_tcp[side] = (tcp_xy, tcp_z)
-        target_pose = _horizontal_side_grasp_pose(robot, tcp_xy, tcp_z=tcp_z)
-        gripper_joint = {
-            "nothing": float(robot.gripper_scale[1]),
-            "pen": _pen_gripper_joint(layout, "target0", robot),
-            "pen_holder": _holder_gripper_joint(layout, robot),
-        }[value]
-        _set_robot_pose(env, robot, target_pose, gripper_joint=gripper_joint)
-
-    # Forward kinematics/body-link buffers are refreshed by a physics step.
-    # Held objects are placed only after this step and are captured without a
-    # subsequent step, so gravity cannot make them drift out of the grippers.
-    env.sim_step(render=False)
+    # The paired source state is already applied before staging. Held objects
+    # are placed after its forward-kinematics refresh and captured without a
+    # subsequent physics step, so gravity cannot move them out of the gripper.
     ee_poses = {
         side: np.asarray(env.robot_manager.get_real_endpose(robots[side], env_idx_list=[0])[0], dtype=np.float64)
         for side, value in hand_values.items()
@@ -539,10 +465,6 @@ def _stage_robot_objects(
         return {
             "left_hand": hand_values["left"],
             "right_hand": hand_values["right"],
-            "gripper_tcp_positions": {
-                side: [float(tcp_xy[0]), float(tcp_xy[1]), float(tcp_z)]
-                for side, (tcp_xy, tcp_z) in sampled_tcp.items()
-            },
         }
 
     holder_hand = "left" if hand_values["left"] == "pen_holder" else "right"
@@ -832,20 +754,6 @@ def _restore_layout_object_poses(env, layout: dict[str, Any]) -> None:
                     _set_local_pose(obj, np.asarray(record["default_pos"]), record["default_ori"])
 
 
-def _restore_robot_targets(env) -> None:
-    """Teleport both arms to default state instead of only changing targets."""
-
-    env.robot_manager.reset()
-    for robot, key in zip(env.robot_manager.robot_list, env.robot_manager.robot_key, strict=True):
-        if robot.type != "target":
-            continue
-        default_joint_pos = key.data.default_joint_pos.clone()
-        zero_joint_vel = torch.zeros_like(key.data.default_joint_vel)
-        key.write_joint_state_to_sim(default_joint_pos, zero_joint_vel)
-        key.set_joint_position_target(default_joint_pos)
-    env.sim_step(render=False)
-
-
 def _select_layouts(
     layouts: list[tuple[Path, dict[str, Any]]], selection: str, max_layouts: int | None
 ) -> list[tuple[int, Path, dict[str, Any]]]:
@@ -890,6 +798,58 @@ def _holder_tilt_degrees(quaternion: np.ndarray | list[float]) -> float:
     return float(math.degrees(math.acos(cosine)))
 
 
+def _pen_color(layout: dict[str, Any], label: str) -> str | None:
+    """Read one stable, human-facing color phrase from the source asset."""
+
+    category, record = _pen_record(layout, label)
+    description_path = (
+        PROJECT_ROOT
+        / "Assets"
+        / "Object"
+        / "RoboDojo"
+        / "Rigid"
+        / category
+        / f"{int(record['category_idx']):05d}"
+        / "description.json"
+    )
+    if not description_path.is_file():
+        return None
+    description = json.loads(description_path.read_text(encoding="utf-8"))
+    caption = description.get("caption")
+    if isinstance(caption, dict):
+        colors = caption.get("color")
+        if isinstance(colors, list) and colors and isinstance(colors[0], str):
+            return colors[0].strip().lower() or None
+    value = description.get("description")
+    return value.strip().lower() if isinstance(value, str) and value.strip() else None
+
+
+def _mask_center(mask: np.ndarray) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return float(xs.mean()), float(ys.mean())
+
+
+def _pen_descriptions(env, layout: dict[str, Any], masks: dict[str, np.ndarray]) -> dict[str, tuple[str, str]]:
+    """Assign only image-grounded, one-to-one natural-language pen descriptions."""
+
+    centers = {label: _mask_center(masks[label]) for label in PEN_LABELS}
+    visible = {label: center for label, center in centers.items() if center is not None}
+    colors = {label: _pen_color(layout, label) for label in visible}
+    robot_centers: dict[str, tuple[float, float]] = {}
+    robots = {robot.arm_name.split("_")[0]: robot for robot in env.robot_manager.robot_list if robot.type == "target"}
+    for side in ("left", "right"):
+        if side not in robots:
+            continue
+        end_pose = np.asarray(env.robot_manager.get_real_endpose(robots[side], env_idx_list=[0])[0], dtype=np.float64)
+        projected = _project_world_point(env, end_pose[:3])
+        if projected is None:
+            continue
+        robot_centers[side] = projected
+    return pen_descriptions_from_features(visible, colors, robot_centers)
+
+
 def _add_case_records(
     writer: SidecarWriter,
     env,
@@ -911,7 +871,7 @@ def _add_case_records(
     audit_dir: Path,
     rng: random.Random,
 ) -> None:
-    """Persist clean/overlay images and emit only contract-compliant VQA rows."""
+    """Persist clean images and emit only contract-compliant VQA rows."""
 
     from PIL import Image
 
@@ -949,13 +909,26 @@ def _add_case_records(
             rgb=rgb,
         ) | {"question_family": family}
 
+    source_state = scene_state["robot_state"]
+
+    def audit_metadata(values: dict[str, Any]) -> str:
+        return json_dumps(
+            {
+                "source_index": source_state["source_index"],
+                "source_episode_index": source_state["source_episode_index"],
+                "source_frame_index": source_state["source_frame_index"],
+                "source_timestamp": source_state["source_timestamp"],
+                **values,
+            }
+        )
+
     if scenario == "layout":
         holder_status, holder_fraction, holder_occlusion = classify_mask_visibility(
             masks["pen_holder"], HOLDER_VISIBILITY
         )
         tilt = _holder_tilt_degrees(layout["Rigid"]["pen_holder"][0]["default_ori"])
-        holder = candidate("holder_fallen", "holder_fallen") | {
-            "prompt_text": "Is the pen holder lying on its side? Answer yes or no.",
+        holder = candidate("pen_holder_is_tipped_over", "tipped_over") | {
+            "prompt_text": "Has the pen holder fallen over? Answer yes or no.",
             "answer_type": "boolean",
             "answer_bool": tilt >= 60.0,
             "world_state_valid": tilt <= 30.0 or tilt >= 60.0,
@@ -965,7 +938,7 @@ def _add_case_records(
             "occlusion_ratio": holder_occlusion,
             "gt_source": "simulated_holder_orientation",
             "quality_score": float(masks["pen_holder"].sum()),
-            "audit_metadata_json": json_dumps({"holder_tilt_degrees": tilt}),
+            "audit_metadata_json": audit_metadata({"holder_tilt_degrees": tilt}),
         }
         if 30.0 < tilt < 60.0:
             writer.reject(holder, "holder_orientation_dead_zone")
@@ -986,41 +959,16 @@ def _add_case_records(
             "bbox_definition": "visible_tight",
             "gt_source": "ego_instance_segmentation",
             "quality_score": float(masks["pen_holder"].sum()),
+            "audit_metadata_json": audit_metadata({"holder_tilt_degrees": tilt}),
         }
         writer.add(holder_box)
 
-        ordered_labels = list(PEN_LABELS)
-        rng.shuffle(ordered_labels)
-        mark_to_label = {str(mark): label for mark, label in enumerate(ordered_labels, start=1)}
         nib_results = {label: _visible_nib_point(env, masks[label], depth, label) for label in PEN_LABELS}
-        try:
-            overlay = numbered_overlay(
-                rgb,
-                {mark: _mask_anchor(masks[label]) for mark, label in mark_to_label.items()},
-                protected_points_xy=[
-                    (point[0] * rgb.shape[1], point[1] * rgb.shape[0])
-                    for point, status in nib_results.values()
-                    if point is not None and status == "visible"
-                ],
-                protected_point_clearance_px=NIB_PATCH_RADIUS_PX + 3,
-            )
-        except (AnnotationMappingError, OverlayError) as error:
-            for mark, label in mark_to_label.items():
-                writer.reject(candidate("pen_nib_grounding", f"nib_{mark}"), f"overlay_unusable: {error}")
-            return
-        overlay_name = f"{scene_id}_pen_marks.png"
-        Image.fromarray(overlay.image).save(image_dir / overlay_name)
-        overlay_ref = str(Path("images") / overlay_name)
-        mapping_json = json_dumps(
-            {
-                mark: env.scene_manager.layout_manager.get_instance_name(0, label)
-                for mark, label in mark_to_label.items()
-            }
-        )
-        for mark, label in mark_to_label.items():
+        descriptions = _pen_descriptions(env, layout, masks)
+        for ordinal, (label, (description, description_kind)) in enumerate(sorted(descriptions.items()), start=1):
             point, status = nib_results[label]
-            record = candidate("pen_nib_grounding", f"nib_{mark}", overlay_ref) | {
-                "prompt_text": f"Locate the nib of the pen marked {mark} in the ego-view image. Return one point.",
+            record = candidate("pen_nib_grounding", f"nib_{ordinal}") | {
+                "prompt_text": f"Locate the nib of {description} in the ego-view image. Return one point.",
                 "answer_type": "point2d",
                 "answer_point_xy_norm": point,
                 "world_state_valid": True,
@@ -1030,10 +978,9 @@ def _add_case_records(
                 "coordinate_space": "original_image_normalized_xy",
                 "point_definition": "functional_nib_tip",
                 "gt_source": "simulated_3d_functional_point_projection",
-                "overlay_type": "numbered_object_marks",
-                "overlay_version": "fill_pen_holder_v1",
-                "overlay_mark_to_instance_json": mapping_json,
-                "audit_metadata_json": json_dumps({"mark_index": int(mark), "target_label": label}),
+                "audit_metadata_json": audit_metadata(
+                    {"pen_description": description, "description_kind": description_kind}
+                ),
             }
             writer.add(record)
         return
@@ -1063,12 +1010,11 @@ def _add_case_records(
                 "visible_fraction": fraction,
                 "occlusion_ratio": occlusion,
                 "gt_source": "dedicated_stable_grasp_generator",
-                "audit_metadata_json": json_dumps(
+                "audit_metadata_json": audit_metadata(
                     {
                         "gripper_side": side,
                         "grasp_class": answer_text[held],
                         "render_stabilization_frames": RENDER_STABILIZATION_FRAMES,
-                        "tcp_position": scene_state["gripper_tcp_positions"][side],
                     }
                 ),
             }
@@ -1105,7 +1051,7 @@ def _add_case_records(
             "image_answerable": True,
             "visibility_status": "not_applicable",
             "gt_source": "simulated_relation_plus_ego_instance_visibility",
-            "audit_metadata_json": json_dumps(
+            "audit_metadata_json": audit_metadata(
                 {
                     "qualifying_pen_instance_ids": qualifying,
                     "counted_pen_instance_ids": counted,
@@ -1133,7 +1079,7 @@ def _manifest(
         "source_layouts": [str(path) for _, path, _ in selected_layouts],
         "scene_count": args.scene_count,
         "start_index": args.start_index,
-        "scenarios": args.scenarios,
+        "scenarios": args.scenarios or ["layout", "layout", "gripper_content", "visible_counts"],
         "camera": "cam_head",
         "image_size": [IMAGE_WIDTH, IMAGE_HEIGHT],
         "visibility_thresholds": {
@@ -1143,8 +1089,7 @@ def _manifest(
             "nib_patch_radius_px": NIB_PATCH_RADIUS_PX,
             "nib_depth_tolerance_m": NIB_DEPTH_TOLERANCE_M,
         },
-        "gripper_position_jitter_m": args.gripper_position_jitter,
-        "gripper_height_jitter_m": args.gripper_height_jitter,
+        "robot_state_pool": str(args.robot_state_pool),
         "render": {
             "antialiasing_mode": "DLAA",
             "stabilization_frames": RENDER_STABILIZATION_FRAMES,
@@ -1163,10 +1108,6 @@ def main() -> None:
     args = _parse_args()
     if args.scene_count <= 0 or args.start_index < 0:
         raise ValueError("--scene-count must be positive and --start-index must be non-negative")
-    # if not 0.0 <= args.gripper_position_jitter <= 0.08:
-    #     raise ValueError("--gripper-position-jitter must be within [0.0, 0.08] metres")
-    # if not 0.0 <= args.gripper_height_jitter <= 0.05:
-    #     raise ValueError("--gripper-height-jitter must be within [0.0, 0.05] metres")
     writer = SidecarWriter(args.output_dir, overwrite=args.overwrite)
     image_dir = writer.prepare_images_dir()
     audit_dir = writer.prepare_audit_dir()
@@ -1182,6 +1123,10 @@ def main() -> None:
 
         from env.environment.task_env import TaskEnv
 
+        try:
+            robot_state_pool = load_robot_state_pool(str(args.robot_state_pool))
+        except RobotStatePoolError as error:
+            raise RuntimeError(f"invalid robot state pool {args.robot_state_pool}: {error}") from error
         source_layouts = _load_source_layouts(args.layout_root, args.seed)
         selected_layouts = _select_layouts(source_layouts, args.layout_index, args.max_layouts)
         for layout_index, source_path, source_layout in selected_layouts:
@@ -1191,7 +1136,9 @@ def main() -> None:
                 env = TaskEnv(_load_config(args), simulation_app)
                 # A new environment per layout is required because Isaac's
                 # object registry cannot safely replace category instances.
-                initial_layout = _make_case_layout(source_layout, "layout", 0, random.Random(args.seed))
+                initial_layout = _make_case_layout(
+                    source_layout, "layout", 0, random.Random(args.seed), seed=args.seed, layout_index=layout_index
+                )
                 env.scene_manager.layout_manager.set_saved_layout(0, initial_layout)
                 LOGGER.info("resetting layout=%s", layout_index)
                 env.reset(seed=[args.seed])
@@ -1203,26 +1150,31 @@ def main() -> None:
                         env.render()
                 semantic_labels, _ = _label_scene_instances(env)
                 base_camera_pose = env.camera_manager.cameras_xform[0][0].get_local_pose()
+                scenario_counts = {scenario: 0 for scenario in SCENARIOS}
                 for index in range(args.start_index, args.start_index + args.scene_count):
-                    scenario = args.scenarios[index % len(args.scenarios)]
-                    scenario_index = index // len(args.scenarios)
+                    scenario_cycle = args.scenarios or ("layout", "layout", "gripper_content", "visible_counts")
+                    scenario = scenario_cycle[index % len(scenario_cycle)]
+                    scenario_index = scenario_counts[scenario]
+                    scenario_counts[scenario] += 1
                     rng = random.Random(args.seed * 1000003 + layout_index * 65537 + index * 9176)
-                    layout = _make_case_layout(source_layout, scenario, scenario_index, rng)
+                    layout = _make_case_layout(
+                        source_layout, scenario, scenario_index, rng, seed=args.seed, layout_index=layout_index
+                    )
                     _restore_layout_object_poses(env, initial_layout)
-                    _restore_robot_targets(env)
                     _apply_camera_jitter(env, args.camera_jitter, rng, base_pose=base_camera_pose)
                     if scenario == "layout":
                         _restore_layout_holder_pose(env, layout)
+                    robot_state = robot_state_pool[rng.randrange(len(robot_state_pool))]
                     try:
+                        _apply_robot_state(env, robot_state)
                         scene_state = _stage_robot_objects(
                             env,
                             layout,
                             scenario,
                             scenario_index,
                             rng,
-                            args.gripper_position_jitter,
-                            args.gripper_height_jitter,
                         )
+                        scene_state["robot_state"] = robot_state
                     except RuntimeError as error:
                         writer.reject(
                             base_record(

@@ -770,42 +770,7 @@ An object counts as visible only if it passes all required thresholds.
 
 ---
 
-## 15. Overlay annotations
-
-Some task-specific VQA questions may require an overlay, such as numbered instance marks.
-
-Universal overlay rules:
-
-- render the clean ego RGB first;
-- project object anchor points;
-- place overlays after all geometric image preprocessing, or transform overlay anchors consistently;
-- overlays must not cover the target point or target object evidence;
-- the complete overlay, including each leader line, must keep a documented
-  clearance from a point-grounding target;
-- overlays must have unambiguous object association;
-- use a leader line when needed;
-- prevent overlapping labels;
-- ensure all marks remain inside the image;
-- store overlay metadata separately from the clean physical scene metadata.
-
-Recommended metadata:
-
-```json
-{
-  "overlay_type": "numbered_object_marks",
-  "overlay_version": "v1",
-  "mark_to_instance": {
-    "1": "instance_id_a",
-    "2": "instance_id_b"
-  }
-}
-```
-
-Do not let the overlay itself encode the answer location.
-
----
-
-## 16. Image preprocessing
+## 15. Image preprocessing
 
 Spatial ground truth must remain synchronized with image geometry.
 
@@ -826,7 +791,6 @@ result = transform(
     image=ego_image,
     point_xy=optional_point,
     bbox_xyxy=optional_bbox,
-    overlay_anchors=optional_overlay_anchors,
 )
 ```
 
@@ -834,7 +798,7 @@ After transforms, validate coordinates and box geometry.
 
 ---
 
-## 17. Validation rules
+## 16. Validation rules
 
 A central validator must reject malformed samples before training.
 
@@ -921,7 +885,6 @@ point and box spatial heatmaps
 box-size distribution
 integer class balance
 short-text class balance
-overlay mark-position distribution
 ```
 
 For simulator-generated datasets, also report:
@@ -983,7 +946,6 @@ fixed-size lists.  This is only a storage compatibility detail: the validator
 enforces lengths two and four respectively, and preserves the normalized
 coordinate contract above.
 
-`overlay_type`, `overlay_version`, `overlay_mark_to_instance_json`,
 `source_layout`, `scene_id`, and `audit_metadata_json` are retained for
 provenance and visual audit.  They are not alternate answer channels or model
 targets.
@@ -999,6 +961,5 @@ The data format is complete when:
 - visibility and answerability are stored separately;
 - invisible spatial targets are rejected instead of assigned sentinel values;
 - model tokens are generated from typed source-of-truth targets;
-- overlays are reproducible and do not leak answers;
-- transforms update coordinates and overlay anchors correctly;
+- transforms update coordinates correctly;
 - validation and dataset statistics are implemented.

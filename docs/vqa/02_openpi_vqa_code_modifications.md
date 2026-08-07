@@ -683,7 +683,6 @@ Transform together:
 image
 point target
 bbox target
-overlay anchors
 ```
 
 Do not resize or pad coordinates independently from the image.

@@ -1,16 +1,15 @@
 """Render typed, ego-only VQA sidecar samples for ``make_kong``.
 
 For each selected layout and target group, the collector holds robots at home,
-enumerates the eight matching-tile fallen bitmasks, and writes only numbered
-``cam_head`` images with physical Parquet annotations. Each scene asks whether
-the leftmost or rightmost matching tile still needs to be knocked down; no
-custom variable-length answer string or wrist image is generated.
+renders clean ``cam_head`` images, and emits two physical VQA families: the
+three left-to-right positions of the matching tiles and per-tile decisions for
+every matching-tile fallen bitmask.
 
 Example:
     python scripts/internal/generate_make_kong_vqa.py \
         --headless --enable_cameras --device-id 0 --seed 0 \
-        --max-layouts 1 --target-groups 0 --state-patterns all \
-        --output-dir /tmp/make_kong_vqa_check --overwrite
+        --max-layouts 1 \
+        --output-dir ./output/RoboDojo_vqa_v2/make_kong_seed0 --overwrite
 """
 
 import argparse
@@ -29,13 +28,20 @@ for package_root in (REPO_ROOT / "XPolicyLab", REPO_ROOT):
 
 from isaaclab.app import AppLauncher
 
-from scripts.internal.vqa.overlay import OverlayError, numbered_overlay
 from scripts.internal.vqa.sidecar import (
     SidecarWriter,
     VisibilityThresholds,
     base_record,
     classify_mask_visibility,
     json_dumps,
+)
+from scripts.internal.vqa.task_logic import (
+    adjacent_nonmatching_labels,
+    fallen_labels_for_pattern,
+    kong_declaration_neighbor_state_reason,
+    labels_for_bitmask,
+    matching_tile_indices,
+    ordinal,
 )
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -61,7 +67,7 @@ parser.add_argument(
 parser.add_argument(
     "--output-dir",
     type=Path,
-    default=Path("data/RoboDojo_vqa_v1/make_kong"),
+    default=Path("data/RoboDojo_vqa_v2/make_kong"),
     help="Output directory for the typed VQA sidecar.",
 )
 parser.add_argument("--overwrite", action="store_true", help="Replace --output-dir if it already exists.")
@@ -307,7 +313,7 @@ def _set_label_pose(env, label: str, position: np.ndarray, orientation: np.ndarr
 
 
 def _robot_side_labels() -> tuple[str, ...]:
-    """Return the 12 robot-side tiles that receive numbered overlay marks."""
+    """Return the 12 robot-side tiles."""
 
     return tuple(label for group in KONG_GROUPS for label in group)
 
@@ -432,11 +438,7 @@ def _mask_for_semantic(
     labels = info.get("idToLabels") or info.get("id_to_labels") or info.get("labels")
     if not isinstance(labels, dict):
         raise AnnotationMappingError("instance segmentation did not provide idToLabels")
-    ids = [
-        int(key)
-        for key, value in labels.items()
-        if _renderer_identity_matches(value, semantic_label, prim_path)
-    ]
+    ids = [int(key) for key, value in labels.items() if _renderer_identity_matches(value, semantic_label, prim_path)]
     if len(ids) != 1:
         raise AnnotationMappingError(
             f"renderer identity for {semantic_label!r} at {prim_path!r} resolves to {len(ids)} instance IDs"
@@ -497,15 +499,6 @@ def _label_tile_instances(env) -> tuple[dict[str, str], dict[str, str]]:
     return semantic, prim_paths
 
 
-def _mask_anchor(mask: np.ndarray) -> tuple[int, int]:
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        raise AnnotationMappingError("cannot anchor empty tile mask")
-    center_x, center_y = float(xs.mean()), float(ys.mean())
-    nearest = int(np.argmin((xs - center_x) ** 2 + (ys - center_y) ** 2))
-    return int(xs[nearest]), int(ys[nearest])
-
-
 def _target_labels_left_to_right(env, target_group: int) -> list[str]:
     labels_with_x = []
     for label in KONG_GROUPS[target_group]:
@@ -543,8 +536,12 @@ def _parse_state_patterns(value: str) -> list[int]:
     return _parse_int_csv(value, valid=set(range(8)), flag="--state-patterns")
 
 
-def _fallen_labels_for_pattern(target_labels: list[str], pattern: int) -> list[str]:
-    return [label for index, label in enumerate(target_labels) if pattern & (1 << index)]
+def _default_neighbor_state_patterns(neighbor_count: int) -> list[int]:
+    """Return every control/error state for one or two adjacent tiles."""
+
+    if neighbor_count not in {1, 2}:
+        raise ValueError(f"expected one or two adjacent nonmatching tiles, got {neighbor_count}")
+    return list(range(1 << neighbor_count))
 
 
 def _render_state(
@@ -559,7 +556,7 @@ def _render_state(
 ) -> None:
     target_labels = _target_labels_left_to_right(env, target_group)
     robot_side_labels = _robot_side_labels_left_to_right(env)
-    fallen_labels = _fallen_labels_for_pattern(target_labels, state_pattern)
+    fallen_labels = fallen_labels_for_pattern(target_labels, state_pattern)
     discard_label = DISCARD_LABELS[target_group]
     robot_side_fallen_quaternion = _robot_side_fallen_quaternion()
     reference_tile_fallen_quaternion = _reference_tile_fallen_quaternion()
@@ -595,13 +592,7 @@ def _render_state(
             label: _mask_for_semantic(instance, info, semantic_labels[label], semantic_prim_paths[label])
             for label in required_labels
         }
-        mark_to_label = {str(index): label for index, label in enumerate(robot_side_labels, start=1)}
-        overlay = numbered_overlay(
-            rgb,
-            {mark: _mask_anchor(masks[label]) for mark, label in mark_to_label.items()},
-            object_masks_by_mark={mark: masks[label] for mark, label in mark_to_label.items()},
-        )
-    except (AnnotationMappingError, OverlayError) as error:
+    except AnnotationMappingError as error:
         writer.reject(
             base_record(
                 sample_id=scene_id, task_name="make_kong", question_family="scene_validation", scene_id=scene_id
@@ -609,21 +600,18 @@ def _render_state(
             str(error),
         )
         return
-    image_name = f"{scene_id}_tile_marks.png"
-    Image.fromarray(overlay.image).save(image_dir / image_name)
+    image_name = f"{scene_id}.png"
+    Image.fromarray(rgb).save(image_dir / image_name)
     image_reference = str(Path("images") / image_name)
     reference_status, reference_fraction, _ = classify_mask_visibility(masks[discard_label], TILE_VISIBILITY)
-    label_to_mark = {label: mark for mark, label in mark_to_label.items()}
-    overlay_mapping = json_dumps(
-        {mark: env.scene_manager.layout_manager.get_instance_name(0, label) for mark, label in mark_to_label.items()}
-    )
 
-    def record(family: str, suffix: str, query_label: str, answer: bool, prompt: str) -> dict[str, Any]:
+    def record(query_label: str, answer: bool, prompt: str) -> dict[str, Any]:
         status, fraction, occlusion = classify_mask_visibility(masks[query_label], TILE_VISIBILITY)
+        query_index = robot_side_labels.index(query_label) + 1
         return base_record(
-            sample_id=f"{scene_id}_{suffix}",
+            sample_id=f"{scene_id}_tile_{query_index}",
             task_name="make_kong",
-            question_family=family,
+            question_family="matching_tile_still_needs_action",
             ego_image_reference=image_reference,
             image_width=int(rgb.shape[1]),
             image_height=int(rgb.shape[0]),
@@ -631,23 +619,18 @@ def _render_state(
             answer_type="boolean",
             answer_bool=answer,
             world_state_valid=True,
-            image_answerable=(
-                status == "visible" and reference_status == "visible"
-            ),
+            image_answerable=(status == "visible" and reference_status == "visible"),
             visibility_status=status,
             visible_fraction=fraction,
             occlusion_ratio=occlusion,
             target_view="ego",
             gt_source="simulated_tile_identity_and_pose",
-            overlay_type="numbered_object_marks",
-            overlay_version="make_kong_v1",
-            overlay_mark_to_instance_json=overlay_mapping,
             source_layout=f"eval_seed:{ARGS.seed}/layout:{layout_id}",
             scene_id=scene_id,
             audit_metadata_json=json_dumps(
                 {
                     "query_label": query_label,
-                    "query_mark": int(label_to_mark[query_label]),
+                    "query_left_to_right_index": query_index,
                     "reference_label": discard_label,
                     "reference_visible_fraction": reference_fraction,
                     "reference_visibility_status": reference_status,
@@ -659,30 +642,239 @@ def _render_state(
             ),
         )
 
-    # Use only the matching group's two outer tiles. This leaves the middle
-    # tile as visual context and prevents one reference group from producing
-    # redundant questions for all three matching tiles.
-    query_labels = (target_labels[0], target_labels[-1])
+    query_labels = target_labels
     for query_label in query_labels:
-        mark = label_to_mark[query_label]
+        query_index = robot_side_labels.index(query_label) + 1
         writer.add(
             record(
-                "matching_tile_needs_to_be_pushed",
-                f"needs_push_{mark}",
                 query_label,
                 query_label not in fallen_labels,
                 (
-                    f"Based on the face-up reference tile, does the tile marked {mark} "
-                    "still need to be knocked down? Answer yes or no."
+                    "Based on the face-up reference tile and the current board state, does the "
+                    f"{ordinal(query_index)} tile from the left still need to be knocked down? Answer yes or no."
                 ),
             )
         )
+
+
+def _render_neighbor_state(
+    env,
+    *,
+    writer: SidecarWriter,
+    image_dir: Path,
+    audit_dir: Path,
+    layout_id: int,
+    target_group: int,
+    neighbor_state_pattern: int,
+) -> None:
+    """Render a state where adjacent nonmatching tiles may be incorrectly fallen."""
+
+    target_labels = _target_labels_left_to_right(env, target_group)
+    robot_side_labels = _robot_side_labels_left_to_right(env)
+    neighbor_labels = adjacent_nonmatching_labels(robot_side_labels, target_labels)
+    fallen_neighbor_labels = labels_for_bitmask(neighbor_labels, neighbor_state_pattern)
+    discard_label = DISCARD_LABELS[target_group]
+    _, reference_position, _ = _label_object(env, discard_label)
+    _set_label_pose(
+        env,
+        discard_label,
+        _fallen_tile_position(reference_position, REFERENCE_TILE_PUSH_DIRECTION),
+        _reference_tile_fallen_quaternion(),
+    )
+    for label in target_labels:
+        _, position, _ = _label_object(env, label)
+        _set_label_pose(
+            env,
+            label,
+            _fallen_tile_position(position, ROBOT_SIDE_PUSH_DIRECTION),
+            _robot_side_fallen_quaternion(),
+        )
+    for label in fallen_neighbor_labels:
+        _, position, _ = _label_object(env, label)
+        _set_label_pose(
+            env,
+            label,
+            _fallen_tile_position(position, ROBOT_SIDE_PUSH_DIRECTION),
+            _robot_side_fallen_quaternion(),
+        )
+    _restore_robot_home(env)
+    _settle(env)
+
+    scene_id = (
+        f"make_kong_seed{ARGS.seed}_layout{layout_id:03d}_group{target_group}_"
+        f"kong_declaration_neighbor_pattern{neighbor_state_pattern:02b}"
+    )
+    try:
+        semantic_labels, semantic_prim_paths = _label_tile_instances(env)
+        _reset_ego_render_product(env)
+        rgb, _, instance, info = _capture_ego_annotations(env)
+        semantic_ids = _write_segmentation_audit(
+            audit_dir, scene_id, instance, info, semantic_labels, semantic_prim_paths
+        )
+        required_labels = set(neighbor_labels) | {discard_label}
+        invalid_mappings = {label: semantic_ids[label] for label in required_labels if len(semantic_ids[label]) != 1}
+        if invalid_mappings:
+            details = ", ".join(f"{label}={ids}" for label, ids in sorted(invalid_mappings.items()))
+            raise AnnotationMappingError(f"semantic-to-instance mapping is not one-to-one: {details}")
+        masks = {
+            label: _mask_for_semantic(instance, info, semantic_labels[label], semantic_prim_paths[label])
+            for label in required_labels
+        }
+    except AnnotationMappingError as error:
+        writer.reject(
+            base_record(
+                sample_id=scene_id,
+                task_name="make_kong",
+                question_family="scene_validation",
+                scene_id=scene_id,
+            ),
+            str(error),
+        )
+        return
+
+    image_name = f"{scene_id}.png"
+    Image.fromarray(rgb).save(image_dir / image_name)
+    image_reference = str(Path("images") / image_name)
+    reference_status, reference_fraction, _ = classify_mask_visibility(masks[discard_label], TILE_VISIBILITY)
+    for query_label in neighbor_labels:
+        status, fraction, occlusion = classify_mask_visibility(masks[query_label], TILE_VISIBILITY)
+        query_index = robot_side_labels.index(query_label) + 1
+        state_reason = kong_declaration_neighbor_state_reason(query_label in fallen_neighbor_labels)
+        writer.add(
+            base_record(
+                sample_id=f"{scene_id}_tile_{query_index}",
+                task_name="make_kong",
+                question_family="kong_declaration_neighbor_state_reason",
+                ego_image_reference=image_reference,
+                image_width=int(rgb.shape[1]),
+                image_height=int(rgb.shape[0]),
+                prompt_text=(
+                    "During kong declaration, only tiles matching the face-up tile should be down. Before the "
+                    f"left-stack draw, classify the {ordinal(query_index)} tile: correct or nonmatching_fallen."
+                ),
+                answer_type="short_text",
+                answer_text=state_reason,
+                world_state_valid=True,
+                image_answerable=(status == "visible" and reference_status == "visible"),
+                visibility_status=status,
+                visible_fraction=fraction,
+                occlusion_ratio=occlusion,
+                target_view="ego",
+                gt_source="simulated_kong_declaration_state_and_expected_matching_state",
+                source_layout=f"eval_seed:{ARGS.seed}/layout:{layout_id}",
+                scene_id=scene_id,
+                audit_metadata_json=json_dumps(
+                    {
+                        "query_label": query_label,
+                        "query_left_to_right_index": query_index,
+                        "expected_state": "upright_nonmatching_tile",
+                        "state_reason": state_reason,
+                        "kong_declaration_matching_labels_fallen": target_labels,
+                        "target_group": target_group,
+                        "matching_labels": target_labels,
+                        "adjacent_nonmatching_labels": neighbor_labels,
+                        "neighbor_state_pattern": neighbor_state_pattern,
+                        "incorrectly_fallen_labels": fallen_neighbor_labels,
+                        "reference_label": discard_label,
+                        "reference_visible_fraction": reference_fraction,
+                        "reference_visibility_status": reference_status,
+                        "semantic_instance_ids": {label: semantic_ids[label][0] for label in sorted(required_labels)},
+                    }
+                ),
+            )
+        )
+
+
+def _render_matching_indices(
+    env,
+    *,
+    writer: SidecarWriter,
+    image_dir: Path,
+    audit_dir: Path,
+    layout_id: int,
+    target_group: int,
+) -> None:
+    """Render the pre-action scene and identify the three matching tile positions."""
+
+    target_labels = _target_labels_left_to_right(env, target_group)
+    robot_side_labels = _robot_side_labels_left_to_right(env)
+    discard_label = DISCARD_LABELS[target_group]
+    _, reference_position, _ = _label_object(env, discard_label)
+    _set_label_pose(
+        env,
+        discard_label,
+        _fallen_tile_position(reference_position, REFERENCE_TILE_PUSH_DIRECTION),
+        _reference_tile_fallen_quaternion(),
+    )
+    _restore_robot_home(env)
+    _settle(env)
+    scene_id = f"make_kong_seed{ARGS.seed}_layout{layout_id:03d}_group{target_group}_initial"
+    try:
+        semantic_labels, semantic_prim_paths = _label_tile_instances(env)
+        _reset_ego_render_product(env)
+        rgb, _, instance, info = _capture_ego_annotations(env)
+        semantic_ids = _write_segmentation_audit(
+            audit_dir, scene_id, instance, info, semantic_labels, semantic_prim_paths
+        )
+        required_labels = set(target_labels) | {discard_label}
+        invalid_mappings = {label: semantic_ids[label] for label in required_labels if len(semantic_ids[label]) != 1}
+        if invalid_mappings:
+            details = ", ".join(f"{label}={ids}" for label, ids in sorted(invalid_mappings.items()))
+            raise AnnotationMappingError(f"semantic-to-instance mapping is not one-to-one: {details}")
+        masks = {
+            label: _mask_for_semantic(instance, info, semantic_labels[label], semantic_prim_paths[label])
+            for label in required_labels
+        }
+    except AnnotationMappingError as error:
+        writer.reject(
+            base_record(
+                sample_id=scene_id, task_name="make_kong", question_family="scene_validation", scene_id=scene_id
+            ),
+            str(error),
+        )
+        return
+    image_name = f"{scene_id}.png"
+    Image.fromarray(rgb).save(image_dir / image_name)
+    matching_indices = matching_tile_indices(robot_side_labels, target_labels)
+    statuses = [classify_mask_visibility(masks[label], TILE_VISIBILITY)[0] for label in required_labels]
+    writer.add(
+        base_record(
+            sample_id=f"{scene_id}_matching_indices",
+            task_name="make_kong",
+            question_family="matching_tile_indices_to_push",
+            ego_image_reference=str(Path("images") / image_name),
+            image_width=int(rgb.shape[1]),
+            image_height=int(rgb.shape[0]),
+            prompt_text=(
+                "After the face-up opponent tile is knocked down, which three tiles on our side should be "
+                "knocked down? Return their 1-based left-to-right indices as a tuple."
+            ),
+            answer_type="short_text",
+            answer_text=f"({matching_indices[0]}, {matching_indices[1]}, {matching_indices[2]})",
+            world_state_valid=True,
+            image_answerable=all(status == "visible" for status in statuses),
+            visibility_status="visible" if all(status == "visible" for status in statuses) else "partially_visible",
+            target_view="ego",
+            gt_source="simulated_tile_identity_and_pose",
+            source_layout=f"eval_seed:{ARGS.seed}/layout:{layout_id}",
+            scene_id=scene_id,
+            audit_metadata_json=json_dumps(
+                {
+                    "matching_left_to_right_indices": matching_indices,
+                    "reference_label": discard_label,
+                    "target_group": target_group,
+                    "semantic_instance_ids": {label: semantic_ids[label][0] for label in sorted(required_labels)},
+                }
+            ),
+        )
+    )
 
 
 def main() -> None:
     _configure_logging()
     target_groups = _parse_int_csv(ARGS.target_groups, valid={0, 1, 2, 3}, flag="--target-groups")
     state_patterns = _parse_state_patterns(ARGS.state_patterns)
+    neighbor_state_patterns_by_group: dict[int, list[int]] = {}
     if ARGS.fps <= 0:
         raise ValueError("--fps must be positive.")
     writer = SidecarWriter(ARGS.output_dir, overwrite=ARGS.overwrite)
@@ -698,7 +890,7 @@ def main() -> None:
         seed_manager.init_eval()
         layout_ids = _parse_layout_ids(ARGS.layout_ids, seed_manager)
         LOGGER.info(
-            "seed=%s layouts=%s groups=%s state_patterns=%s output=%s",
+            "seed=%s layouts=%s groups=%s state_patterns=%s adjacent-state-coverage=all output=%s",
             ARGS.seed,
             layout_ids,
             target_groups,
@@ -712,11 +904,29 @@ def main() -> None:
                 _reset_layout(env, layout_id)
                 base_poses = _snapshot_tile_poses(env)
                 for target_group in target_groups:
+                    target_labels = _target_labels_left_to_right(env, target_group)
+                    robot_side_labels = _robot_side_labels_left_to_right(env)
+                    neighbor_labels = adjacent_nonmatching_labels(robot_side_labels, target_labels)
+                    neighbor_state_patterns = _default_neighbor_state_patterns(len(neighbor_labels))
+                    existing_patterns = neighbor_state_patterns_by_group.setdefault(
+                        target_group, neighbor_state_patterns
+                    )
+                    if existing_patterns != neighbor_state_patterns:
+                        raise RuntimeError(
+                            f"adjacent tile order changed across layouts for target group {target_group}"
+                        )
+                    _restore_tile_poses(env, base_poses)
+                    _render_matching_indices(
+                        env,
+                        writer=writer,
+                        image_dir=image_dir,
+                        audit_dir=audit_dir,
+                        layout_id=layout_id,
+                        target_group=target_group,
+                    )
                     for state_pattern in state_patterns:
                         _restore_tile_poses(env, base_poses)
-                        LOGGER.info(
-                            "capturing layout=%s group=%s pattern=%s", layout_id, target_group, state_pattern
-                        )
+                        LOGGER.info("capturing layout=%s group=%s pattern=%s", layout_id, target_group, state_pattern)
                         _render_state(
                             env,
                             writer=writer,
@@ -725,6 +935,23 @@ def main() -> None:
                             layout_id=layout_id,
                             target_group=target_group,
                             state_pattern=state_pattern,
+                        )
+                    for neighbor_state_pattern in neighbor_state_patterns:
+                        _restore_tile_poses(env, base_poses)
+                        LOGGER.info(
+                            "capturing layout=%s group=%s adjacent-pattern=%s",
+                            layout_id,
+                            target_group,
+                            neighbor_state_pattern,
+                        )
+                        _render_neighbor_state(
+                            env,
+                            writer=writer,
+                            image_dir=image_dir,
+                            audit_dir=audit_dir,
+                            layout_id=layout_id,
+                            target_group=target_group,
+                            neighbor_state_pattern=neighbor_state_pattern,
                         )
             finally:
                 env.close()
@@ -740,9 +967,17 @@ def main() -> None:
                 "max_layouts": ARGS.max_layouts,
                 "target_groups": target_groups,
                 "state_patterns": state_patterns,
+                "neighbor_state_patterns": {
+                    str(group): patterns for group, patterns in sorted(neighbor_state_patterns_by_group.items())
+                },
+                "neighbor_state_pattern_semantics": {
+                    "bit_0": "immediate left adjacent nonmatching tile",
+                    "bit_1": "immediate right adjacent nonmatching tile",
+                    "zero": "both adjacent nonmatching tiles remain upright and correct",
+                },
                 "camera": "cam_head",
                 "fps": ARGS.fps,
-                "numbered_robot_side_tiles": len(_robot_side_labels()),
+                "robot_side_tiles": len(_robot_side_labels()),
                 "fallen_forward_offset_m": FALLEN_FORWARD_OFFSET_M,
                 "fallen_z_offset_m": FALLEN_Z_OFFSET_M,
                 "render": {
