@@ -14,7 +14,26 @@ No tmux is started by these scripts.
 | Machine | Responsibility | Local ports |
 | --- | --- | --- |
 | Hoo | Strict Kai0 `robodojo-policy-v1` server and official 59999 checkpoint | `127.0.0.1:18080` |
-| X5 PC (`piper@turingmachine`) | Isaac Sim, two physical ARX X5 arms, and LeRobot recording | source `127.0.0.1:8770`; forwarded policy `127.0.0.1:18080` |
+| X5 PC | Isaac Sim, two physical ARX X5 arms, and LeRobot recording | source `127.0.0.1:8770`; forwarded policy `127.0.0.1:18080` |
+
+The implementation is staged on Piper at
+`/home/piper/vibe_code/RoboDojo-x5-dagger`. Piper is only the preparation
+host; it does not need to be one of the runtime machines.
+
+## Copy to the actual X5 PC
+
+A complete portable Git bundle is staged at
+`/home/piper/vibe_code/RoboDojo-x5-dagger.bundle`. Copy that file to the X5 PC
+with `scp` or removable storage, then run:
+
+```bash
+git clone /path/to/RoboDojo-x5-dagger.bundle RoboDojo-x5-dagger
+cd RoboDojo-x5-dagger
+git submodule update --init --recursive
+```
+
+The prepared branch is `feat/arx-x5-online-dagger`. Keep this RoboDojo
+worktree clean so every recorded episode has useful hardware-code provenance.
 
 The hardware protocol is `robodojo_dual_joint_mirror_v1`. The required
 embodiment profile is `arx_x5_identity_joint_v1`, whose six joint signs are
