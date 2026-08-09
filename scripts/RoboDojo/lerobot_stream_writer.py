@@ -19,6 +19,7 @@ import stat
 import sys
 import tempfile
 import time
+import traceback
 from typing import Any, BinaryIO, Callable
 
 import numpy as np
@@ -652,9 +653,16 @@ def _episode_metadata(
         except (TypeError, ValueError):
             return default
 
+    def boolean_or_unknown(key: str) -> bool | str:
+        value = metadata.get(key, "unknown")
+        return value if isinstance(value, bool) else str(value)
+
     policy_provenance = metadata.get("policy_provenance", {})
     if not isinstance(policy_provenance, dict):
         policy_provenance = {}
+    recovery_source = metadata.get("recovery_source", {})
+    if not isinstance(recovery_source, dict):
+        recovery_source = {}
 
     return {
         "robodojo_task": str(metadata.get("task_name", "")),
@@ -671,7 +679,34 @@ def _episode_metadata(
         "robodojo_piperx_embodiment_profile": str(
             metadata.get("piperx_embodiment_profile", ""),
         ),
+        "robodojo_piperx_bridge_commit": str(
+            metadata.get("piperx_bridge_commit", "unknown"),
+        ),
+        "robodojo_piperx_bridge_dirty": boolean_or_unknown("piperx_bridge_dirty"),
+        "robodojo_piperx_control_topology": str(
+            metadata.get("piperx_control_topology", ""),
+        ),
+        "robodojo_piperx_restore_direct_control": bool(
+            metadata.get("piperx_restore_direct_control", False),
+        ),
+        "robodojo_hardware_embodiment": str(
+            metadata.get("hardware_embodiment", ""),
+        ),
+        "robodojo_hardware_profile": str(metadata.get("hardware_profile", "")),
+        "robodojo_hardware_bridge_protocol": str(
+            metadata.get("hardware_bridge_protocol", ""),
+        ),
+        "robodojo_hardware_bridge_commit": str(
+            metadata.get("hardware_bridge_commit", "unknown"),
+        ),
+        "robodojo_hardware_bridge_dirty": boolean_or_unknown(
+            "hardware_bridge_dirty"
+        ),
+        "robodojo_hardware_control_topology": str(
+            metadata.get("hardware_control_topology", ""),
+        ),
         "robodojo_policy_provenance": dict(policy_provenance),
+        "robodojo_recovery_source": dict(recovery_source),
         "robodojo_layout_id": integer("layout_id"),
         "robodojo_layout_cycle": integer("layout_cycle", 0),
         "robodojo_eval_seed": integer("eval_seed"),
@@ -760,6 +795,42 @@ def _clear_episode(dataset: Any) -> None:
     clear = getattr(dataset, "clear_episode_buffer", None)
     if callable(clear):
         clear(delete_images=True)
+
+
+def _normalise_singleton_numeric_episode_features(dataset: Any) -> None:
+    """Make LeRobot 0.4.4 singleton features commit correctly on NumPy 2."""
+
+    episode_buffer = getattr(dataset, "episode_buffer", None)
+    features = getattr(dataset, "features", None)
+    if not isinstance(episode_buffer, dict) or not isinstance(features, dict):
+        return
+    for key, feature in features.items():
+        if not isinstance(feature, dict) or tuple(feature.get("shape", ())) != (1,):
+            continue
+        try:
+            dtype = np.dtype(feature.get("dtype"))
+        except (TypeError, ValueError):
+            continue
+        if dtype.kind not in "biuf":
+            continue
+        values = episode_buffer.get(key)
+        if not isinstance(values, list) or not values:
+            continue
+        normalised: list[Any] = []
+        changed = False
+        for value in values:
+            if isinstance(value, np.ndarray):
+                array = np.asarray(value, dtype=dtype)
+                if array.shape != (1,):
+                    raise ValueError(
+                        f"Buffered singleton feature {key!r} has shape {array.shape}, expected (1,)"
+                    )
+                normalised.append(array.reshape(())[()])
+                changed = True
+            else:
+                normalised.append(value)
+        if changed:
+            episode_buffer[key] = normalised
 
 
 def _finalize_dataset(dataset: Any) -> None:
@@ -867,6 +938,7 @@ def serve(
                     # fields are already regular frame features; persist the
                     # remaining RoboDojo provenance in a version-independent
                     # sidecar immediately after the LeRobot commit.
+                    _normalise_singleton_numeric_episode_features(dataset)
                     dataset.save_episode()
                     _finalize_dataset(dataset)
                     dataset_finalized = True
@@ -951,6 +1023,7 @@ def serve(
             except Exception as cleanup_exc:
                 print(f"[LEROBOT][CLEANUP ERROR] {cleanup_exc}", file=sys.stderr, flush=True)
             remove_safe_empty_staging(config.dataset_root)
+        traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
         print(f"[LEROBOT][ERROR] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         try:
             send_message(

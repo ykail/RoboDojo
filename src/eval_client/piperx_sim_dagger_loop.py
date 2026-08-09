@@ -56,32 +56,45 @@ def _episode_id(task_env: Any) -> str:
 
 def run_piperx_sim_dagger_episode(
     task_env: Any,
-    model_client: Any,
+    model_client: Any | None,
     *,
     bridge: PiperXBridgeClient | None = None,
     controller: ArxPiperXRetargetController | None = None,
     recorder: Any | None = None,
     pace_realtime: bool = True,
+    manual_only: bool = False,
 ) -> str | None:
-    """Run one operator-labelled DAgger episode.
+    """Run one PiPER-X episode, with an optional policy-free manual mode.
 
-    Policy actions drive the ARX X5 simulation.  Before every action, the
-    latest accepted simulator pose is exchanged with the local hardware
-    bridge so the two PiPER-X followers mirror it and the leaders follow fresh
+    Policy actions drive the ARX X5 simulation. Before every action, the
+    latest accepted simulator joint state is exchanged with the local hardware
+    bridge until the two PiPER-X followers reach that relative joint target;
+    the leaders then follow fresh
     follower deltas around runtime-relative anchors. A bridge-side ``I`` edge
     immediately invalidates the current policy chunk. During the physical mode
     transition the simulator is frozen and no frame is recorded. While
     intervention is active,
-    each synchronized leader sample is first checked by ARX IK, then explicitly
+    each synchronized leader sample is first checked against the ARX joint target, then explicitly
     committed as a calibration-free relative joint delta to the matching
     PiPER-X follower. The simulator executes only after that exact physical
-    sample has been acknowledged.
+    sample has been acknowledged. In ``manual_only`` mode no policy client or
+    recorder is created: policy mode is a stationary bridge hold until ``I``
+    enters intervention, and the second ``I`` returns to that hold.
     """
 
     if task_env.num_envs != 1:
         raise ValueError("PiPER-X simulator DAgger supports exactly one environment")
     if getattr(task_env, "eval_batch", False):
         raise ValueError("PiPER-X simulator DAgger does not support batched policy evaluation")
+    if manual_only and model_client is not None:
+        raise ValueError("PiPER-X manual-only mode must not receive a policy client")
+    if manual_only and recorder is not None:
+        raise ValueError("PiPER-X manual-only mode does not record a LeRobot episode")
+    record_enabled = (
+        recorder is not None
+        or os.environ.get("ROBODOJO_PIPERX_RECORD", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
 
     bridge = bridge or shared_client_from_environment()
     try:
@@ -100,7 +113,7 @@ def run_piperx_sim_dagger_episode(
     try:
         if controller is None:
             controller = ArxPiperXRetargetController(task_env, RetargetConfig())
-        if recorder is None:
+        if recorder is None and not manual_only and record_enabled:
             from src.eval_client.lerobot_stream_recorder import recorder_for_env
 
             recorder = recorder_for_env(task_env)
@@ -112,16 +125,26 @@ def run_piperx_sim_dagger_episode(
         initial_sim = sim_targets_from_env(task_env, obs)
         # Finish all policy-side staging before authorizing the separate
         # hardware owner to leave SAFE_IDLE and arm the four physical devices.
-        _send_observation(task_env, model_client, obs)
+        if not manual_only:
+            _send_observation(task_env, model_client, obs)
         bridge.begin_episode(
             _episode_id(task_env),
             initial_sim,
         )
-        print(
-            "[PiPER-X DAgger] policy -> simulation -> followers -> leaders; "
-            "I toggles leader intervention; Right/Left/Esc/Backspace label the episode."
-        )
-        print(f"[PiPER-X DAgger] Recording under {recorder.record_dir}")
+        if manual_only:
+            print(
+                "[PiPER-X Manual] stationary hold; I toggles leader intervention; "
+                "Esc/Backspace exits. No policy client or dataset recorder is active."
+            )
+        else:
+            print(
+                "[PiPER-X DAgger] policy -> simulation -> followers -> leaders; "
+                "I toggles leader intervention; Right/Left/Esc/Backspace label the episode."
+            )
+            if recorder is not None:
+                print(f"[PiPER-X DAgger] Recording under {recorder.record_dir}")
+            else:
+                print("[PiPER-X DAgger] Checkpoint mode: LeRobot recording disabled.")
     except Exception as exc:
         if recorder is not None:
             try:
@@ -140,10 +163,28 @@ def run_piperx_sim_dagger_episode(
     pending_release_edge = 0
     consecutive_manual_failures = 0
     reported_transition: str | None = None
+    manual_frame_count = 0
 
     def policy_exchange() -> tuple[OperatorSample, Any]:
         sim = sim_targets_from_env(task_env, obs)
-        return bridge.exchange(sim), sim
+        if manual_only:
+            # A policy-free wait must not call exchange: exchange is a motion
+            # command even when the simulator state appears unchanged.
+            return bridge.poll(), sim
+        while True:
+            sample = bridge.exchange(sim)
+            if sample.transition is not None or sample.terminal_request is not None:
+                return sample, sim
+            operation = sample.diagnostics.get("operation")
+            if not isinstance(operation, dict) or "mirror_complete" not in operation:
+                raise PiperXBridgeSafetyError(
+                    "direct-joint bridge exchange omitted mirror_complete"
+                )
+            if operation["mirror_complete"] is True:
+                return sample, sim
+            if operation["mirror_complete"] is not False:
+                raise PiperXBridgeSafetyError("mirror_complete must be boolean")
+            pacer.wait()
 
     def execute(
         action: dict[str, Any],
@@ -153,7 +194,7 @@ def run_piperx_sim_dagger_episode(
         control: dict[str, Any],
         sample: OperatorSample,
     ) -> None:
-        nonlocal obs
+        nonlocal obs, manual_frame_count
         metadata = dict(control)
         metadata.setdefault("timestamp", time.monotonic())
         metadata.update(
@@ -165,21 +206,25 @@ def run_piperx_sim_dagger_episode(
                 "follower_actuation_mode": sample.follower_actuation_mode,
             }
         )
-        recorder.append(
-            obs=obs,
-            policy_action=policy_action,
-            human_action=human_action,
-            executed_action=action,
-            control=metadata,
-        )
+        if recorder is not None:
+            recorder.append(
+                obs=obs,
+                policy_action=policy_action,
+                human_action=human_action,
+                executed_action=action,
+                control=metadata,
+            )
         task_env.take_action(action)
+        manual_frame_count += 1
         pacer.wait()
         obs = task_env.get_obs()
-        _send_observation(task_env, model_client, obs)
+        if not manual_only:
+            _send_observation(task_env, model_client, obs)
 
     def process_terminal(sample: OperatorSample) -> bool:
         nonlocal accepted, finish_reason, terminal_request
-        request = _terminal_request(sample, recorder.frame_count)
+        frame_count = recorder.frame_count if recorder is not None else manual_frame_count
+        request = _terminal_request(sample, frame_count)
         if request is None:
             return False
         terminal_request = request
@@ -195,12 +240,12 @@ def run_piperx_sim_dagger_episode(
         consecutive_manual_failures += 1
         if consecutive_manual_failures == 1:
             print(
-                "\n[PiPER-X DAgger] retarget/IK rejected; simulation remains frozen. "
+                "\n[PiPER-X DAgger] direct-joint target rejected; simulation remains frozen. "
                 f"detail={control.get('retarget_failures', {})}"
             )
         if consecutive_manual_failures >= max_manual_failures:
             raise PiperXBridgeSafetyError(
-                f"retarget/IK failed {consecutive_manual_failures} consecutive samples; "
+                f"direct-joint mapping failed {consecutive_manual_failures} consecutive samples; "
                 "holding followers and aborting the collection session"
             )
         pacer.wait()
@@ -270,8 +315,9 @@ def run_piperx_sim_dagger_episode(
             pending_takeover_edge = 1
             consecutive_manual_failures = 0
             print(
-                "\n[PiPER-X DAgger] manual control ON; leader sample fan-out active; "
-                "policy chunk preempted."
+                "\n[PiPER-X Manual] manual control ON; leader sample fan-out active."
+                if manual_only
+                else "\n[PiPER-X DAgger] manual control ON; leader sample fan-out active; policy chunk preempted."
             )
             return
         if completed.edge == "exit":
@@ -280,8 +326,9 @@ def run_piperx_sim_dagger_episode(
             pending_release_edge = -1
             consecutive_manual_failures = 0
             print(
-                "\n[PiPER-X DAgger] manual control OFF; policy mapping re-anchored; "
-                "requesting a fresh chunk."
+                "\n[PiPER-X Manual] manual control OFF; returned to stationary hold."
+                if manual_only
+                else "\n[PiPER-X DAgger] manual control OFF; policy mapping re-anchored; requesting a fresh chunk."
             )
             process_terminal(completed)
             return
@@ -321,7 +368,9 @@ def run_piperx_sim_dagger_episode(
                         or result.decision != "reject"
                         or result.follower_commanded
                     ):
-                        raise PiperXBridgeSafetyError("rejected ARX IK did not produce a confirmed follower hold")
+                        raise PiperXBridgeSafetyError(
+                            "rejected ARX joint target did not produce a confirmed follower hold"
+                        )
                     reject_unsafe_manual(control)
                     continue
                 resolution = bridge.manual_resolve(sample.manual_sample.sample_id, commit=True)
@@ -359,6 +408,13 @@ def run_piperx_sim_dagger_episode(
             reported_transition = None
             if sample.mode != "policy":
                 raise PiperXBridgeSafetyError("policy exchange returned outside policy mode")
+
+            if manual_only:
+                pacer.wait()
+                render = getattr(task_env, "render", None)
+                if callable(render):
+                    render()
+                continue
 
             # Policy-v1 consumes its staged observation when inference starts.
             # Re-stage unconditionally: an I enter+exit can invalidate a slow
@@ -410,18 +466,25 @@ def run_piperx_sim_dagger_episode(
             reason=finish_reason,
         )
         bridge_ended = True
-        saved_path = recorder.finalize(
-            accepted=accepted,
-            success=bool(task_env.success[0]),
-            reason=finish_reason,
-        )
-        recorder_finalized = True
-        if saved_path:
-            print(f"\n[PiPER-X DAgger] Saved trajectory: {saved_path}")
-        elif accepted and terminal_request != "accept_exit":
-            raise RuntimeError("Recorder returned no path for an accepted PiPER-X episode")
-        elif not accepted:
-            print("\n[PiPER-X DAgger] Episode discarded; candidate data were not kept.")
+        if recorder is not None:
+            saved_path = recorder.finalize(
+                accepted=accepted,
+                success=bool(task_env.success[0]),
+                reason=finish_reason,
+            )
+            recorder_finalized = True
+            if saved_path:
+                print(f"\n[PiPER-X DAgger] Saved trajectory: {saved_path}")
+            elif accepted and terminal_request != "accept_exit":
+                raise RuntimeError("Recorder returned no path for an accepted PiPER-X episode")
+            elif not accepted:
+                print("\n[PiPER-X DAgger] Episode discarded; candidate data were not kept.")
+        elif manual_only:
+            recorder_finalized = True
+            print("\n[PiPER-X Manual] Manual-only session ended; no dataset was written.")
+        else:
+            recorder_finalized = True
+            print("\n[PiPER-X DAgger] Checkpoint ended; recording was disabled.")
 
         if terminal_request == "discard_retry":
             raise InterventionRejected("Operator rejected the PiPER-X DAgger episode")
@@ -440,7 +503,7 @@ def run_piperx_sim_dagger_episode(
     except Exception as exc:
         if not bridge_ended:
             bridge.fail_closed("episode_exception")
-        if not recorder_finalized:
+        if not recorder_finalized and recorder is not None:
             try:
                 recorder.finalize(accepted=False, success=False, reason="exception")
             except Exception as finalize_error:
@@ -455,4 +518,5 @@ def run_piperx_sim_dagger_episode(
             f"PiPER-X DAgger episode failed; the physical session cannot be retried: {exc}"
         ) from exc
     finally:
-        controller.exit()
+        if controller is not None:
+            controller.exit()

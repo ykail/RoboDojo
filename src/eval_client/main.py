@@ -19,6 +19,17 @@ parser.add_argument(
     required=True,
     help="config file name for evaluation",
 )
+parser.add_argument("--restore_dataset_root", type=str, default="")
+parser.add_argument("--restore_episode", type=int, default=None)
+parser.add_argument(
+    "--restore_queue_manifest",
+    type=str,
+    default="",
+    help="Ordered JSON manifest for multi-item restored-recovery collection.",
+)
+restore_selection = parser.add_mutually_exclusive_group()
+restore_selection.add_argument("--restore_frame", type=int, default=None)
+restore_selection.add_argument("--restore_time_s", type=float, default=None)
 parser.add_argument("--device_id", type=int, required=True, help="the device id for current process")
 parser.add_argument(
     "--policy_name",
@@ -195,7 +206,17 @@ from src.eval_client.piperx_bridge_client import (
     PiperXBridgeError,
     close_piperx_bridge_session,
 )
+from src.eval_client.piperx_joint_j1 import (
+    PiperXJointJ1Error,
+    PiperXJointJ1Exit,
+)
 from src.eval_client.policy_runtime import PolicyClientError, ResetReason
+from src.eval_client.replay_bundle import load_replay_frame
+from src.eval_client.restore_recovery_queue import (
+    completed_queue_ids,
+    load_recovery_queue,
+)
+from src.eval_client.sim_state_restore import restore_replay_frame
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
 from utils.pipeline_utils import *
@@ -330,18 +351,136 @@ def main():
     num_envs = args_cli.num_envs
     policy_runtime = args_cli.policy_runtime
     control_mode = os.environ.get("ROBODOJO_CONTROL_MODE", "policy").strip().lower()
+    restore_validation = bool(
+        os.environ.get("ROBODOJO_RECOVERY_VALIDATION_DATASET", "").strip()
+    )
     if control_mode not in {
         "policy",
         "keyboard_intervention",
         "keyboard_observe",
         "piperx_sim_dagger",
+        "piperx_manual",
+        "piperx_joint_j1",
+        "piperx_sim_follow_j1",
+        "piperx_dual_joint_test",
+        "piperx_policy_leader_mirror",
+        "piperx_policy_joint_intervention",
+        "x5_policy_joint_intervention",
+        "piperx_restore_recovery",
     }:
         raise ValueError(
             "ROBODOJO_CONTROL_MODE must be 'policy', 'keyboard_intervention', "
-            "'keyboard_observe', or 'piperx_sim_dagger', "
+            "'keyboard_observe', 'piperx_sim_dagger', 'piperx_manual', "
+            "'piperx_joint_j1', 'piperx_sim_follow_j1', "
+            "'piperx_dual_joint_test', 'piperx_policy_leader_mirror', or "
+            "'piperx_policy_joint_intervention', 'x5_policy_joint_intervention', "
+            "'piperx_restore_recovery', "
             f"got {control_mode!r}."
         )
-    operator_driven = control_mode in {"keyboard_intervention", "piperx_sim_dagger"}
+    replay_frame = None
+    replay_reference_frame = None
+    recovery_queue = None
+    recovery_items = []
+    recovery_completed: set[str] = set()
+    if control_mode == "piperx_restore_recovery":
+        using_queue = bool(args_cli.restore_queue_manifest)
+        using_single = bool(args_cli.restore_dataset_root) or args_cli.restore_episode is not None
+        if using_queue and (
+            using_single
+            or args_cli.restore_frame is not None
+            or args_cli.restore_time_s is not None
+        ):
+            raise ValueError(
+                "--restore_queue_manifest cannot be combined with single-frame restore arguments"
+            )
+        if using_queue:
+            if restore_validation:
+                raise ValueError("restore validation does not support a queue manifest")
+            recovery_queue = load_recovery_queue(args_cli.restore_queue_manifest)
+            if recovery_queue.task_name != task_name:
+                raise ValueError(
+                    f"recovery queue task {recovery_queue.task_name!r} does not match "
+                    f"{task_name!r}"
+                )
+            if recovery_queue.env_config != args_cli.env_cfg_type:
+                raise ValueError(
+                    f"recovery queue env {recovery_queue.env_config!r} does not match "
+                    f"{args_cli.env_cfg_type!r}"
+                )
+            os.environ["ROBODOJO_LEROBOT_ROOT"] = str(recovery_queue.output_root)
+            os.environ["ROBODOJO_LEROBOT_REPO_ID"] = recovery_queue.output_repo_id
+            recovery_completed = completed_queue_ids(recovery_queue)
+            queue_ids = {item.queue_id for item in recovery_queue.items}
+            recovery_completed.intersection_update(queue_ids)
+            recovery_items = [
+                item
+                for item in recovery_queue.items
+                if item.queue_id not in recovery_completed
+            ]
+            print(
+                "[Batch] "
+                f"completed={len(recovery_completed)} "
+                f"pending={len(recovery_items)} total={len(recovery_queue.items)} "
+                f"manifest={recovery_queue.path} digest={recovery_queue.sha256}",
+                flush=True,
+            )
+            if not recovery_items:
+                print("[Batch] COMPLETE: every queue item is already committed.", flush=True)
+                simulation_app.close()
+                return
+            first_item = recovery_items[0]
+            replay_frame = load_replay_frame(
+                first_item.dataset_root,
+                first_item.episode_index,
+                time_s=first_item.time_s,
+            )
+            replay_reference_frame = load_replay_frame(
+                first_item.dataset_root,
+                first_item.episode_index,
+                frame_index=0,
+            )
+        else:
+            if not args_cli.restore_dataset_root or args_cli.restore_episode is None:
+                raise ValueError(
+                    "piperx_restore_recovery requires either --restore_queue_manifest or "
+                    "--restore_dataset_root with --restore_episode"
+                )
+            if (args_cli.restore_frame is None) == (args_cli.restore_time_s is None):
+                raise ValueError(
+                    "piperx_restore_recovery requires exactly one of --restore_frame or "
+                    "--restore_time_s"
+                )
+            replay_frame = load_replay_frame(
+                args_cli.restore_dataset_root,
+                args_cli.restore_episode,
+                frame_index=args_cli.restore_frame,
+                time_s=args_cli.restore_time_s,
+            )
+            replay_reference_frame = load_replay_frame(
+                args_cli.restore_dataset_root,
+                args_cli.restore_episode,
+                frame_index=0,
+            )
+        if replay_frame.task_name != task_name:
+            raise ValueError(
+                f"replay task {replay_frame.task_name!r} does not match {task_name!r}"
+            )
+        if replay_frame.env_config and replay_frame.env_config != args_cli.env_cfg_type:
+            raise ValueError(
+                f"replay env config {replay_frame.env_config!r} does not match "
+                f"{args_cli.env_cfg_type!r}"
+            )
+        if replay_frame.layout_id < 0:
+            raise ValueError("replay metadata has no valid layout id")
+    operator_driven = control_mode in {
+        "keyboard_intervention",
+        "piperx_sim_dagger",
+        "piperx_manual",
+        "piperx_joint_j1",
+        "piperx_sim_follow_j1",
+        "piperx_dual_joint_test",
+        "piperx_restore_recovery",
+    }
     observation_mode = control_mode == "keyboard_observe"
     if control_mode in {"keyboard_intervention", "keyboard_observe"}:
         if policy_runtime == "xpolicy_ws_v0" and args_cli.policy_name != "Pi_05":
@@ -355,15 +494,33 @@ def main():
         if num_envs != 1:
             print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
             num_envs = 1
-    if control_mode == "piperx_sim_dagger":
+    if control_mode in {
+        "piperx_sim_dagger",
+        "piperx_manual",
+        "piperx_joint_j1",
+        "piperx_sim_follow_j1",
+        "piperx_dual_joint_test",
+        "piperx_policy_leader_mirror",
+        "piperx_policy_joint_intervention",
+        "x5_policy_joint_intervention",
+        "piperx_restore_recovery",
+    }:
         if policy_runtime != "robodojo_policy_v1":
-            raise ValueError("piperx_sim_dagger requires --policy_runtime robodojo_policy_v1")
+            if control_mode in {
+                "piperx_sim_dagger",
+                "piperx_policy_leader_mirror",
+                "piperx_policy_joint_intervention",
+                "x5_policy_joint_intervention",
+            }:
+                raise ValueError(f"{control_mode} requires --policy_runtime robodojo_policy_v1")
         launcher_headless = bool(
             getattr(app_launcher, "_headless", getattr(args_cli, "headless", False))
         )
-        if launcher_headless:
+        if launcher_headless and not (
+            control_mode == "piperx_restore_recovery" and restore_validation
+        ):
             raise ValueError(
-                "piperx_sim_dagger requires the live Isaac Sim window; disable --headless"
+                f"{control_mode} requires the live Isaac Sim window; disable --headless"
             )
         if num_envs != 1:
             print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
@@ -379,22 +536,44 @@ def main():
     policy_deploy_cfg = (
         _load_policy_deploy(args_cli.policy_name)
         if policy_runtime == "xpolicy_ws_v0"
+        and control_mode
+        not in {
+            "piperx_manual",
+            "piperx_joint_j1",
+            "piperx_sim_follow_j1",
+            "piperx_dual_joint_test",
+            "piperx_restore_recovery",
+        }
         else {}
     )
     eval_batch = (
         bool(policy_deploy_cfg.get("eval_batch", False))
         if policy_runtime == "xpolicy_ws_v0"
+        and control_mode
+        not in {
+            "piperx_manual",
+            "piperx_joint_j1",
+            "piperx_sim_follow_j1",
+            "piperx_dual_joint_test",
+            "piperx_restore_recovery",
+        }
         else False
     )
     eval_cfg["eval_batch"] = eval_batch
     eval_cfg["policy_name"] = args_cli.policy_name
     eval_cfg["additional_info"] = args_cli.additional_info
-    eval_cfg["seed"] = args_cli.seed
+    eval_cfg["seed"] = (
+        replay_frame.eval_seed
+        if replay_frame is not None and replay_frame.eval_seed >= 0
+        else args_cli.seed
+    )
     eval_cfg["physx_monitor_enabled"] = enable_monitor
     eval_cfg["control_mode"] = control_mode
     eval_cfg["operator_driven"] = operator_driven
     eval_cfg["observation_mode"] = observation_mode
     eval_cfg["policy_runtime"] = policy_runtime
+    if replay_frame is not None:
+        eval_cfg["restore_saved_layout"] = replay_frame.saved_layout
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
@@ -465,11 +644,24 @@ def main():
     OmegaConf.update(env_cfg, "eval_cfg.num_envs", num_envs, force_add=True)
     env_cfg = process_randomization(env_cfg)
     env_cfg, eval_num = process_config(env_cfg, task_name=task_name)
-    if policy_runtime == "robodojo_policy_v1":
+    if replay_frame is not None:
+        OmegaConf.update(
+            env_cfg,
+            "eval_cfg.restore_saved_layout",
+            replay_frame.saved_layout,
+            force_add=True,
+        )
+    if policy_runtime == "robodojo_policy_v1" or control_mode in {
+        "piperx_manual",
+        "piperx_joint_j1",
+        "piperx_sim_follow_j1",
+        "piperx_dual_joint_test",
+        "piperx_restore_recovery",
+    }:
         collect_freq = float(eval_cfg["observation"].get("collect_freq", 0))
         if collect_freq != 25.0:
             raise ValueError(
-                "policy-v1 ARX X5 profile requires observation.collect_freq=25, "
+                "ARX X5 intervention profile requires observation.collect_freq=25, "
                 f"got {collect_freq}",
             )
 
@@ -490,6 +682,177 @@ def main():
     run_id = os.environ["ROBODOJO_RUN_ID"]
     resume_state = _load_resume_manifest(eval_cfg, run_id)
     env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+    if replay_frame is not None:
+        mirror_client = None
+        try:
+            from src.eval_client.piperx_dual_joint_mirror import (
+                DualJointMirrorClient,
+                _target_robots,
+                replay_sim_state,
+                run_piperx_restored_recovery_episode,
+            )
+
+            if recovery_queue is None:
+                queue_entries = [(None, replay_frame, replay_reference_frame)]
+                total_count = 1
+            else:
+                queue_entries = [(item, None, None) for item in recovery_items]
+                total_count = len(recovery_queue.items)
+
+            if not restore_validation:
+                mirror_client = DualJointMirrorClient()
+                mirror_client.connect()
+
+            first_reset = True
+            for queue_item, initial_frame, initial_reference in queue_entries:
+                if queue_item is None:
+                    item_frame = initial_frame
+                    item_reference = initial_reference
+                    ordinal = 1
+                else:
+                    item_frame = load_replay_frame(
+                        queue_item.dataset_root,
+                        queue_item.episode_index,
+                        time_s=queue_item.time_s,
+                    )
+                    item_reference = load_replay_frame(
+                        queue_item.dataset_root,
+                        queue_item.episode_index,
+                        frame_index=0,
+                    )
+                    ordinal = recovery_queue.items.index(queue_item) + 1
+                assert item_frame is not None and item_reference is not None
+                if item_frame.task_name != task_name:
+                    raise ValueError(
+                        f"replay task {item_frame.task_name!r} does not match {task_name!r}"
+                    )
+                if item_frame.env_config and item_frame.env_config != args_cli.env_cfg_type:
+                    raise ValueError(
+                        f"replay env config {item_frame.env_config!r} does not match "
+                        f"{args_cli.env_cfg_type!r}"
+                    )
+                if item_frame.layout_id < 0:
+                    raise ValueError("replay metadata has no valid layout id")
+                if (
+                    item_reference.layout_id != item_frame.layout_id
+                    or item_reference.eval_seed != item_frame.eval_seed
+                ):
+                    raise ValueError("replay frame-0 reference belongs to a different layout")
+
+                attempt = 0
+                while True:
+                    attempt += 1
+                    source_label = (
+                        queue_item.source_id if queue_item is not None else "single"
+                    )
+                    print(
+                        f"[Batch {ordinal}/{total_count}] source={source_label} "
+                        f"episode={item_frame.episode_index} "
+                        f"requested_time="
+                        f"{queue_item.time_s if queue_item is not None else item_frame.timestamp_s:.3f}s "
+                        f"attempt={attempt}",
+                        flush=True,
+                    )
+                    if not first_reset:
+                        env.close()
+                    first_reset = False
+                    env.restore_saved_layout = item_frame.saved_layout
+                    env.eval_seed = item_frame.eval_seed
+                    env.env_seeds = [item_frame.layout_id]
+                    print(
+                        "[RestoreRecovery] resetting saved layout "
+                        f"episode={item_frame.episode_index} layout={item_frame.layout_id}",
+                        flush=True,
+                    )
+                    env.reset(seed=env.env_seeds)
+                    robots = _target_robots(env)
+                    print(
+                        "[RestoreRecovery] reading episode frame-0 mapping reference",
+                        flush=True,
+                    )
+                    follow_reference = replay_sim_state(item_reference, robots)
+                    summary = restore_replay_frame(env, item_frame)
+                    lineage = {
+                        "dataset_root": str(item_frame.dataset_root),
+                        "episode": item_frame.episode_index,
+                        "frame": item_frame.frame_index,
+                        "time_s": item_frame.timestamp_s,
+                        "requested_time_s": (
+                            queue_item.time_s
+                            if queue_item is not None
+                            else item_frame.timestamp_s
+                        ),
+                        "layout_id": item_frame.layout_id,
+                        "eval_seed": item_frame.eval_seed,
+                        "frame_count": item_frame.frame_count,
+                        "source_checkpoint": item_frame.source_checkpoint,
+                        "source_policy_provenance": dict(
+                            item_frame.source_policy_provenance
+                        ),
+                    }
+                    if queue_item is not None:
+                        lineage.update(
+                            {
+                                "queue_id": queue_item.queue_id,
+                                "source_id": queue_item.source_id,
+                                "queue_manifest": str(recovery_queue.path),
+                                "queue_manifest_sha256": recovery_queue.sha256,
+                            }
+                        )
+                    env.restore_lineage = lineage
+                    print(
+                        "[RestoreRecovery] restored "
+                        f"episode={item_frame.episode_index} "
+                        f"frame={item_frame.frame_index}/{item_frame.frame_count - 1} "
+                        f"time={item_frame.timestamp_s:.3f}s "
+                        f"robots={summary.robots} rigid={summary.rigid_objects} "
+                        f"articulations={summary.articulations}",
+                        flush=True,
+                    )
+                    result = run_piperx_restored_recovery_episode(
+                        env,
+                        follow_reference=follow_reference,
+                        client=mirror_client,
+                    )
+                    if result == "retry":
+                        print(
+                            f"[Batch {ordinal}/{total_count}] RETRY: restoring the same source frame.",
+                            flush=True,
+                        )
+                        continue
+                    if result != "save" and not restore_validation:
+                        raise RuntimeError(
+                            f"unexpected restored-recovery terminal result: {result!r}"
+                        )
+                    if queue_item is not None:
+                        recovery_completed.add(queue_item.queue_id)
+                        print(
+                            f"[Batch {ordinal}/{total_count}] SAVED; "
+                            f"completed={len(recovery_completed)}/{total_count}. "
+                            "Loading the next item.",
+                            flush=True,
+                        )
+                    break
+            if recovery_queue is not None:
+                print(
+                    f"[Batch] COMPLETE {len(recovery_completed)}/{total_count}; "
+                    "all selected recoveries are committed.",
+                    flush=True,
+                )
+        finally:
+            if mirror_client is not None:
+                try:
+                    mirror_client.end()
+                except Exception as exc:
+                    print(f"[RestoreRecovery] final PiPER hold warning: {exc}", flush=True)
+                mirror_client.close()
+            close_lerobot_stream_session()
+            close_piperx_bridge_session()
+            _close_model_client(env)
+            env._robodojo_final_shutdown = True
+            env.close()
+            simulation_app.close()
+        return
     eval_time = env.success_nums + env.fail_nums
     if operator_driven:
         env.env_seeds = env.seed_manager.get_cyclic_seeds(max_count=1)
@@ -544,10 +907,17 @@ def main():
             env.close()
             retry_round = True
         except InterventionAcceptedAndExit as request:
-            print(
-                "[Intervention] accepted final episode; closing collection session. "
-                f"episode={getattr(request, 'saved_path', '')}"
-            )
+            if (
+                control_mode == "piperx_sim_dagger"
+                and os.environ.get("ROBODOJO_PIPERX_RECORD", "1").strip().lower()
+                in {"0", "false", "no", "off"}
+            ):
+                print("[Intervention] checkpoint ended; recording was disabled.")
+            else:
+                print(
+                    "[Intervention] accepted final episode; closing collection session. "
+                    f"episode={getattr(request, 'saved_path', '')}"
+                )
             env.seed_manager.eval_step()
             operator_stop_requested = True
         except InterventionDiscardedAndExit:
@@ -573,6 +943,14 @@ def main():
             # already entered fail-closed hold/disable and the staged episode
             # was discarded by the control loop.
             print(f"[PiPER-X DAgger][FATAL] {e}", flush=True)
+            env.close()
+            operator_fatal_error = e
+            operator_stop_requested = True
+        except PiperXJointJ1Exit:
+            print("[J1 checkpoint] operator requested exit.", flush=True)
+            operator_stop_requested = True
+        except PiperXJointJ1Error as e:
+            print(f"[J1 checkpoint][FATAL] {e}", flush=True)
             env.close()
             operator_fatal_error = e
             operator_stop_requested = True

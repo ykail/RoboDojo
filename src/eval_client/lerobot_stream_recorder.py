@@ -65,6 +65,18 @@ def _git_revision(path: Path) -> str:
         return "unknown"
 
 
+def _git_dirty(path: Path) -> bool | str:
+    try:
+        output = subprocess.check_output(
+            ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=normal"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return bool(output)
+    except Exception:
+        return "unknown"
+
+
 def _resolve_dataset_root(base_root: Path, repo_id: str) -> Path:
     base = base_root.expanduser().resolve()
     dataset_root = (base / repo_id).resolve()
@@ -522,6 +534,13 @@ class LeRobotStreamRecorder:
 
 def _task_metadata(task_env: Any) -> dict[str, Any]:
     project_root = Path(__file__).resolve().parents[2]
+    piperx_code_root = Path(
+        os.environ.get(
+            "ROBODOJO_PIPERX_CODE_ROOT",
+            "/home/hoo/piper_x/lerobot_sealab-robodojo-v2",
+        )
+    )
+    x5_code_root = Path(os.environ.get("ROBODOJO_X5_CODE_ROOT", str(project_root)))
     env_seeds = getattr(task_env, "env_seeds", None)
     layout_id = env_seeds[0] if env_seeds is not None and len(env_seeds) else -1
     seed_manager = getattr(task_env, "seed_manager", None)
@@ -552,9 +571,54 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         "run_id": os.environ.get("ROBODOJO_RUN_ID", ""),
         "control_mode": control_mode,
     }
-    if control_mode == "piperx_sim_dagger":
-        metadata["piperx_embodiment_profile"] = "arx_x5_piperx_relative_v1"
-        metadata["piperx_bridge_protocol"] = "robodojo_piperx_v3"
+    restore_lineage = getattr(task_env, "restore_lineage", None)
+    if isinstance(restore_lineage, dict):
+        metadata["recovery_source"] = dict(restore_lineage)
+        if control_mode == "piperx_restore_recovery":
+            source_checkpoint = restore_lineage.get("source_checkpoint")
+            source_policy_provenance = restore_lineage.get(
+                "source_policy_provenance"
+            )
+            if source_checkpoint:
+                metadata["base_checkpoint"] = str(source_checkpoint)
+            if isinstance(source_policy_provenance, dict):
+                metadata["policy_provenance"] = dict(source_policy_provenance)
+    if control_mode == "x5_policy_joint_intervention":
+        metadata["hardware_embodiment"] = "arx_x5"
+        metadata["hardware_profile"] = "arx_x5_identity_joint_v1"
+        metadata["hardware_bridge_protocol"] = "robodojo_dual_joint_mirror_v1"
+        metadata["hardware_bridge_commit"] = _git_revision(x5_code_root)
+        metadata["hardware_bridge_dirty"] = _git_dirty(x5_code_root)
+        metadata["hardware_control_topology"] = (
+            "policy_sim_to_two_x5_manual_two_x5_to_sim"
+        )
+    elif control_mode == "piperx_sim_dagger":
+        metadata["piperx_embodiment_profile"] = "arx_x5_piperx_relative_joint_v1"
+        metadata["piperx_bridge_protocol"] = "robodojo_piperx_v4"
+        metadata["piperx_bridge_commit"] = _git_revision(piperx_code_root)
+        metadata["piperx_bridge_dirty"] = _git_dirty(piperx_code_root)
+        metadata["piperx_control_topology"] = (
+            "direct_joint_policy_sim_to_follower_to_leader_manual_joint_fanout"
+        )
+    elif (
+        control_mode == "piperx_restore_recovery"
+        or (
+            control_mode == "piperx_policy_joint_intervention"
+            and _env_bool("ROBODOJO_DUAL_MIRROR_RECORD", False)
+        )
+    ):
+        metadata["piperx_embodiment_profile"] = "arx_x5_piperx_relative_joint_v1"
+        metadata["piperx_bridge_protocol"] = "robodojo_piperx_dual_joint_mirror_v1"
+        metadata["piperx_bridge_commit"] = _git_revision(piperx_code_root)
+        metadata["piperx_bridge_dirty"] = _git_dirty(piperx_code_root)
+        metadata["piperx_control_topology"] = (
+            "restored_sim_to_two_leader_relative_joint_recovery"
+            if control_mode == "piperx_restore_recovery"
+            else "policy_sim_to_two_leaders_manual_two_leaders_to_sim"
+        )
+        metadata["piperx_restore_direct_control"] = (
+            control_mode == "piperx_restore_recovery"
+        )
     return metadata
 
 

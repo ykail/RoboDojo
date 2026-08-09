@@ -229,14 +229,19 @@ class BaseEnv(gym.Env):
             self.sim.close()
             self.sim = None
 
-        try:
-            import omni.usd
+        # Replacing the stage is required when another environment will be
+        # created in this process. During final SimulationApp shutdown it
+        # races the live viewport: the old camera disappears before the empty
+        # replacement stage has a camera. Let SimulationApp own final teardown.
+        if not getattr(self, "_robodojo_final_shutdown", False):
+            try:
+                import omni.usd
 
-            ctx = omni.usd.get_context()
-            ctx.close_stage()
-            ctx.new_stage()
-        except Exception as e:
-            print("[restart] close_stage failed:", e)
+                ctx = omni.usd.get_context()
+                ctx.close_stage()
+                ctx.new_stage()
+            except Exception as e:
+                print("[restart] close_stage failed:", e)
 
     def update_seed(self, seed: Any | None = None):
         global_seed, _ = self._process_seed_input(seed)

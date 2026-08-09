@@ -39,7 +39,10 @@ RoboDojo simulation:
   --env-gpu ID                GPU visible to Isaac Sim (default: 0)
   --seed NUM                  RoboDojo layout-set seed (default: 0)
   --control-mode MODE         policy, keyboard_intervention,
-                              keyboard_observe, or piperx_sim_dagger
+                              keyboard_observe, piperx_sim_dagger,
+                              piperx_policy_leader_mirror, or
+                              piperx_policy_joint_intervention, or
+                              x5_policy_joint_intervention
                               (default: policy)
   --headless                  Disable the Isaac Sim window (GUI is the default)
 
@@ -102,6 +105,7 @@ expected_kai0_commit=""
 kai0_root="${ROOT_DIR}/third_party/kai0"
 kai0_python=""
 lerobot_python=""
+preflight_python="${ROBODOJO_PREFLIGHT_PYTHON:-}"
 eval_num="10"
 port="8000"
 env_gpu="0"
@@ -115,6 +119,8 @@ lerobot_repo_id="${ROBODOJO_LEROBOT_REPO_ID:-}"
 resume="0"
 lerobot_vcodec="h264"
 encoder_threads="2"
+piperx_record="${ROBODOJO_PIPERX_RECORD:-1}"
+dual_mirror_record="${ROBODOJO_DUAL_MIRROR_RECORD:-0}"
 piperx_bridge_host="${ROBODOJO_PIPERX_BRIDGE_HOST:-127.0.0.1}"
 piperx_bridge_port="${ROBODOJO_PIPERX_BRIDGE_PORT:-8765}"
 piperx_connect_timeout="${ROBODOJO_PIPERX_CONNECT_TIMEOUT_S:-5.0}"
@@ -347,11 +353,26 @@ if [[ -n "${external_policy_server_url}" ]]; then
 fi
 
 case "${control_mode}" in
-  policy|keyboard_intervention|keyboard_observe|piperx_sim_dagger) ;;
+  policy|keyboard_intervention|keyboard_observe|piperx_sim_dagger|piperx_policy_leader_mirror|piperx_policy_joint_intervention|x5_policy_joint_intervention) ;;
   *)
-    die "--control-mode must be policy, keyboard_intervention, keyboard_observe, or piperx_sim_dagger"
+    die "unsupported --control-mode: ${control_mode}"
     ;;
 esac
+case "${piperx_record}" in
+  1|true|TRUE|yes|YES|on|ON) piperx_record="1" ;;
+  0|false|FALSE|no|NO|off|OFF) piperx_record="0" ;;
+  *) die "ROBODOJO_PIPERX_RECORD must be a boolean" ;;
+esac
+case "${dual_mirror_record}" in
+  1|true|TRUE|yes|YES|on|ON) dual_mirror_record="1" ;;
+  0|false|FALSE|no|NO|off|OFF) dual_mirror_record="0" ;;
+  *) die "ROBODOJO_DUAL_MIRROR_RECORD must be a boolean" ;;
+esac
+if [[ "${dual_mirror_record}" == "1" \
+  && "${control_mode}" != "piperx_policy_joint_intervention" \
+  && "${control_mode}" != "x5_policy_joint_intervention" ]]; then
+  die "ROBODOJO_DUAL_MIRROR_RECORD=1 requires a dual-joint intervention mode"
+fi
 if [[ "${headless}" == "1" && "${control_mode}" != "policy" ]]; then
   die "--headless cannot be combined with an interactive/observation control mode"
 fi
@@ -424,9 +445,30 @@ if [[ -n "${lerobot_python}" ]]; then
   [[ -x "${lerobot_python}" ]] || die "LeRobot Python is not executable: ${lerobot_python}"
   lerobot_python="$(cd "$(dirname "${lerobot_python}")" && pwd -P)/$(basename "${lerobot_python}")"
 fi
+if [[ -n "${external_policy_server_url}" ]]; then
+  if [[ -z "${preflight_python}" ]]; then
+    preflight_python="$(command -v python)" \
+      || die "Active RoboDojo Python is not on PATH"
+  elif [[ "${preflight_python}" != /* ]]; then
+    preflight_python="$(command -v "${preflight_python}")" \
+      || die "Policy preflight Python is not on PATH: ${preflight_python}"
+  fi
+  [[ -x "${preflight_python}" ]] \
+    || die "Policy preflight Python is not executable: ${preflight_python}"
+  preflight_python="$(cd "$(dirname "${preflight_python}")" && pwd -P)/$(basename "${preflight_python}")"
+fi
 
+needs_lerobot_dataset="0"
 if [[ "${control_mode}" == "keyboard_intervention" \
-  || "${control_mode}" == "piperx_sim_dagger" ]]; then
+  || ( "${control_mode}" == "piperx_sim_dagger" && "${piperx_record}" == "1" ) \
+  || ( "${control_mode}" == "piperx_policy_joint_intervention" \
+    && "${dual_mirror_record}" == "1" ) \
+  || ( "${control_mode}" == "x5_policy_joint_intervention" \
+    && "${dual_mirror_record}" == "1" ) ]]; then
+  needs_lerobot_dataset="1"
+fi
+
+if [[ "${needs_lerobot_dataset}" == "1" ]]; then
   if [[ -z "${lerobot_repo_id}" ]]; then
     lerobot_repo_id="robodojo_interventions_${task}"
   fi
@@ -459,8 +501,10 @@ if [[ "${control_mode}" == "keyboard_intervention" \
       -u CONDA_DEFAULT_ENV \
       CUDA_VISIBLE_DEVICES="" \
       PYTHONNOUSERSITE="1" \
-      "${lerobot_python}" -c 'import numpy; import lerobot' >/dev/null; then
-      die "Recorder environment cannot import numpy/lerobot: ${lerobot_python}"
+      "${lerobot_python}" -c \
+        'import numpy; from lerobot.datasets.lerobot_dataset import LeRobotDataset' \
+        >/dev/null; then
+      die "Recorder environment cannot import LeRobotDataset and its dependencies: ${lerobot_python}"
     fi
   fi
 fi
@@ -518,6 +562,31 @@ if [[ "${control_mode}" == "keyboard_intervention" \
     "ROBODOJO_OPERATOR_DRIVEN=1"
     "ROBODOJO_REALTIME=1"
     "ROBODOJO_HIDE_ISAACLAB_WINDOW=1"
+    "ROBODOJO_TASK_NAME=${task}"
+    "ROBODOJO_ENV_CFG=arx_x5"
+    "ROBODOJO_CHECKPOINT=${checkpoint_id}"
+  )
+fi
+if [[ ( "${control_mode}" == "piperx_policy_joint_intervention" \
+    || "${control_mode}" == "x5_policy_joint_intervention" ) \
+  && "${dual_mirror_record}" == "1" ]]; then
+  eval_environment+=(
+    "ROBODOJO_TASK_NAME=${task}"
+    "ROBODOJO_ENV_CFG=arx_x5"
+    "ROBODOJO_CHECKPOINT=${checkpoint_id}"
+  )
+fi
+if [[ "${control_mode}" == "piperx_policy_joint_intervention" \
+  || "${control_mode}" == "x5_policy_joint_intervention" ]]; then
+  eval_environment+=("ROBODOJO_DUAL_MIRROR_RECORD=${dual_mirror_record}")
+fi
+if [[ "${control_mode}" == "x5_policy_joint_intervention" ]]; then
+  eval_environment+=(
+    "ROBODOJO_DUAL_MIRROR_PROFILE=arx_x5_identity_joint_v1"
+  )
+fi
+if [[ "${needs_lerobot_dataset}" == "1" ]]; then
+  eval_environment+=(
     "ROBODOJO_LEROBOT_PYTHON=${lerobot_python}"
     "ROBODOJO_LEROBOT_ROOT=${lerobot_root}"
     "ROBODOJO_LEROBOT_REPO_ID=${lerobot_repo_id}"
@@ -525,13 +594,11 @@ if [[ "${control_mode}" == "keyboard_intervention" \
     "ROBODOJO_LEROBOT_VCODEC=${lerobot_vcodec}"
     "ROBODOJO_LEROBOT_ENCODER_THREADS=${encoder_threads}"
     "ROBODOJO_LEROBOT_STREAMING_ENCODING=1"
-    "ROBODOJO_TASK_NAME=${task}"
-    "ROBODOJO_ENV_CFG=arx_x5"
-    "ROBODOJO_CHECKPOINT=${checkpoint_id}"
   )
 fi
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   eval_environment+=(
+    "ROBODOJO_PIPERX_RECORD=${piperx_record}"
     "ROBODOJO_PIPERX_BRIDGE_HOST=${piperx_bridge_host}"
     "ROBODOJO_PIPERX_BRIDGE_PORT=${piperx_bridge_port}"
     "ROBODOJO_PIPERX_CONNECT_TIMEOUT_S=${piperx_connect_timeout}"
@@ -567,7 +634,7 @@ if [[ -n "${external_policy_server_url}" ]]; then
     "CUDA_VISIBLE_DEVICES="
     "PYTHONNOUSERSITE=1"
     "PYTHONPATH=${ROOT_DIR}"
-    "${lerobot_python}"
+    "${preflight_python}"
     "${preflight_script}"
     --url "${policy_url}"
     --expected-checkpoint-id "${checkpoint_id}"
@@ -612,13 +679,14 @@ if [[ -n "${expected_checkpoint_digest}" ]]; then
   echo "[eval_kai0_pi05] expected_checkpoint_digest=${expected_checkpoint_digest}"
 fi
 echo "[eval_kai0_pi05] policy_url=${policy_url} headless=${headless}"
-if [[ "${control_mode}" == "keyboard_intervention" \
-  || "${control_mode}" == "piperx_sim_dagger" ]]; then
+if [[ "${needs_lerobot_dataset}" == "1" ]]; then
   echo "[eval_kai0_pi05] LeRobot=${lerobot_root%/}/${lerobot_repo_id} resume=${resume}"
+elif [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
+  echo "[eval_kai0_pi05] LeRobot recording disabled"
 fi
 if [[ "${control_mode}" == "piperx_sim_dagger" ]]; then
   echo "[eval_kai0_pi05] PiPER-X bridge=${piperx_bridge_host}:${piperx_bridge_port}"
-  echo "[eval_kai0_pi05] PiPER-X profile=arx_x5_piperx_relative_v1 (automatic relative anchors)"
+  echo "[eval_kai0_pi05] PiPER-X profile=arx_x5_piperx_relative_joint_v1 (automatic relative anchors)"
   echo "[eval_kai0_pi05] NOTE: the separate supervised bridge owns CAN; the first episode authorizes its arm stage"
 fi
 

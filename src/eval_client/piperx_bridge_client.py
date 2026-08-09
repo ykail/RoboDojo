@@ -18,8 +18,8 @@ import time
 from typing import Any
 import uuid
 
-PROTOCOL = "robodojo_piperx_v3"
-EMBODIMENT_PROFILE = "arx_x5_piperx_relative_v1"
+PROTOCOL = "robodojo_piperx_v4"
+EMBODIMENT_PROFILE = "arx_x5_piperx_relative_joint_v1"
 MAX_FRAME_BYTES = 1 << 20
 _ENVELOPE_KEYS = frozenset(
     {
@@ -41,13 +41,14 @@ _REQUEST_TYPES = frozenset(
         "transition_ack",
         "manual_sample",
         "manual_resolve",
+        "poll",
         "heartbeat",
         "hold",
         "end_episode",
     }
 )
 _MODES = frozenset({"policy", "intervention", "fault"})
-_CONTROL_TOPOLOGY = "policy_sim_to_follower_to_leader_manual_leader_joint_fanout"
+_CONTROL_TOPOLOGY = "direct_joint_policy_sim_to_follower_to_leader_manual_joint_fanout"
 _LEADER_ACTUATION_MODES = frozenset({"output_follow", "native_leader", "disabled", "fault"})
 _FOLLOWER_ACTUATION_MODES = frozenset({"sim_follow", "leader_follow", "hold", "disabled", "fault"})
 _TRANSITIONS = frozenset({None, "entering_intervention", "reattaching_policy"})
@@ -98,33 +99,32 @@ def _reason(value: Any) -> str:
     return value.strip()[:512]
 
 
-def _pose(value: Any, *, label: str) -> tuple[float, ...]:
-    if not isinstance(value, list) or len(value) != 7:
-        raise PiperXBridgeProtocolError(f"{label} must be [x,y,z,qw,qx,qy,qz]")
-    pose = tuple(_finite_number(item, label=f"{label}[{index}]") for index, item in enumerate(value))
-    norm = math.sqrt(sum(component * component for component in pose[3:]))
-    if not 0.999 <= norm <= 1.001:
-        raise PiperXBridgeProtocolError(f"{label} quaternion must be normalized, got norm={norm:g}")
-    return pose
+def _joints(value: Any, *, label: str) -> tuple[float, ...]:
+    if not isinstance(value, list) or len(value) != 6:
+        raise PiperXBridgeProtocolError(f"{label} must contain six joint angles")
+    return tuple(
+        _finite_number(item, label=f"{label}[{index}]")
+        for index, item in enumerate(value)
+    )
 
 
 @dataclass(frozen=True)
 class SimArmTarget:
-    """One simulator end-effector target sent to the physical mirror."""
+    """One simulator joint target sent to the physical mirror."""
 
-    pose: tuple[float, ...]
+    joints_rad: tuple[float, ...]
     gripper: float
 
     def __post_init__(self) -> None:
-        pose = _pose(list(self.pose), label="sim.pose")
+        joints_rad = _joints(list(self.joints_rad), label="sim.joints_rad")
         gripper = _finite_number(self.gripper, label="sim.gripper")
         if not 0.0 <= gripper <= 1.0:
             raise PiperXBridgeProtocolError("sim.gripper must be in [0, 1]")
-        object.__setattr__(self, "pose", pose)
+        object.__setattr__(self, "joints_rad", joints_rad)
         object.__setattr__(self, "gripper", gripper)
 
     def to_payload(self) -> dict[str, Any]:
-        return {"pose": list(self.pose), "gripper": self.gripper}
+        return {"joints_rad": list(self.joints_rad), "gripper": self.gripper}
 
 
 @dataclass(frozen=True)
@@ -140,9 +140,9 @@ class SimTargets:
 
 @dataclass(frozen=True)
 class OperatorArmSample:
-    """One physical leader state whose pose was computed from the same cached joints."""
+    """One effective PiPER-X model joint target from the cached leader sample."""
 
-    pose: tuple[float, ...]
+    joints_rad: tuple[float, ...]
     gripper_m: float
     sampled_monotonic_ns: int
 
@@ -266,16 +266,16 @@ def receive_frame(connection: socket.socket, *, max_frame_bytes: int = MAX_FRAME
 
 
 def _parse_arm_sample(value: Any, *, label: str) -> OperatorArmSample:
-    expected = {"pose", "gripper_m", "sampled_monotonic_ns"}
+    expected = {"joints_rad", "gripper_m", "sampled_monotonic_ns"}
     if not isinstance(value, dict) or set(value) != expected:
         raise PiperXBridgeProtocolError(
-            f"{label} must contain exactly pose, gripper_m and sampled_monotonic_ns"
+            f"{label} must contain exactly joints_rad, gripper_m and sampled_monotonic_ns"
         )
     gripper_m = _finite_number(value["gripper_m"], label=f"{label}.gripper_m")
     if not 0.0 <= gripper_m <= 0.2:
         raise PiperXBridgeProtocolError(f"{label}.gripper_m must be in [0, 0.2]")
     return OperatorArmSample(
-        pose=_pose(value["pose"], label=f"{label}.pose"),
+        joints_rad=_joints(value["joints_rad"], label=f"{label}.joints_rad"),
         gripper_m=gripper_m,
         sampled_monotonic_ns=_non_negative_int(
             value["sampled_monotonic_ns"], label=f"{label}.sampled_monotonic_ns"
@@ -509,7 +509,7 @@ class PiperXBridgeClient:
         }
         if not isinstance(payload, dict) or set(payload) != expected_payload_keys:
             raise PiperXBridgeProtocolError(
-                "PiPER-X v3 response payload keys do not match the strict schema"
+                "PiPER-X v4 response payload keys do not match the strict schema"
             )
         mode = payload["mode"]
         edge = payload["edge"]
@@ -587,6 +587,15 @@ class PiperXBridgeClient:
             health=dict(payload["health"]),
             diagnostics=dict(payload["diagnostics"]),
         )
+        if request_type == "poll" and (
+            motion_accepted
+            or manual_sample is not None
+            or manual_resolution is not None
+            or sample.diagnostics.get("operation") is not None
+        ):
+            raise PiperXBridgeProtocolError(
+                "poll must be a motion-free response with no manual payload or operation"
+            )
         # Heartbeat proves only connection liveness.  It deliberately neither
         # acknowledges nor consumes the hardware-side operator generation;
         # the next exchange remains the sole control-state boundary.
@@ -698,6 +707,13 @@ class PiperXBridgeClient:
         if not self._episode_active:
             raise PiperXBridgeProtocolError("exchange requires an active PiPER-X episode")
         return self._request("exchange", {"sim": sim.to_payload()})
+
+    def poll(self) -> OperatorSample:
+        """Read UI/transition state without issuing any hardware motion."""
+
+        if not self._episode_active:
+            raise PiperXBridgeProtocolError("poll requires an active PiPER-X episode")
+        return self._request("poll", {})
 
     def transition_ack(self, sim: SimTargets) -> OperatorSample:
         if not self._episode_active:

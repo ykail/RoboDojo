@@ -71,11 +71,27 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.additional_info = self.eval_cfg.get("additional_info", "")
             self.eval_seed = self.eval_cfg.get("seed", 0)
             self.control_mode = self.eval_cfg.get("control_mode", "policy")
+            self.manual_only = self.control_mode in {
+                "piperx_manual",
+                "piperx_joint_j1",
+                "piperx_sim_follow_j1",
+                "piperx_dual_joint_test",
+                "piperx_restore_recovery",
+            }
+            self.restore_saved_layout = self.eval_cfg.get("restore_saved_layout", None)
             self.observation_mode = self.control_mode == "keyboard_observe"
             self.operator_driven = bool(
                 self.eval_cfg.get(
                     "operator_driven",
-                    self.control_mode in {"keyboard_intervention", "piperx_sim_dagger"},
+                    self.control_mode in {
+                        "keyboard_intervention",
+                        "piperx_sim_dagger",
+                        "piperx_manual",
+                        "piperx_joint_j1",
+                        "piperx_sim_follow_j1",
+                        "piperx_dual_joint_test",
+                        "piperx_restore_recovery",
+                    },
                 )
             )
             self.layout_cycle = 0
@@ -153,6 +169,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 "details": {},
             }
             self.policy_provenance = None
+            # CP12 is still a policy-backed episode, but once the operator has
+            # entered manual control it must not be attributed as a pure policy
+            # trial by the policy-v1 lifecycle.
+            self.piperx_intervention_occurred = False
 
             self.scene_manager.layout_manager.replay = True
             self.seed_manager = SeedManager(config.eval_cfg)
@@ -202,14 +222,17 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             )
 
             self.deploy_cfg = config.deploy_cfg
+            self.model_client = None
             self.port = self.deploy_cfg.get("port", None)
-            if self.port is None:
+            if self.port is None and not self.manual_only:
                 raise ValueError("Port must be specified in deploy_cfg for the policy server!")
             self.host = self.deploy_cfg.get("host", "localhost")
             policy_server_url = self.deploy_cfg.get("policy_server_url") or f"ws://{self.host}:{self.port}"
             self._policy_episode_counter = 0
             self._next_policy_reset_reason = ResetReason.EPISODE_START
-            if self.policy_runtime == "robodojo_policy_v1":
+            if self.manual_only:
+                print("[PiPER-X Manual] policy client disabled")
+            elif self.policy_runtime == "robodojo_policy_v1":
                 if self.num_envs != 1 or self.eval_batch:
                     raise ValueError(
                         "robodojo_policy_v1 requires num_envs=1 and eval_batch=false",
@@ -300,6 +323,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.success = [True] * self.num_envs
             self.end_flag = [False] * self.num_envs
             self.take_action_cnt = [0] * self.num_envs
+            self.piperx_intervention_occurred = False
             # Discard any writers left open by a previous (e.g. crashed or
             # unstable) batch before starting a fresh one.
             self._abort_video_writers()
@@ -308,9 +332,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
             self.current_env_seed_map = {}
             for idx in range(self.num_envs):
-                self.scene_manager.layout_manager.set_saved_layout(
-                    idx, self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
+                saved_layout = (
+                    deepcopy(self.restore_saved_layout)
+                    if self.control_mode == "piperx_restore_recovery"
+                    and self.restore_saved_layout is not None
+                    else self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
                 )
+                self.scene_manager.layout_manager.set_saved_layout(idx, saved_layout)
                 if seed[idx] is None:
                     self.success[idx] = False
                     self.end_flag[idx] = True
@@ -324,7 +352,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.robot_manager.set_robot_init_state()
             self.reward_manager.init_state()
 
-            if self.policy_runtime == "robodojo_policy_v1":
+            if self.manual_only:
+                pass
+            elif self.policy_runtime == "robodojo_policy_v1":
                 self._start_policy_v1_episode()
             else:
                 self.model_client.call(func_name="reset")
@@ -414,6 +444,55 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
                 run_piperx_sim_dagger_episode(self, self.model_client)
                 return
+            if self.control_mode == "piperx_joint_j1":
+                from src.eval_client.piperx_joint_j1 import (
+                    run_piperx_joint_j1_episode,
+                )
+
+                run_piperx_joint_j1_episode(self)
+                return
+            if self.control_mode == "piperx_sim_follow_j1":
+                from src.eval_client.piperx_sim_follow_j1 import (
+                    run_piperx_sim_follow_j1_episode,
+                )
+
+                run_piperx_sim_follow_j1_episode(self)
+                return
+            if self.control_mode == "piperx_dual_joint_test":
+                from src.eval_client.piperx_dual_joint_mirror import (
+                    run_piperx_dual_joint_test_episode,
+                )
+
+                run_piperx_dual_joint_test_episode(self)
+                return
+            if self.control_mode in {
+                "piperx_policy_leader_mirror",
+                "piperx_policy_joint_intervention",
+                "x5_policy_joint_intervention",
+            }:
+                from src.eval_client.piperx_dual_joint_mirror import (
+                    run_piperx_policy_leader_mirror_episode,
+                )
+
+                run_piperx_policy_leader_mirror_episode(
+                    self,
+                    self.model_client,
+                    allow_intervention=(
+                        self.control_mode
+                        in {
+                            "piperx_policy_joint_intervention",
+                            "x5_policy_joint_intervention",
+                        }
+                    ),
+                )
+                return
+            if self.control_mode == "piperx_manual":
+                from src.eval_client.piperx_sim_dagger_loop import (
+                    run_piperx_sim_dagger_episode,
+                )
+
+                run_piperx_sim_dagger_episode(self, None, manual_only=True)
+                return
             if self.policy_runtime == "robodojo_policy_v1":
                 run_single_env_policy_episode(self, self.model_client)
                 return
@@ -456,8 +535,17 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
                 run_keyboard_intervention_episode(self, self.model_client)
                 return
-            if self.control_mode == "piperx_sim_dagger":
-                raise RuntimeError("piperx_sim_dagger does not support batched evaluation")
+            if self.control_mode in {
+                "piperx_sim_dagger",
+                "piperx_manual",
+                "piperx_joint_j1",
+                "piperx_sim_follow_j1",
+                "piperx_dual_joint_test",
+                "piperx_policy_leader_mirror",
+                "piperx_policy_joint_intervention",
+                "x5_policy_joint_intervention",
+            }:
+                raise RuntimeError(f"{self.control_mode} does not support batched evaluation")
             policy_name = self.deploy_cfg["policy_name"]
             try:
                 eval_module = __import__(
@@ -651,6 +739,10 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             interpolation_nums = int(self.obs_manager.collect_interval)
             if interpolation_nums <= 0:
                 return [deepcopy(control_info)]
+            direct_recovery_control = (
+                self.control_mode == "piperx_restore_recovery"
+                and bool(getattr(self, "piperx_intervention_occurred", False))
+            )
 
             control_info_list = [deepcopy(control_info) for _ in range(interpolation_nums)]
             for robot in self.robot_manager.robot_list:
@@ -667,7 +759,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     position = control_info[key_name]["position"]
                     current_position = self.robot_manager.get_joint(robot, env_idx_list=[env_idx])[env_idx]
                     if current_position is not None:
-                        interp_count = int(np.floor(interpolation_nums * 0.8))
+                        interp_count = (
+                            0
+                            if direct_recovery_control
+                            else int(np.floor(interpolation_nums * 0.8))
+                        )
 
                         current_arr = np.array(current_position)
                         target_arr = np.array(position)
@@ -687,7 +783,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         env_idx
                     ][0]
                     if current_position is not None:
-                        interp_count = int(np.floor(interpolation_nums * 0.8))
+                        interp_count = (
+                            0
+                            if direct_recovery_control
+                            else int(np.floor(interpolation_nums * 0.8))
+                        )
 
                         scale = robot.gripper_scale
                         for i in range(interp_count):
@@ -951,6 +1051,13 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             def normal_outcome():
                 if self.operator_driven or self.observation_mode:
                     return operator_trial_end("operator_controlled_boundary")
+                if self.piperx_intervention_occurred:
+                    reason = (
+                        "x5_joint_intervention"
+                        if self.control_mode == "x5_policy_joint_intervention"
+                        else "piperx_joint_intervention"
+                    )
+                    return operator_trial_end(reason)
                 return task_trial_end(bool(self.success[0]))
 
             return run_policy_v1_lifecycle(
