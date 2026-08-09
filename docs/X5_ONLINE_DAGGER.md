@@ -27,7 +27,8 @@ A complete portable Git bundle is staged at
 with `scp` or removable storage, then run:
 
 ```bash
-git clone /path/to/RoboDojo-x5-dagger.bundle RoboDojo-x5-dagger
+git clone -b feat/arx-x5-online-dagger \
+  /path/to/RoboDojo-x5-dagger.bundle RoboDojo-x5-dagger
 cd RoboDojo-x5-dagger
 git submodule update --init --recursive
 ```
