@@ -195,35 +195,21 @@ class CameraView(XFormPrim):
         self._output_annotators = output_annotators
         self._annotators = dict()
         self.camera_resolution = camera_resolution
-        self._render_product = None
+        self._tiled_render_product = None
         self._updates_enabled = True
         self._setup_tiled_sensor()
 
     def __del__(self):
-        try:
-            self._clean_up_tiled_sensor()
-        except Exception:
-            pass
-        try:
-            XFormPrim.__del__(self)
-        except Exception:
-            pass
+        XFormPrim.__del__(self)
+        self._clean_up_tiled_sensor()
 
     def _clean_up_tiled_sensor(self):
         """Clean up the sensor by detaching annotators and destroying render products, and removing related prims."""
-        render_product = getattr(self, "_render_product", None)
-        if render_product is None:
-            return
-        seen_annotators: set[int] = set()
-        for annotator in getattr(self, "_annotators", {}).values():
-            if id(annotator) in seen_annotators:
-                continue
-            annotator.detach([render_product.path])
-            seen_annotators.add(id(annotator))
-        render_product.destroy()
-        self._render_product = None
-        self._annotators.clear()
-        self._updates_enabled = False
+        if self._tiled_render_product is not None:
+            # detach annotators from render product
+            self._tiled_annotator.detach([self._tiled_render_product.path])
+            # delete tiled render products
+            self._tiled_render_product.destroy()
 
     def set_updates_enabled(self, enabled: bool) -> None:
         """Pause this RTX render product without changing its render settings."""
@@ -240,9 +226,6 @@ class CameraView(XFormPrim):
             raise RuntimeError("tiled camera render product cannot be paused")
         setter(enabled)
         self._updates_enabled = enabled
-
-    def destroy(self) -> None:
-        self._clean_up_tiled_sensor()
 
     def _get_tiled_resolution(self, num_cameras, resolution) -> Tuple[int, int]:
         """Calculate the resolution for the tiled sensor based on the number of cameras and individual camera resolution.
@@ -269,7 +252,6 @@ class CameraView(XFormPrim):
             tile_resolution=self.camera_resolution,
             name=f"{self.name}_tiled_sensor",
         )
-        self._updates_enabled = True
         # define the annotators based on defined types
         self._render_product_path = self._render_product.path
         for annotator_type in self._output_annotators:

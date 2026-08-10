@@ -420,7 +420,7 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             "ROBODOJO_DUAL_MIRROR_RECORD=1",
             "ROBODOJO_X5_CODE_ROOT",
             "ROBODOJO_RENDERING_MODE=quality",
-            'ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-1}"',
+            'ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-0}"',
             "--control-mode x5_policy_joint_intervention",
             'CHECKPOINT_ID="RoboDojo-sim-arx_x5-joint-0/59999"',
             "--checkpoint-id",

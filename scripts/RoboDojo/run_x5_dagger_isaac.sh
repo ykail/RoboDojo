@@ -81,10 +81,11 @@ export ROBODOJO_REALTIME=1
 # render products are paused and their quality frames are rendered afterwards
 # from exact simulator snapshots.
 export ROBODOJO_RENDERING_MODE=quality
-# RoboDojo already forces GPU PhysX, but its stock IsaacLab tensor pipeline is
-# CPU-backed. Keep X5 control tensors and scene state on the same GPU; set this
-# to 0 for an immediate fallback if a task exposes a GPU/Fabric incompatibility.
-export ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-1}"
+# Keep the stock CPU tensor pipeline: RoboDojo's reward and scene logic passes
+# poses to NumPy/Shapely.  The CUDA/Fabric path is experimental and can be
+# enabled explicitly with ROBODOJO_X5_CUDA_PIPELINE=1 after those boundaries
+# are ported.
+export ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-0}"
 # make_toast uses dt=4 ms and ten physics steps per 25 Hz action.  The old
 # 125 Hz Kit cap alone could consume roughly 80 ms before camera rendering.
 export ROBODOJO_MAIN_RATE_LIMIT_HZ="${ROBODOJO_MAIN_RATE_LIMIT_HZ:-250}"
@@ -102,7 +103,7 @@ echo "[X5 Isaac] hardware=${SOURCE_HOST}:${SOURCE_PORT} protocol=${MIRROR_PROTOC
 echo "[X5 Isaac] profile=${MIRROR_PROFILE} signs=[+1,+1,+1,+1,+1,+1]"
 echo "[X5 Isaac] dataset=${DATASET_PATH}"
 echo "[X5 Isaac] rendering=${ROBODOJO_RENDERING_MODE} (official quality is the default)"
-echo "[X5 Isaac] CUDA tensor/Fabric pipeline=${ROBODOJO_X5_CUDA_PIPELINE} (0 restores stock CPU tensors)"
+echo "[X5 Isaac] CUDA tensor/Fabric pipeline=${ROBODOJO_X5_CUDA_PIPELINE} (0 is the supported default)"
 echo "[X5 Isaac] Kit main-loop cap=${ROBODOJO_MAIN_RATE_LIMIT_HZ}Hz"
 echo "[X5 Isaac] use the global i key to enter/leave intervention; terminal focus is not required"
 echo "[X5 Isaac] an episode is committed automatically at its terminal outcome"
