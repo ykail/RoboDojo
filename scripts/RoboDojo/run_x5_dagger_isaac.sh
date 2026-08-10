@@ -18,9 +18,9 @@ SEED="${ROBODOJO_SEED:-0}"
 POLICY_SEED="${ROBODOJO_POLICY_SEED:-${SEED}}"
 ENCODER_THREADS="${ROBODOJO_LEROBOT_ENCODER_THREADS:-2}"
 
-CHECKPOINT_ID="${ROBODOJO_CHECKPOINT_ID:-RoboDojo-sim-arx_x5-joint-0/59999}"
-EXPECTED_KAI0_COMMIT="${ROBODOJO_EXPECTED_KAI0_COMMIT-ecc1a7451c3156b1e5f7533851dbb0222896206f}"
-EXPECTED_CHECKPOINT_DIGEST="${ROBODOJO_EXPECTED_CHECKPOINT_DIGEST-sha256:70bb68139ba717553d9a9d9c3055bb322b85046d729377ee46eaaf997c1eaac4}"
+CHECKPOINT_ID="${ROBODOJO_CHECKPOINT_ID:-}"
+EXPECTED_KAI0_COMMIT="${ROBODOJO_EXPECTED_KAI0_COMMIT:-}"
+EXPECTED_CHECKPOINT_DIGEST="${ROBODOJO_EXPECTED_CHECKPOINT_DIGEST:-}"
 MIRROR_PROTOCOL="robodojo_dual_joint_mirror_v1"
 MIRROR_PROFILE="arx_x5_identity_joint_v1"
 
@@ -42,6 +42,12 @@ done
     || die "X5 collection requires profile ${MIRROR_PROFILE}"
 [[ "${ROBODOJO_DUAL_MIRROR_PROTOCOL:-${MIRROR_PROTOCOL}}" == "${MIRROR_PROTOCOL}" ]] \
     || die "X5 collection requires protocol ${MIRROR_PROTOCOL}"
+[[ -n "${CHECKPOINT_ID}" ]] \
+    || die "ROBODOJO_CHECKPOINT_ID is unset; start through run_acone_x5_isaac.sh"
+[[ "${EXPECTED_KAI0_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+    || die "ROBODOJO_EXPECTED_KAI0_COMMIT must be the commit discovered from policy HELLO"
+[[ "${EXPECTED_CHECKPOINT_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "ROBODOJO_EXPECTED_CHECKPOINT_DIGEST must be the digest discovered from policy HELLO"
 
 if ! (exec 3<>"/dev/tcp/127.0.0.1/${POLICY_PORT}") >/dev/null 2>&1; then
     die "Hoo policy tunnel is not reachable at 127.0.0.1:${POLICY_PORT}"
@@ -66,12 +72,10 @@ args=(
     --control-mode x5_policy_joint_intervention
 )
 
-if [[ -n "${EXPECTED_KAI0_COMMIT}" ]]; then
-    args+=(--expected-kai0-commit "${EXPECTED_KAI0_COMMIT}")
-fi
-if [[ -n "${EXPECTED_CHECKPOINT_DIGEST}" ]]; then
-    args+=(--expected-checkpoint-digest "${EXPECTED_CHECKPOINT_DIGEST}")
-fi
+args+=(
+    --expected-kai0-commit "${EXPECTED_KAI0_COMMIT}"
+    --expected-checkpoint-digest "${EXPECTED_CHECKPOINT_DIGEST}"
+)
 
 if [[ -e "${DATASET_PATH}" || -L "${DATASET_PATH}" ]]; then
     [[ -f "${DATASET_PATH}/meta/info.json" ]] \

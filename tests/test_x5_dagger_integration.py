@@ -384,6 +384,9 @@ class X5DaggerIntegrationTest(unittest.TestCase):
     def test_x5_launchers_are_foreground_and_pin_the_integration_contract(self):
         hardware = SCRIPT_DIR / "run_x5_dagger_hardware.sh"
         isaac = SCRIPT_DIR / "run_x5_dagger_isaac.sh"
+        generic_acone = SCRIPT_DIR / "run_acone_x5_isaac.sh"
+        generic_tunnel = SCRIPT_DIR / "run_acone_x5_tunnel.sh"
+        generic_policy = SCRIPT_DIR / "run_hoo_policy.sh"
         pen_holder = SCRIPT_DIR / "run_acone_x5_pen_holder_isaac.sh"
         pen_holder_9999 = SCRIPT_DIR / "run_acone_x5_pen_holder_9999_isaac.sh"
         pen_tunnel = SCRIPT_DIR / "run_acone_x5_pen_holder_tunnel.sh"
@@ -394,6 +397,9 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             for script in (
                 hardware,
                 isaac,
+                generic_acone,
+                generic_tunnel,
+                generic_policy,
                 pen_holder,
                 pen_holder_9999,
                 pen_tunnel,
@@ -406,6 +412,9 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         for script in (
             hardware,
             isaac,
+            generic_acone,
+            generic_tunnel,
+            generic_policy,
             pen_holder,
             pen_holder_9999,
             pen_tunnel,
@@ -455,12 +464,12 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             'ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-0}"',
             "--control-mode x5_policy_joint_intervention",
             'TASK="${ROBODOJO_TASK:-make_toast}"',
-            'CHECKPOINT_ID="${ROBODOJO_CHECKPOINT_ID:-RoboDojo-sim-arx_x5-joint-0/59999}"',
+            'CHECKPOINT_ID="${ROBODOJO_CHECKPOINT_ID:-}"',
             "--checkpoint-id",
             '--external-policy-server-url "ws://127.0.0.1:${POLICY_PORT}"',
-            'EXPECTED_KAI0_COMMIT="${ROBODOJO_EXPECTED_KAI0_COMMIT-ecc1a7451c3156b1e5f7533851dbb0222896206f}"',
+            'EXPECTED_KAI0_COMMIT="${ROBODOJO_EXPECTED_KAI0_COMMIT:-}"',
             "--expected-kai0-commit",
-            'EXPECTED_CHECKPOINT_DIGEST="${ROBODOJO_EXPECTED_CHECKPOINT_DIGEST-sha256:70bb68139ba717553d9a9d9c3055bb322b85046d729377ee46eaaf997c1eaac4}"',
+            'EXPECTED_CHECKPOINT_DIGEST="${ROBODOJO_EXPECTED_CHECKPOINT_DIGEST:-}"',
             "--expected-checkpoint-digest",
             "ROBODOJO_DUAL_MIRROR_TIMEOUT_S",
             "eval_kai0_pi05.sh",
@@ -469,43 +478,91 @@ class X5DaggerIntegrationTest(unittest.TestCase):
                 self.assertIn(required, isaac_source)
         self.assertNotIn("run_x5_dagger_hardware.sh", isaac_source)
 
+        generic_acone_source = generic_acone.read_text(encoding="utf-8")
+        for required in (
+            "--policy-dir",
+            "--task",
+            "--checkpoint-id",
+            "--preflight-only",
+            "preflight_policy_v1.py",
+            "--require-clean",
+            'payload.get("code_revision", "")',
+            'payload.get("checkpoint_digest", "")',
+            'export ROBODOJO_EXPECTED_KAI0_COMMIT="${EXPECTED_KAI0_COMMIT}"',
+            'export ROBODOJO_EXPECTED_CHECKPOINT_DIGEST="${EXPECTED_CHECKPOINT_DIGEST}"',
+            "run_x5_dagger_isaac.sh",
+        ):
+            with self.subTest(generic_acone_required=required):
+                self.assertIn(required, generic_acone_source)
+        self.assertNotIn("sha256:70bb68139", generic_acone_source)
+        self.assertNotIn("sha256:7e3cbf579", generic_acone_source)
+
+        generic_policy_source = generic_policy.read_text(encoding="utf-8")
+        for required in (
+            "--policy-dir",
+            "--task",
+            'DETECTED_SCHEMA="$(',
+            'STRICT_KAI0_ROOT="${ROBODOJO_KAI0_STRICT_ROOT:-/home/hoo/RoboDojo/third_party/kai0}"',
+            'OUTPUT_ENGINE_KAI0_ROOT="${ROBODOJO_KAI0_OUTPUT_ENGINE_ROOT:-/home/hoo/kai0-output-engine-policy-v1}"',
+            "ecc1a7451c3156b1e5f7533851dbb0222896206f",
+            "76d26714c276c9a4812066854d248111382fe591",
+            "params/output_engine/",
+            '("action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out")',
+            "--checkpoint-dir",
+            "--checkpoint-step",
+            "--dry-run",
+        ):
+            with self.subTest(generic_policy_required=required):
+                self.assertIn(required, generic_policy_source)
+
+        generic_tunnel_source = generic_tunnel.read_text(encoding="utf-8")
+        self.assertIn("--port", generic_tunnel_source)
+        self.assertIn('export ROBODOJO_POLICY_PORT="${POLICY_PORT}"', generic_tunnel_source)
+        self.assertIn('export HOO_POLICY_PORT="${POLICY_PORT}"', generic_tunnel_source)
+
+        for generic in (generic_acone, generic_tunnel, generic_policy):
+            with self.subTest(generic_help=generic.name):
+                help_result = subprocess.run(
+                    ["bash", str(generic), "--help"],
+                    cwd=ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(help_result.returncode, 0, help_result.stderr)
+                self.assertIn("--option=value", help_result.stdout)
+
         pen_source = pen_holder.read_text(encoding="utf-8")
         for required in (
-            'ROBODOJO_TASK="fill_pen_holder"',
-            'ROBODOJO_CHECKPOINT_ID="fill_pen_holder/9999_my"',
-            'ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"',
+            "--task fill_pen_holder",
+            "--checkpoint-id fill_pen_holder/9999_my",
+            '--port "${ROBODOJO_POLICY_PORT:-18081}"',
             "robodojo_fill_pen_holder_x5_online_dagger_9999_my_v1",
-            "76d26714c276c9a4812066854d248111382fe591",
-            "sha256:7e3cbf579a37640a13c0d152cd5913b9142437627db1e5c33b4266602c2c46ab",
             "run_acone_x5_isaac.sh",
         ):
             with self.subTest(pen_holder_required=required):
                 self.assertIn(required, pen_source)
 
         pen_tunnel_source = pen_tunnel.read_text(encoding="utf-8")
-        self.assertIn('ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"', pen_tunnel_source)
-        self.assertIn('HOO_POLICY_PORT="${HOO_POLICY_PORT:-18081}"', pen_tunnel_source)
+        self.assertIn("run_acone_x5_tunnel.sh", pen_tunnel_source)
+        self.assertIn('--port "${ROBODOJO_POLICY_PORT:-18081}"', pen_tunnel_source)
 
         pen_policy_source = pen_policy.read_text(encoding="utf-8")
         for required in (
-            'KAI0_ROOT="/home/hoo/kai0-output-engine-policy-v1"',
-            'CHECKPOINT_DIR="/home/hoo/checkpoints/9999_my"',
-            'CHECKPOINT_ID="fill_pen_holder/9999_my"',
-            "another policy server is using the GPU",
-            "76d26714c276c9a4812066854d248111382fe591",
-            "sha256:7e3cbf579a37640a13c0d152cd5913b9142437627db1e5c33b4266602c2c46ab",
+            "run_hoo_policy.sh",
+            "--policy-dir /home/hoo/checkpoints/9999_my",
+            "--checkpoint-id fill_pen_holder/9999_my",
+            "--checkpoint-step 9999",
         ):
             with self.subTest(pen_policy_required=required):
                 self.assertIn(required, pen_policy_source)
 
         pen_9999_source = pen_holder_9999.read_text(encoding="utf-8")
         for required in (
-            'ROBODOJO_TASK="fill_pen_holder"',
-            'ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"',
+            "--task fill_pen_holder",
+            '--port "${ROBODOJO_POLICY_PORT:-18081}"',
             "robodojo_fill_pen_holder_x5_online_dagger_9999_v1",
             "pi05_robodojo_three_task_base/fill_pen_kong_toast_300_base_official_norm_v1/9999",
-            "ecc1a7451c3156b1e5f7533851dbb0222896206f",
-            "sha256:2b906f8e1d4932d7f7cb57aa2d8113f83efcc9f5fb35a0fc17c2934346c4eec2",
             "run_acone_x5_isaac.sh",
         ):
             with self.subTest(pen_9999_required=required):
@@ -513,11 +570,10 @@ class X5DaggerIntegrationTest(unittest.TestCase):
 
         pen_policy_9999_source = pen_policy_9999.read_text(encoding="utf-8")
         for required in (
-            'KAI0_ROOT="/home/hoo/RoboDojo/third_party/kai0"',
-            'CHECKPOINT_DIR="/home/hoo/checkpoints/9999"',
+            "run_hoo_policy.sh",
+            "--policy-dir /home/hoo/checkpoints/9999",
             "pi05_robodojo_three_task_base/fill_pen_kong_toast_300_base_official_norm_v1/9999",
-            "ecc1a7451c3156b1e5f7533851dbb0222896206f",
-            "sha256:2b906f8e1d4932d7f7cb57aa2d8113f83efcc9f5fb35a0fc17c2934346c4eec2",
+            "--checkpoint-step 9999",
         ):
             with self.subTest(pen_policy_9999_required=required):
                 self.assertIn(required, pen_policy_9999_source)
