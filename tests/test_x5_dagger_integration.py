@@ -462,6 +462,7 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             "ROBODOJO_X5_CODE_ROOT",
             "ROBODOJO_RENDERING_MODE=quality",
             "recording=online RGB for policy and intervention",
+            "manual timing=wall-time zero-order hold resampled to 25Hz",
             'ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-0}"',
             "--control-mode x5_policy_joint_intervention",
             'TASK="${ROBODOJO_TASK:-make_toast}"',
@@ -491,6 +492,8 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             'payload.get("checkpoint_digest", "")',
             'export ROBODOJO_EXPECTED_KAI0_COMMIT="${EXPECTED_KAI0_COMMIT}"',
             'export ROBODOJO_EXPECTED_CHECKPOINT_DIGEST="${EXPECTED_CHECKPOINT_DIGEST}"',
+            "_timing25_v2",
+            "manual timing=wall-time zero-order hold resampled to 25Hz",
             "run_x5_dagger_isaac.sh",
         ):
             with self.subTest(generic_acone_required=required):
@@ -538,7 +541,7 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             "--task fill_pen_holder",
             "--checkpoint-id fill_pen_holder/9999_my",
             '--port "${ROBODOJO_POLICY_PORT:-18081}"',
-            "robodojo_fill_pen_holder_x5_online_dagger_9999_my_v1",
+            "robodojo_fill_pen_holder_x5_online_dagger_9999_my_timing25_v2",
             "run_acone_x5_isaac.sh",
         ):
             with self.subTest(pen_holder_required=required):
@@ -562,7 +565,7 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         for required in (
             "--task fill_pen_holder",
             '--port "${ROBODOJO_POLICY_PORT:-18081}"',
-            "robodojo_fill_pen_holder_x5_online_dagger_9999_v1",
+            "robodojo_fill_pen_holder_x5_online_dagger_9999_timing25_v2",
             "pi05_robodojo_three_task_base/fill_pen_kong_toast_300_base_official_norm_v1/9999",
             "run_acone_x5_isaac.sh",
         ):
@@ -594,6 +597,11 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         self.assertIn("do_array_copy=True", camera_view_source)
         self.assertIn("def destroy(self) -> None", camera_view_source)
         self.assertIn("tiled camera output is not ready", camera_view_source)
+        self.assertIn("annotator was already invalid during detach", camera_view_source)
+        self.assertLess(
+            camera_view_source.index("self._render_product = None"),
+            camera_view_source.index("annotator.detach([render_product.path])"),
+        )
 
         capture_manager_source = _source(
             "env/camera_manager/capture/tiled_capture_manager.py"
@@ -602,6 +610,11 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         self.assertIn("self._output_buffers.clear()", capture_manager_source)
         self.assertIn("self.cameras = self.camera_manager.cameras", capture_manager_source)
         self.assertIn("self._updates_enabled = False", capture_manager_source)
+        self.assertIn("tiled camera teardown warning", capture_manager_source)
+
+        task_env_source = _source("env/environment/task_env.py")
+        self.assertIn('(\"simulation\", super().close)', task_env_source)
+        self.assertIn("if first_error is not None", task_env_source)
 
         main_source = _source("src/eval_client/main.py")
         self.assertIn("def _has_cuda_illegal_memory_error", main_source)

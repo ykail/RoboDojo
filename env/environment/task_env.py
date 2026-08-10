@@ -93,8 +93,27 @@ class TaskEnv(BaseEnv):
         self.robot_manager.control_robot(meta_control_list=meta_control_list)
 
     def close(self):
-        self.capture_manager.destroy()
-        self.camera_manager.destroy()
-        self.robot_manager.close()
-        self.scene_manager.close()
-        super().close()
+        # A cleanup warning from one subsystem must not strand the live
+        # simulator and make the next operator-selected layout impossible to
+        # launch.  Preserve the first exception, but always release every lower
+        # layer and the stage.
+        first_error = None
+        for label, operation in (
+            ("capture manager", self.capture_manager.destroy),
+            ("camera manager", self.camera_manager.destroy),
+            ("robot manager", self.robot_manager.close),
+            ("scene manager", self.scene_manager.close),
+            ("simulation", super().close),
+        ):
+            try:
+                operation()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                print(
+                    f"[environment cleanup] {label} warning: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+        if first_error is not None:
+            raise first_error

@@ -158,11 +158,33 @@ class _SynchronousPendingRecorder:
         return None
 
 
-def _response(*, mode="follow", edge=None, terminal=None, delta=0.0) -> dict:
+class _BlockingPendingRecorder(_SynchronousPendingRecorder):
+    waits = [0.5, 0.0]
+
+    def __init__(self, recorder):
+        super().__init__(recorder)
+        self._waits = list(self.waits)
+
+    def append(self, **kwargs):
+        self.recorder.append(**kwargs)
+        return self._waits.pop(0) if self._waits else 0.0
+
+
+def _response(
+    *,
+    mode="follow",
+    edge=None,
+    terminal=None,
+    delta=0.0,
+    sample_s=None,
+    boundary_s=None,
+) -> dict:
     return {
         "mode": mode,
         "edge": edge,
         "terminal": terminal,
+        "sample_monotonic_s": sample_s,
+        "boundary_monotonic_s": boundary_s,
         "sides": {
             side: {
                 "leader_delta_q_rad": np.full(6, delta),
@@ -238,10 +260,100 @@ class X5PolicyMirrorLoopTest(unittest.TestCase):
         self.assertGreater(events.index("get_obs", 1), events.index("take_action"))
         self.assertEqual(task.get_obs_count, 2)
         self.assertEqual(task.capture_updates, [])
+        self.assertEqual(len(recorder.finishes), 1)
+        finish = dict(recorder.finishes[0])
+        self.assertGreater(finish.pop("timestamp_s"), 0.0)
         self.assertEqual(
-            recorder.finishes,
-            [{"accepted": True, "success": False, "reason": "operator_accept_next"}],
+            finish,
+            {"accepted": True, "success": False, "reason": "operator_accept_next"},
         )
+
+    def test_exit_boundary_wins_if_right_arrives_before_next_policy_frame(self) -> None:
+        events: list[str] = []
+        client = _Client(
+            [
+                _response(sample_s=10.0),
+                _response(mode="manual", edge="enter", sample_s=10.6, boundary_s=10.5),
+                _response(mode="manual", delta=0.1, sample_s=11.0),
+                _response(mode="follow", edge="exit", sample_s=12.1, boundary_s=12.0),
+                _response(sample_s=12.2),
+                _response(terminal="save", sample_s=13.1, boundary_s=13.0),
+            ],
+            events,
+        )
+        task = _TaskEnv(events)
+        task.is_episode_end = lambda: False
+        recorder = _Recorder(events)
+        recorder_module = ModuleType("src.eval_client.lerobot_stream_recorder")
+        recorder_module.recorder_for_env = lambda _task_env: recorder
+
+        with mock.patch.object(
+            mirror, "DualJointMirrorClient", return_value=client
+        ), mock.patch.object(
+            mirror, "_SinglePendingRecorder", _SynchronousPendingRecorder
+        ), mock.patch.dict(
+            sys.modules,
+            {"src.eval_client.lerobot_stream_recorder": recorder_module},
+        ), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "1",
+                "ROBODOJO_REALTIME": "0",
+            },
+        ):
+            mirror.run_piperx_policy_leader_mirror_episode(
+                task,
+                _Model(),
+                allow_intervention=True,
+            )
+
+        self.assertEqual(recorder.finishes[0]["timestamp_s"], 12.0)
+
+    def test_writer_ack_wait_is_removed_from_next_manual_sample_time(self) -> None:
+        events: list[str] = []
+        client = _Client(
+            [
+                _response(sample_s=99.0),
+                _response(mode="manual", edge="enter", sample_s=99.9, boundary_s=99.8),
+                _response(mode="manual", delta=0.1, sample_s=100.0),
+                _response(mode="manual", delta=0.2, sample_s=100.75),
+                _response(mode="manual", terminal="save", sample_s=101.1, boundary_s=101.0),
+            ],
+            events,
+        )
+        task = _TaskEnv(events)
+        task.is_episode_end = lambda: False
+        recorder = _Recorder(events)
+        recorder_module = ModuleType("src.eval_client.lerobot_stream_recorder")
+        recorder_module.recorder_for_env = lambda _task_env: recorder
+
+        with mock.patch.object(
+            mirror, "DualJointMirrorClient", return_value=client
+        ), mock.patch.object(
+            mirror, "_SinglePendingRecorder", _BlockingPendingRecorder
+        ), mock.patch.dict(
+            sys.modules,
+            {"src.eval_client.lerobot_stream_recorder": recorder_module},
+        ), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "1",
+                "ROBODOJO_REALTIME": "0",
+            },
+        ):
+            mirror.run_piperx_policy_leader_mirror_episode(
+                task,
+                _Model(),
+                allow_intervention=True,
+            )
+
+        self.assertEqual(
+            [frame["control"]["timestamp"] for frame in recorder.frames],
+            [100.0, 100.25],
+        )
+        self.assertEqual(recorder.finishes[0]["timestamp_s"], 100.5)
 
     def test_left_discards_and_requests_same_layout_retry(self) -> None:
         events: list[str] = []

@@ -128,13 +128,15 @@ class JointMirrorSession:
         self.mode = "follow"
         self.require_zero = True
         self.pending_transition: str | None = None
+        self.pending_transition_monotonic_ns: int | None = None
         self.pending_terminal: str | None = None
+        self.pending_terminal_monotonic_ns: int | None = None
         self.terminal_delivered: str | None = None
         self.manual_anchor: DualState | None = None
         self.follow_anchor = hardware.latched_target
         self.ended = False
 
-    def toggle_intervention(self) -> bool:
+    def toggle_intervention(self, event_monotonic_ns: int | None = None) -> bool:
         if (
             self.ended
             or self.pending_transition is not None
@@ -143,15 +145,26 @@ class JointMirrorSession:
         ):
             return False
         self.pending_transition = "enter" if self.mode == "follow" else "exit"
+        self.pending_transition_monotonic_ns = int(
+            time.monotonic_ns() if event_monotonic_ns is None else event_monotonic_ns
+        )
         return True
 
-    def request_terminal(self, terminal: str) -> bool:
+    def request_terminal(
+        self,
+        terminal: str,
+        event_monotonic_ns: int | None = None,
+    ) -> bool:
         if terminal not in {"save", "retry"}:
             raise X5SourceError(f"invalid terminal request {terminal!r}")
         if self.ended or self.pending_terminal is not None or self.terminal_delivered is not None:
             return False
         self.pending_terminal = terminal
+        self.pending_terminal_monotonic_ns = int(
+            time.monotonic_ns() if event_monotonic_ns is None else event_monotonic_ns
+        )
         self.pending_transition = None
+        self.pending_transition_monotonic_ns = None
         return True
 
     def _response(
@@ -160,8 +173,12 @@ class JointMirrorSession:
         seq: int,
         edge: str | None,
         terminal: str | None = None,
+        boundary_monotonic_ns: int | None = None,
     ) -> dict[str, Any]:
         measured = self.hardware.read()
+        sample_monotonic_ns = int(measured.left.sample_monotonic_ns)
+        if int(measured.right.sample_monotonic_ns) != sample_monotonic_ns:
+            raise X5SourceError("left/right X5 samples do not share one monotonic timestamp")
         follow_target = self.hardware.latched_target
         sides: dict[str, dict[str, Any]] = {}
         for side in SIDES:
@@ -192,6 +209,10 @@ class JointMirrorSession:
             "mode": self.mode,
             "edge": edge,
             "terminal": terminal,
+            "sample_monotonic_ns": sample_monotonic_ns,
+            "boundary_monotonic_ns": (
+                None if boundary_monotonic_ns is None else int(boundary_monotonic_ns)
+            ),
             "sides": sides,
         }
 
@@ -200,11 +221,15 @@ class JointMirrorSession:
             raise X5SourceError("joint-mirror session has ended")
         request_type, seq, parsed = parse_request(payload, require_zero=self.require_zero)
         edge: str | None = None
+        boundary_monotonic_ns: int | None = None
 
         if request_type == "end":
             self.hardware.enter_hold()
             self.mode = "follow"
             self.pending_transition = None
+            self.pending_transition_monotonic_ns = None
+            self.pending_terminal = None
+            self.pending_terminal_monotonic_ns = None
             self.manual_anchor = None
             response = self._response(request_type, seq, None)
             self.ended = True
@@ -223,21 +248,33 @@ class JointMirrorSession:
                 self.follow_anchor = self.hardware.latched_target
                 self.require_zero = True
                 terminal = self.pending_terminal
+                boundary_monotonic_ns = self.pending_terminal_monotonic_ns
                 self.pending_terminal = None
+                self.pending_terminal_monotonic_ns = None
                 self.terminal_delivered = terminal
-                return self._response(request_type, seq, None, terminal)
+                return self._response(
+                    request_type,
+                    seq,
+                    None,
+                    terminal,
+                    boundary_monotonic_ns,
+                )
             if self.pending_transition == "enter":
+                boundary_monotonic_ns = self.pending_transition_monotonic_ns
                 self.manual_anchor = self.hardware.enter_teach()
                 self.mode = "manual"
                 self.pending_transition = None
+                self.pending_transition_monotonic_ns = None
                 edge = "enter"
             elif self.pending_transition == "exit":
+                boundary_monotonic_ns = self.pending_transition_monotonic_ns
                 self.hardware.enter_hold()
                 self.follow_anchor = self.hardware.latched_target
                 self.manual_anchor = None
                 self.mode = "follow"
                 self.require_zero = True
                 self.pending_transition = None
+                self.pending_transition_monotonic_ns = None
                 edge = "exit"
             elif self.mode == "follow":
                 requested = {
@@ -249,13 +286,23 @@ class JointMirrorSession:
             elif self.mode != "manual":
                 raise X5SourceError(f"invalid source mode {self.mode!r}")
 
-        return self._response(request_type, seq, edge)
+        return self._response(
+            request_type,
+            seq,
+            edge,
+            boundary_monotonic_ns=(
+                boundary_monotonic_ns if request_type == "joint_mirror" else None
+            ),
+        )
 
     def disconnect(self) -> None:
         if self.hardware.is_connected:
             self.hardware.enter_hold()
         self.mode = "follow"
         self.pending_transition = None
+        self.pending_transition_monotonic_ns = None
+        self.pending_terminal = None
+        self.pending_terminal_monotonic_ns = None
         self.manual_anchor = None
 
 
@@ -280,7 +327,7 @@ class _KeyReader:
         self._global_failed = False
         self._key_by_code: dict[int, str] = {}
         self._down_codes: set[int] = set()
-        self._pending: queue.Queue[str] = queue.Queue(maxsize=8)
+        self._pending: queue.Queue[tuple[str, int]] = queue.Queue(maxsize=8)
         self._lock = threading.RLock()
 
     @staticmethod
@@ -324,7 +371,9 @@ class _KeyReader:
                 return
             self._down_codes.add(keycode)
             try:
-                self._pending.put_nowait(self._key_by_code[keycode])
+                self._pending.put_nowait(
+                    (self._key_by_code[keycode], time.monotonic_ns())
+                )
             except queue.Full:
                 pass
 
@@ -422,7 +471,7 @@ class _KeyReader:
             self._enable_terminal()
         return self
 
-    def poll(self) -> str | None:
+    def poll(self) -> tuple[str, int] | None:
         if self._process is not None:
             if self._global_failed or self._process.poll() is not None:
                 self._stop_global()
@@ -438,10 +487,11 @@ class _KeyReader:
                 suffix = sys.stdin.read(1)
                 if suffix == "[" and select.select([sys.stdin], [], [], 0.02)[0]:
                     arrow = sys.stdin.read(1)
-                    return {"D": "left", "C": "right"}.get(arrow)
+                    key_name = {"D": "left", "C": "right"}.get(arrow)
+                    return None if key_name is None else (key_name, time.monotonic_ns())
                 return None
             key = key.lower()
-            return key if key in {"i", "q"} else None
+            return (key, time.monotonic_ns()) if key in {"i", "q"} else None
         return None
 
     def _stop_global(self) -> None:
@@ -553,11 +603,13 @@ def _serve_connection(
     buffer = b""
     last_liveness = time.monotonic()
     while True:
-        key = keys.poll()
+        key_event = keys.poll()
+        key = None if key_event is None else key_event[0]
+        key_monotonic_ns = None if key_event is None else key_event[1]
         if key == "q":
             session.disconnect()
             return True, False, session.terminal_delivered
-        if key == "i" and session.toggle_intervention():
+        if key == "i" and session.toggle_intervention(key_monotonic_ns):
             print(
                 f"\n[Dual X5] intervention {session.pending_transition} requested; "
                 "waiting for the next Isaac boundary.",
@@ -565,7 +617,7 @@ def _serve_connection(
             )
         elif key in {"left", "right"}:
             terminal = "retry" if key == "left" else "save"
-            if session.request_terminal(terminal):
+            if session.request_terminal(terminal, key_monotonic_ns):
                 label = "discard/retry" if terminal == "retry" else "save/next"
                 print(
                     f"\n[Dual X5] {label} requested; holding at the next Isaac boundary.",
@@ -656,7 +708,8 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
             display_name=args.display,
         ) as keys:
             while not quit_requested:
-                key = keys.poll()
+                key_event = keys.poll()
+                key = None if key_event is None else key_event[0]
                 if key == "q":
                     break
                 try:

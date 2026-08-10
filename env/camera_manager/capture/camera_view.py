@@ -214,16 +214,38 @@ class CameraView(XFormPrim):
         render_product = getattr(self, "_render_product", None)
         if render_product is None:
             return
+
+        # Replicator can invalidate an OmniGraph node before Python receives
+        # the hard-reset teardown.  Drop our ownership first so this operation
+        # is idempotent even when detach/destroy sees that already-dead node.
+        annotators = []
         seen_annotators: set[int] = set()
         for annotator in getattr(self, "_annotators", {}).values():
             if id(annotator) in seen_annotators:
                 continue
-            annotator.detach([render_product.path])
             seen_annotators.add(id(annotator))
-        render_product.destroy()
+            annotators.append(annotator)
         self._render_product = None
         self._annotators.clear()
         self._updates_enabled = False
+
+        for annotator in annotators:
+            try:
+                annotator.detach([render_product.path])
+            except Exception as exc:
+                print(
+                    "[camera cleanup] annotator was already invalid during detach: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+        try:
+            render_product.destroy()
+        except Exception as exc:
+            print(
+                "[camera cleanup] render product was already invalid during destroy: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def set_updates_enabled(self, enabled: bool) -> None:
         """Pause this RTX render product without changing its render settings."""

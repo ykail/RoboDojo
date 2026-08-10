@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import time
 from typing import Any
 
 from .lerobot_stream_protocol import receive_message, send_message
@@ -330,7 +331,14 @@ class _WriterSidecar:
         response = self._exchange({"command": "frame", **message}, "frame")
         return int(response["frame_count"])
 
-    def finish(self, *, accepted: bool, success: bool, reason: str) -> dict[str, Any]:
+    def finish(
+        self,
+        *,
+        accepted: bool,
+        success: bool,
+        reason: str,
+        timestamp_s: float | None = None,
+    ) -> dict[str, Any]:
         if not self.active:
             raise LeRobotStreamError("No active LeRobot candidate episode")
         expected = "committed" if accepted else "discarded"
@@ -340,6 +348,9 @@ class _WriterSidecar:
                 "accepted": bool(accepted),
                 "success": bool(success),
                 "reason": str(reason),
+                "timestamp": (
+                    time.monotonic() if timestamp_s is None else float(timestamp_s)
+                ),
             },
             expected,
         )
@@ -505,7 +516,13 @@ class LeRobotStreamRecorder:
             self._finished = True
             raise
 
-    def finalize(self, accepted: bool, success: bool, reason: str) -> str | None:
+    def finalize(
+        self,
+        accepted: bool,
+        success: bool,
+        reason: str,
+        timestamp_s: float | None = None,
+    ) -> str | None:
         if self._finished:
             return None
         self._finished = True
@@ -515,7 +532,10 @@ class LeRobotStreamRecorder:
         commit = bool(accepted) and self._frame_count > 0
         try:
             result = self._sidecar.finish(
-                accepted=commit, success=bool(success), reason=str(reason)
+                accepted=commit,
+                success=bool(success),
+                reason=str(reason),
+                timestamp_s=timestamp_s,
             )
         except Exception:
             _drop_sidecar(self._sidecar)

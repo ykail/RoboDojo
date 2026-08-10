@@ -208,15 +208,24 @@ class TiledCaptureManager:
         Only Hard Reset need which means if we reset simulation backend we need to initialize camera again
         Since Render product change, we also need to attch a new writer maybe
         """
-        for tiled_camera in self.tiled_cameras:
-            tiled_camera.destroy()
-        self.tiled_cameras.clear()
-        self.tiled_render_products.clear()
-        self.annotator.clear()
-        self.annotator_type.clear()
-        self.annotator_device.clear()
-        self._output_buffers.clear()
-        self._updates_enabled = True
+        try:
+            for tiled_camera in list(self.tiled_cameras):
+                try:
+                    tiled_camera.destroy()
+                except Exception as exc:
+                    print(
+                        "[camera cleanup] reset teardown warning: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+        finally:
+            self.tiled_cameras.clear()
+            self.tiled_render_products.clear()
+            self.annotator.clear()
+            self.annotator_type.clear()
+            self.annotator_device.clear()
+            self._output_buffers.clear()
+            self._updates_enabled = True
         self.init_cameras()
 
     def destroy(self):
@@ -224,17 +233,29 @@ class TiledCaptureManager:
         Destroy the capture manager.
         This function will be called when we close the environment.
         """
-
-        for tiled_camera in self.tiled_cameras:
-            tiled_camera.destroy()
-        self.annotator.clear()
-        self.annotator_type.clear()
-        self.annotator_device.clear()
-        self.tiled_cameras.clear()
-        self.cameras.clear()
-        self.camera_names.clear()
-        self.sim = None
-        self.tiled_render_products.clear()
-        self._output_buffers.clear()
-        self._updates_enabled = False
-        self.camera_prim_paths.clear()
+        cameras = list(self.tiled_cameras)
+        try:
+            for tiled_camera in cameras:
+                try:
+                    tiled_camera.destroy()
+                except Exception as exc:
+                    # Hard reset replaces the whole stage.  One stale
+                    # Replicator node must not prevent the remaining cameras,
+                    # robot, scene and simulator from being released.
+                    print(
+                        "[camera cleanup] tiled camera teardown warning: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+        finally:
+            self.annotator.clear()
+            self.annotator_type.clear()
+            self.annotator_device.clear()
+            self.tiled_cameras.clear()
+            self.cameras.clear()
+            self.camera_names.clear()
+            self.sim = None
+            self.tiled_render_products.clear()
+            self._output_buffers.clear()
+            self._updates_enabled = False
+            self.camera_prim_paths.clear()

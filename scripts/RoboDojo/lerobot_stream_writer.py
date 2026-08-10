@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -657,6 +658,21 @@ def _episode_metadata(
         value = metadata.get(key, "unknown")
         return value if isinstance(value, bool) else str(value)
 
+    def float_list(key: str) -> list[float]:
+        values = metadata.get(key, [])
+        if not isinstance(values, (list, tuple)):
+            return []
+        result = [float(value) for value in values]
+        if not all(math.isfinite(value) and value >= 0.0 for value in result):
+            raise ValueError(f"{key} must contain finite non-negative values")
+        return result
+
+    def bool_list(key: str) -> list[bool]:
+        values = metadata.get(key, [])
+        if not isinstance(values, (list, tuple)):
+            return []
+        return [bool(value) for value in values]
+
     policy_provenance = metadata.get("policy_provenance", {})
     if not isinstance(policy_provenance, dict):
         policy_provenance = {}
@@ -717,6 +733,21 @@ def _episode_metadata(
         "robodojo_finish_reason": str(reason),
         "robodojo_has_intervention": bool(has_intervention),
         "robodojo_frame_count": int(frame_count),
+        "robodojo_timing_resample": str(metadata.get("timing_resample", "none")),
+        "robodojo_source_frame_count": integer("source_frame_count", frame_count),
+        "robodojo_manual_source_frame_count": integer(
+            "manual_source_frame_count", 0
+        ),
+        "robodojo_manual_output_frame_count": integer(
+            "manual_output_frame_count", 0
+        ),
+        "robodojo_max_manual_source_gap_s": float(
+            metadata.get("max_manual_source_gap_s", 0.0)
+        ),
+        # Kept in RoboDojo's sidecar rather than as a LeRobot frame feature so
+        # timing-v2 episodes remain schema-compatible with rollout datasets.
+        "robodojo_source_wall_elapsed_s": float_list("source_wall_elapsed_s"),
+        "robodojo_source_is_manual": bool_list("source_is_manual"),
     }
 
 
@@ -855,6 +886,106 @@ def _quiesce_failed_commit(dataset: Any) -> list[str]:
     return errors
 
 
+def _control_wall_time(message: dict[str, Any]) -> float:
+    value = message.get("control", {}).get("timestamp")
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("X5 timing resampling requires control.timestamp") from exc
+    if not math.isfinite(timestamp):
+        raise ValueError(f"control.timestamp must be finite, got {timestamp!r}")
+    return timestamp
+
+
+def _is_manual_frame(message: dict[str, Any]) -> bool:
+    control = message.get("control", {})
+    mask = float(control.get("intervention_mask", 0.0))
+    source = str(control.get("action_source", "")).strip().lower()
+    return bool(mask) or source in {"human", "safety_hold"}
+
+
+class _ManualWallTimeResampler:
+    """Causally expand slow human samples onto the dataset's fixed-rate grid.
+
+    Policy actions already represent nominal 25 Hz simulator ticks and must not
+    be stretched by policy inference or rendering wall time.  Human X5 motion,
+    however, is generated in wall time.  Repeat the last complete manual frame
+    so that a slow Isaac loop does not compress several hundred milliseconds of
+    physical motion into one nominal 40 ms training step.
+    """
+
+    def __init__(self, fps: int, emit: Callable[[dict[str, Any], float], None]):
+        self.fps = int(fps)
+        self.period_s = 1.0 / float(self.fps)
+        self.emit = emit
+        self.active = False
+        self.segment_start_s = 0.0
+        self.segment_output_count = 0
+        self.previous_message: dict[str, Any] | None = None
+        self.previous_source_s = 0.0
+        self.source_count = 0
+        self.output_count = 0
+        self.max_source_gap_s = 0.0
+
+    def add(self, message: dict[str, Any], timestamp_s: float) -> None:
+        timestamp_s = float(timestamp_s)
+        self.source_count += 1
+        if not self.active:
+            self.active = True
+            self.segment_start_s = timestamp_s
+            self.segment_output_count = 0
+            self.previous_message = message
+            self.previous_source_s = timestamp_s
+            self._emit(message, timestamp_s)
+            return
+        if timestamp_s < self.previous_source_s:
+            raise ValueError(
+                "manual control.timestamp moved backwards: "
+                f"{timestamp_s:.9f} < {self.previous_source_s:.9f}"
+            )
+        self.max_source_gap_s = max(
+            self.max_source_gap_s,
+            timestamp_s - self.previous_source_s,
+        )
+        desired_count = max(
+            self.segment_output_count + 1,
+            int(round((timestamp_s - self.segment_start_s) * self.fps)) + 1,
+        )
+        assert self.previous_message is not None
+        while self.segment_output_count + 1 < desired_count:
+            grid_s = self.segment_start_s + self.segment_output_count * self.period_s
+            self._emit(self.previous_message, grid_s)
+        self.previous_message = message
+        self.previous_source_s = timestamp_s
+        self._emit(message, timestamp_s)
+
+    def finish_before(self, timestamp_s: float) -> None:
+        if not self.active:
+            return
+        timestamp_s = max(float(timestamp_s), self.previous_source_s)
+        self.max_source_gap_s = max(
+            self.max_source_gap_s,
+            timestamp_s - self.previous_source_s,
+        )
+        # The next policy frame (or the episode boundary) owns timestamp_s.
+        # Hold the latest human target only on grid points strictly before it.
+        desired_count = max(
+            self.segment_output_count,
+            int(math.ceil((timestamp_s - self.segment_start_s) * self.fps - 1e-9)),
+        )
+        assert self.previous_message is not None
+        while self.segment_output_count < desired_count:
+            grid_s = self.segment_start_s + self.segment_output_count * self.period_s
+            self._emit(self.previous_message, grid_s)
+        self.active = False
+        self.previous_message = None
+
+    def _emit(self, message: dict[str, Any], timestamp_s: float) -> None:
+        self.emit(message, timestamp_s)
+        self.segment_output_count += 1
+        self.output_count += 1
+
+
 def serve(
     config: WriterConfig,
     input_stream: BinaryIO,
@@ -865,8 +996,13 @@ def serve(
     dataset = None
     active = False
     frame_count = 0
+    source_frame_count = 0
     has_intervention = False
     metadata: dict[str, Any] = {}
+    source_wall_origin_s: float | None = None
+    source_wall_elapsed_s: list[float] = []
+    source_is_manual: list[bool] = []
+    manual_resampler: _ManualWallTimeResampler | None = None
     try:
         dataset, _created = dataset_opener(config)
         total_episodes = int(getattr(dataset.meta, "total_episodes", 0))
@@ -878,6 +1014,22 @@ def serve(
                 "total_episodes": total_episodes,
             },
         )
+
+        def emit_frame(
+            source_message: dict[str, Any],
+            _wall_timestamp_s: float,
+        ) -> None:
+            nonlocal frame_count
+            # A single low-rate source sample may expand into several 25 Hz
+            # rows.  Apply encoder backpressure before every row so a long gap
+            # cannot overrun the video queues before the command-level ACK.
+            _wait_for_encoder_headroom(dataset, config.encoder_wait_s)
+            frame = build_frame(source_message)
+            dataset.add_frame(frame)
+            drops = _dropped_frame_counts(dataset)
+            if drops:
+                raise RuntimeError(f"LeRobot video encoder dropped frame(s): {drops}")
+            frame_count += 1
 
         while True:
             try:
@@ -891,18 +1043,63 @@ def serve(
                     raise RuntimeError("Received begin while an episode is already active")
                 metadata = dict(message.get("metadata", {}))
                 frame_count = 0
+                source_frame_count = 0
                 has_intervention = False
+                source_wall_origin_s = None
+                source_wall_elapsed_s = []
+                source_is_manual = []
+                manual_resampler = (
+                    _ManualWallTimeResampler(config.fps, emit_frame)
+                    if metadata.get("control_mode") == "x5_policy_joint_intervention"
+                    else None
+                )
                 active = True
                 send_message(output_stream, {"status": "begun"})
             elif command == "frame":
                 if not active:
                     raise RuntimeError("Received frame without begin")
-                frame = build_frame(message)
-                dataset.add_frame(frame)
-                frame_count += 1
-                has_intervention = has_intervention or bool(
-                    float(message.get("control", {}).get("intervention_mask", 0.0))
-                )
+                source_frame_count += 1
+                is_manual = _is_manual_frame(message)
+                has_intervention = has_intervention or is_manual
+                if manual_resampler is not None:
+                    wall_timestamp_s = _control_wall_time(message)
+                    if source_wall_origin_s is None:
+                        source_wall_origin_s = wall_timestamp_s
+                    source_wall_elapsed_s.append(
+                        max(0.0, wall_timestamp_s - source_wall_origin_s)
+                    )
+                    source_is_manual.append(is_manual)
+                    if is_manual:
+                        manual_resampler.add(message, wall_timestamp_s)
+                    else:
+                        manual_end_timestamp = message.get("control", {}).get(
+                            "manual_end_timestamp"
+                        )
+                        if manual_resampler.active and manual_end_timestamp is None:
+                            raise ValueError(
+                                "first policy frame after X5 intervention is missing "
+                                "manual_end_timestamp"
+                            )
+                        if manual_end_timestamp is None:
+                            manual_end_timestamp = wall_timestamp_s
+                        try:
+                            manual_end_timestamp = float(manual_end_timestamp)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                "manual_end_timestamp must be a finite timestamp"
+                            ) from exc
+                        if not math.isfinite(manual_end_timestamp):
+                            raise ValueError(
+                                "manual_end_timestamp must be a finite timestamp"
+                            )
+                        if manual_end_timestamp > wall_timestamp_s:
+                            raise ValueError(
+                                "manual_end_timestamp cannot be after the policy frame timestamp"
+                            )
+                        manual_resampler.finish_before(manual_end_timestamp)
+                        emit_frame(message, wall_timestamp_s)
+                else:
+                    emit_frame(message, 0.0)
                 _wait_for_encoder_headroom(dataset, config.encoder_wait_s)
                 drops = _dropped_frame_counts(dataset)
                 if drops:
@@ -921,12 +1118,38 @@ def serve(
                     active = False
                     send_message(output_stream, {"status": "discarded", "frame_count": frame_count})
                     continue
+                if manual_resampler is not None and manual_resampler.active:
+                    terminal_timestamp = message.get("timestamp")
+                    if terminal_timestamp is None:
+                        terminal_timestamp = (
+                            manual_resampler.previous_source_s
+                            + manual_resampler.period_s
+                        )
+                    manual_resampler.finish_before(float(terminal_timestamp))
                 if frame_count <= 0:
                     raise RuntimeError("Refusing to commit an empty LeRobot episode")
                 drops = _dropped_frame_counts(dataset)
                 if drops:
                     raise RuntimeError(f"Refusing commit after video frame drop(s): {drops}")
                 episode_index = int(getattr(dataset.meta, "total_episodes", 0))
+                metadata["source_frame_count"] = source_frame_count
+                if manual_resampler is not None:
+                    metadata["timing_resample"] = "manual_wall_time_zoh_25hz_v1"
+                    metadata["manual_source_frame_count"] = manual_resampler.source_count
+                    metadata["manual_output_frame_count"] = manual_resampler.output_count
+                    metadata["max_manual_source_gap_s"] = (
+                        manual_resampler.max_source_gap_s
+                    )
+                    metadata["source_wall_elapsed_s"] = source_wall_elapsed_s
+                    metadata["source_is_manual"] = source_is_manual
+                    print(
+                        "[LEROBOT timing] manual source="
+                        f"{manual_resampler.source_count} -> 25Hz output="
+                        f"{manual_resampler.output_count}; max source gap="
+                        f"{manual_resampler.max_source_gap_s * 1000.0:.0f}ms",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 commit_snapshot = _CommitSnapshot.capture(
                     config.dataset_root,
                     transient_roots=_encoder_transient_roots(dataset, config.dataset_root),

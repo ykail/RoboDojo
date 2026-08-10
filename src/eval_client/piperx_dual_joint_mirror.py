@@ -161,6 +161,8 @@ class DualJointMirrorClient:
                 mode = payload["mode"]
                 edge = payload["edge"]
                 terminal = payload.get("terminal")
+                sample_monotonic_ns = payload.get("sample_monotonic_ns")
+                boundary_monotonic_ns = payload.get("boundary_monotonic_ns")
                 sides = payload["sides"]
             except (KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise DualJointMirrorError(f"invalid dual PiPER response: {raw!r}") from exc
@@ -178,6 +180,23 @@ class DualJointMirrorClient:
                 )
                 or not isinstance(sides, dict)
                 or set(sides) != set(SIDES)
+                or (
+                    sample_monotonic_ns is not None
+                    and (
+                        not isinstance(sample_monotonic_ns, int)
+                        or isinstance(sample_monotonic_ns, bool)
+                        or sample_monotonic_ns < 0
+                    )
+                )
+                or (
+                    boundary_monotonic_ns is not None
+                    and (
+                        not isinstance(boundary_monotonic_ns, int)
+                        or isinstance(boundary_monotonic_ns, bool)
+                        or boundary_monotonic_ns < 0
+                        or (edge is None and terminal is None)
+                    )
+                )
             ):
                 raise DualJointMirrorError(f"invalid dual PiPER response envelope: {payload!r}")
             parsed: dict[str, Any] = {}
@@ -221,7 +240,22 @@ class DualJointMirrorClient:
                     "follow_target_q_rad": follow_target_q,
                     "leader_delta_gripper_open_fraction": leader_delta_gripper,
                 }
-            return {"mode": mode, "edge": edge, "terminal": terminal, "sides": parsed}
+            return {
+                "mode": mode,
+                "edge": edge,
+                "terminal": terminal,
+                "sample_monotonic_s": (
+                    None
+                    if sample_monotonic_ns is None
+                    else float(sample_monotonic_ns) * 1e-9
+                ),
+                "boundary_monotonic_s": (
+                    None
+                    if boundary_monotonic_ns is None
+                    else float(boundary_monotonic_ns) * 1e-9
+                ),
+                "sides": parsed,
+            }
 
     def exchange(
         self,
@@ -752,6 +786,8 @@ def run_piperx_policy_leader_mirror_episode(
     recorder_finalized = False
     camera_paused = False
     terminal_request: str | None = None
+    terminal_wall_timestamp: float | None = None
+    recorder_blocked_s = 0.0
     robots = _target_robots(task_env)
     pacer = RealtimePacer(
         frequency=float(task_env.obs_manager.collect_freq),
@@ -791,17 +827,42 @@ def run_piperx_policy_leader_mirror_episode(
         manual_anchor: dict[str, tuple[np.ndarray, float]] | None = None
         pending_takeover_edge = 0
         pending_release_edge = 0
+        pending_manual_end_timestamp: float | None = None
         chunk_id = -1
         timing = _ControlRateReporter(float(task_env.obs_manager.collect_freq))
 
+        def recording_timestamp() -> float:
+            # A slow encoder must not lengthen the demonstrated motion and then
+            # create still more timing-fill frames.  Keep the recording clock in
+            # wall time, but remove time spent waiting only for the prior frame's
+            # writer acknowledgement.
+            return time.monotonic() - recorder_blocked_s
+
+        def source_timestamp(source_response: dict[str, Any]) -> float:
+            timestamp = source_response.get("sample_monotonic_s")
+            return (
+                recording_timestamp()
+                if timestamp is None
+                else float(timestamp) - recorder_blocked_s
+            )
+
+        def boundary_timestamp(source_response: dict[str, Any]) -> float:
+            timestamp = source_response.get("boundary_monotonic_s")
+            return (
+                recording_timestamp()
+                if timestamp is None
+                else float(timestamp) - recorder_blocked_s
+            )
+
         def consume_terminal(source_response: dict[str, Any]) -> bool:
-            nonlocal mode, terminal_request
+            nonlocal mode, terminal_request, terminal_wall_timestamp
             requested = source_response.get("terminal")
             if requested is None:
                 return False
             if requested not in {"save", "retry"}:
                 raise DualJointMirrorError(f"unknown X5 terminal request {requested!r}")
             terminal_request = requested
+            terminal_wall_timestamp = boundary_timestamp(source_response)
             mode = "follow"
             _mark_dual_operator_end(task_env, rejected=requested == "retry")
             action = "SAVE/NEXT" if requested == "save" else "DISCARD/RETRY"
@@ -817,6 +878,7 @@ def run_piperx_policy_leader_mirror_episode(
                 if consume_terminal(response):
                     break
                 if response["edge"] == "exit":
+                    pending_manual_end_timestamp = boundary_timestamp(response)
                     follow_anchor = current
                     follow_command = current
                     zero = client.exchange(_zero_deltas(current))
@@ -856,7 +918,7 @@ def run_piperx_policy_leader_mirror_episode(
                         "takeover_edge": pending_takeover_edge,
                         "chunk_id": chunk_id,
                         "chunk_index": -1,
-                        "timestamp": time.monotonic(),
+                        "timestamp": source_timestamp(response),
                     }
                 if recorder is not None:
                     if control is None:  # Defensive: recorder creates control above.
@@ -868,6 +930,7 @@ def run_piperx_policy_leader_mirror_episode(
                         executed_action=deepcopy(action),
                         control=dict(control),
                     )
+                    recorder_blocked_s += record_wait_s
                 # Preserve the standard dataset contract: record S_t/A_t,
                 # execute A_t, then acquire S_(t+1).  Manual interpolation stays
                 # disabled so the simulator follows the latest X5 sample once.
@@ -979,8 +1042,10 @@ def run_piperx_policy_leader_mirror_episode(
                     "takeover_edge": pending_release_edge,
                     "chunk_id": chunk_id,
                     "chunk_index": action_index,
-                    "timestamp": time.monotonic(),
+                    "timestamp": source_timestamp(pre),
                 }
+                if pending_manual_end_timestamp is not None:
+                    policy_control["manual_end_timestamp"] = pending_manual_end_timestamp
                 snapshot_s = 0.0
                 record_wait_s = 0.0
                 if recorder is not None:
@@ -991,6 +1056,8 @@ def run_piperx_policy_leader_mirror_episode(
                         executed_action=deepcopy(action),
                         control=dict(policy_control),
                     )
+                    recorder_blocked_s += record_wait_s
+                pending_manual_end_timestamp = None
                 physics_started = time.monotonic()
                 task_env.take_action(action)
                 physics_s = time.monotonic() - physics_started
@@ -1017,6 +1084,19 @@ def run_piperx_policy_leader_mirror_episode(
                 break
             if chunk_stale:
                 continue
+        if recorder is not None:
+            # An intervention-exit key is the end of the demonstrated segment,
+            # even if Right arrives while fresh policy inference is still
+            # pending.  Never extend human hold to that later terminal event.
+            terminal_wall_timestamp = (
+                pending_manual_end_timestamp
+                if pending_manual_end_timestamp is not None
+                else (
+                    terminal_wall_timestamp
+                    if terminal_wall_timestamp is not None
+                    else recording_timestamp()
+                )
+            )
         if mode == "follow" and terminal_request is None:
             # The source keeps pursuing its latest target between requests.
             # Let the physical arms finish the final simulator move before END
@@ -1051,6 +1131,7 @@ def run_piperx_policy_leader_mirror_episode(
             saved_path = recorder.finalize(
                 accepted=True,
                 success=success,
+                timestamp_s=terminal_wall_timestamp,
                 reason=(
                     "operator_accept_next"
                     if terminal_request == "save"

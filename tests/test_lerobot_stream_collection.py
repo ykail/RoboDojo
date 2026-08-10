@@ -32,9 +32,9 @@ def _joints(offset: float = 0.0):
     }
 
 
-def _frame_message(*, source="policy", edge=0, policy=True):
+def _frame_message(*, source="policy", edge=0, policy=True, timestamp=None):
     image = np.zeros((480, 640, 3), dtype=np.uint8)
-    return {
+    message = {
         "command": "frame",
         "obs": {
             "instruction": "make toast",
@@ -52,6 +52,9 @@ def _frame_message(*, source="policy", edge=0, policy=True):
             "takeover_edge": edge,
         },
     }
+    if timestamp is not None:
+        message["control"]["timestamp"] = float(timestamp)
+    return message
 
 
 class _FakeMeta:
@@ -74,6 +77,7 @@ class _FakeDataset:
         self.frames = []
         self.clears = 0
         self.saves = []
+        self.saved_frames = []
         self.finalized = 0
 
     def add_frame(self, frame):
@@ -90,6 +94,7 @@ class _FakeDataset:
     # fake must reject the newer ``extra_episode_metadata`` keyword so the
     # production incompatibility cannot slip through the test again.
     def save_episode(self, episode_data=None, parallel_encoding=True):
+        self.saved_frames = list(self.frames)
         self.saves.append(
             {
                 "episode_data": episode_data,
@@ -235,10 +240,150 @@ class LeRobotStreamWriterTest(unittest.TestCase):
         np.testing.assert_array_equal(
             frame["complementary_info.state"], np.asarray([1], dtype=np.float32)
         )
+        self.assertNotIn("complementary_info.wall_elapsed_s", frame)
         self.assertEqual(frame["observation.images.cam_high"].shape, (480, 640, 3))
 
         release = writer.build_frame(_frame_message(source="policy", edge=-1))
         self.assertEqual(release["complementary_info.state"].item(), 2.0)
+
+    def test_x5_manual_frames_are_resampled_by_wall_time_but_policy_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp) / "test"
+            (dataset_root / "meta").mkdir(parents=True)
+            (dataset_root / "meta" / "info.json").write_text(
+                json.dumps({"total_episodes": 0, "total_frames": 0}),
+                encoding="utf-8",
+            )
+            dataset = _FakeDataset()
+            config = writer.WriterConfig(
+                repo_id="test",
+                root=Path(tmp),
+                fps=25,
+                resume=False,
+                vcodec="h264",
+                encoder_threads=1,
+            )
+            messages = [
+                {
+                    "command": "begin",
+                    "metadata": {
+                        "task_name": "make_toast",
+                        "control_mode": "x5_policy_joint_intervention",
+                    },
+                },
+                # Policy inference/render wall time must not stretch nominal
+                # policy ticks: these two messages still produce two rows.
+                _frame_message(source="policy", timestamp=98.0),
+                _frame_message(source="policy", timestamp=100.0),
+                # 0.25 seconds of human wall time becomes approximately six
+                # additional 25 Hz rows, all with complete aligned features.
+                _frame_message(source="human", policy=False, timestamp=100.04),
+                _frame_message(source="human", policy=False, timestamp=100.29),
+                {
+                    "command": "finish",
+                    "accepted": True,
+                    "success": False,
+                    "reason": "right",
+                    "timestamp": 100.54,
+                },
+            ]
+            output = io.BytesIO()
+            status = writer.serve(
+                config,
+                _packet_stream(messages),
+                output,
+                dataset_opener=lambda _config: (dataset, True),
+            )
+
+            self.assertEqual(status, 0)
+            packets = _all_packets(output)
+            self.assertEqual([packet["frame_count"] for packet in packets[2:6]], [1, 2, 3, 9])
+            self.assertEqual(packets[-1]["frame_count"], 15)
+            self.assertEqual(len(dataset.saved_frames), 15)
+            self.assertTrue(
+                all(
+                    "complementary_info.wall_elapsed_s" not in frame
+                    for frame in dataset.saved_frames
+                )
+            )
+            metadata_path = (
+                dataset_root
+                / writer._ROBODOJO_EPISODE_METADATA_DIR
+                / "episode_0000000.json"
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                metadata["robodojo_timing_resample"],
+                "manual_wall_time_zoh_25hz_v1",
+            )
+            self.assertEqual(metadata["robodojo_source_frame_count"], 4)
+            self.assertEqual(metadata["robodojo_manual_source_frame_count"], 2)
+            self.assertEqual(metadata["robodojo_manual_output_frame_count"], 13)
+            np.testing.assert_allclose(
+                metadata["robodojo_source_wall_elapsed_s"],
+                [0.0, 2.0, 2.04, 2.29],
+                atol=1e-8,
+            )
+            self.assertEqual(
+                metadata["robodojo_source_is_manual"],
+                [False, False, True, True],
+            )
+
+    def test_manual_exit_boundary_does_not_turn_policy_inference_into_human_hold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp) / "test"
+            (dataset_root / "meta").mkdir(parents=True)
+            (dataset_root / "meta" / "info.json").write_text(
+                json.dumps({"total_episodes": 0, "total_frames": 0}),
+                encoding="utf-8",
+            )
+            dataset = _FakeDataset()
+            config = writer.WriterConfig(
+                repo_id="test",
+                root=Path(tmp),
+                fps=25,
+                resume=False,
+                vcodec="h264",
+                encoder_threads=1,
+            )
+            release = _frame_message(source="policy", edge=-1, timestamp=105.0)
+            release["control"]["manual_end_timestamp"] = 100.30
+            messages = [
+                {
+                    "command": "begin",
+                    "metadata": {
+                        "task_name": "make_toast",
+                        "control_mode": "x5_policy_joint_intervention",
+                    },
+                },
+                _frame_message(source="human", policy=False, timestamp=100.0),
+                _frame_message(source="human", policy=False, timestamp=100.25),
+                release,
+                {
+                    "command": "finish",
+                    "accepted": True,
+                    "success": False,
+                    "reason": "right",
+                    "timestamp": 105.04,
+                },
+            ]
+            output = io.BytesIO()
+            status = writer.serve(
+                config,
+                _packet_stream(messages),
+                output,
+                dataset_opener=lambda _config: (dataset, True),
+            )
+
+            self.assertEqual(status, 0)
+            # 0.30 seconds of manual control becomes 8 rows.  The 4.70-second
+            # policy inference delay after manual exit must add zero human rows.
+            self.assertEqual(len(dataset.saved_frames), 9)
+            manual_rows = sum(
+                int(frame["complementary_info.is_intervention"].item())
+                for frame in dataset.saved_frames
+            )
+            self.assertEqual(manual_rows, 8)
 
     def test_nonfinite_policy_and_pixels_are_rejected(self):
         message = _frame_message()
@@ -633,7 +778,7 @@ class _FakeSidecar:
 
 
 class LeRobotStreamRecorderTest(unittest.TestCase):
-    def test_piperx_metadata_attests_v3_and_fixed_embodiment_profile(self):
+    def test_piperx_metadata_attests_v4_and_fixed_embodiment_profile(self):
         task_env = SimpleNamespace(
             env_seeds=[7],
             layout_cycle=0,
@@ -656,10 +801,10 @@ class LeRobotStreamRecorderTest(unittest.TestCase):
             metadata = _task_metadata(task_env)
 
         self.assertEqual(metadata["control_mode"], "piperx_sim_dagger")
-        self.assertEqual(metadata["piperx_bridge_protocol"], "robodojo_piperx_v3")
+        self.assertEqual(metadata["piperx_bridge_protocol"], "robodojo_piperx_v4")
         self.assertEqual(
             metadata["piperx_embodiment_profile"],
-            "arx_x5_piperx_relative_v1",
+            "arx_x5_piperx_relative_joint_v1",
         )
         self.assertNotIn("piperx_calibration_name", metadata)
         self.assertNotIn("piperx_calibration_sha256", metadata)

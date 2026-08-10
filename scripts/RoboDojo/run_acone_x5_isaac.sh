@@ -172,7 +172,7 @@ IFS=$'\t' read -r EXPECTED_KAI0_COMMIT EXPECTED_CHECKPOINT_DIGEST <<<"${PROVENAN
 
 if [[ -z "${DATASET_ID}" ]]; then
     DIGEST_HEX="${EXPECTED_CHECKPOINT_DIGEST#sha256:}"
-    DATASET_ID="robodojo_${TASK}_x5_online_dagger_${POLICY_NAME}_${DIGEST_HEX:0:12}_${EXPECTED_KAI0_COMMIT:0:8}_v1"
+    DATASET_ID="robodojo_${TASK}_x5_online_dagger_${POLICY_NAME}_${DIGEST_HEX:0:12}_${EXPECTED_KAI0_COMMIT:0:8}_timing25_v2"
 fi
 
 echo "[acOne Isaac] task=${TASK}"
@@ -181,6 +181,7 @@ echo "[acOne Isaac] checkpoint_id=${CHECKPOINT_ID}"
 echo "[acOne Isaac] pinned Kai0=${EXPECTED_KAI0_COMMIT} clean=true"
 echo "[acOne Isaac] pinned digest=${EXPECTED_CHECKPOINT_DIGEST}"
 echo "[acOne Isaac] dataset=${DATASET_ROOT%/}/${DATASET_ID}"
+echo "[acOne Isaac] manual timing=wall-time zero-order hold resampled to 25Hz"
 
 if (( PREFLIGHT_ONLY )); then
     echo "[acOne Isaac] PREFLIGHT OK; Isaac was not started"

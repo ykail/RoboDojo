@@ -19,8 +19,8 @@ source = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(source)
 
 
-def arm_state(q, gripper, seq=1):
-    return ArmState(tuple(q), gripper * 0.08, gripper, 1000, seq)
+def arm_state(q, gripper, seq=1, sample_ns=1000):
+    return ArmState(tuple(q), gripper * 0.08, gripper, sample_ns, seq)
 
 
 class FakeHardware:
@@ -92,9 +92,11 @@ class JointMirrorSessionTest(unittest.TestCase):
 
     def test_manual_wire_delta_preserves_identity_joint_signs(self) -> None:
         self.session.handle(request(1))
-        self.assertTrue(self.session.toggle_intervention())
+        self.assertTrue(self.session.toggle_intervention(1100))
         entered = self.session.handle(request(2))
         self.assertEqual((entered["mode"], entered["edge"]), ("manual", "enter"))
+        self.assertEqual(entered["boundary_monotonic_ns"], 1100)
+        self.assertEqual(entered["sample_monotonic_ns"], 1000)
         physical_delta = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
         self.hardware.state = DualState(
             arm_state(physical_delta, 0.25, seq=2),
@@ -111,20 +113,22 @@ class JointMirrorSessionTest(unittest.TestCase):
 
     def test_exit_holds_release_pose_and_requires_new_zero_frame(self) -> None:
         self.session.handle(request(1))
-        self.session.toggle_intervention()
+        self.session.toggle_intervention(1100)
         self.session.handle(request(2))
         release_q = (0.2,) * 6
         self.hardware.state = DualState(arm_state(release_q, 0.5), arm_state(release_q, 0.5))
-        self.session.toggle_intervention()
+        self.session.toggle_intervention(2200)
 
         exited = self.session.handle(request(3))
 
         self.assertEqual((exited["mode"], exited["edge"]), ("follow", "exit"))
+        self.assertEqual(exited["boundary_monotonic_ns"], 2200)
         self.assertEqual(self.hardware.latched_target.left.q_rad, release_q)
         with self.assertRaises(source.X5SourceError):
             self.session.handle(request(4, q=(0.01,) * 6))
         zero = self.session.handle(request(5))
         self.assertEqual((zero["mode"], zero["edge"]), ("follow", None))
+        self.assertIsNone(zero["boundary_monotonic_ns"])
 
     def test_heartbeat_and_end_match_existing_client_envelope(self) -> None:
         heartbeat = self.session.handle({"type": "heartbeat", "seq": 1})
@@ -136,11 +140,12 @@ class JointMirrorSessionTest(unittest.TestCase):
 
     def test_left_terminal_holds_and_emits_one_retry_boundary(self) -> None:
         self.session.handle(request(1))
-        self.assertTrue(self.session.request_terminal("retry"))
+        self.assertTrue(self.session.request_terminal("retry", 3300))
 
         response = self.session.handle(request(2, q=(0.2,) * 6))
 
         self.assertEqual((response["mode"], response["edge"], response["terminal"]), ("follow", None, "retry"))
+        self.assertEqual(response["boundary_monotonic_ns"], 3300)
         self.assertIn("enter_hold", self.hardware.calls)
         self.assertFalse(self.session.toggle_intervention())
         heartbeat = self.session.handle({"type": "heartbeat", "seq": 3})
@@ -148,13 +153,14 @@ class JointMirrorSessionTest(unittest.TestCase):
 
     def test_right_terminal_overrides_manual_mode(self) -> None:
         self.session.handle(request(1))
-        self.session.toggle_intervention()
+        self.session.toggle_intervention(1100)
         self.session.handle(request(2))
-        self.assertTrue(self.session.request_terminal("save"))
+        self.assertTrue(self.session.request_terminal("save", 4400))
 
         response = self.session.handle(request(3))
 
         self.assertEqual((response["mode"], response["edge"], response["terminal"]), ("follow", None, "save"))
+        self.assertEqual(response["boundary_monotonic_ns"], 4400)
         self.assertIsNone(self.session.manual_anchor)
 
     def test_cli_defaults_are_stable_for_launcher(self) -> None:
