@@ -44,10 +44,19 @@ class RealtimePacer:
         if not self.enabled:
             return
         now = time.monotonic()
-        if self._deadline is None or self._deadline < now - self.period:
+        if self._deadline is None:
             self._deadline = now
-        self._deadline += self.period
-        delay = self._deadline - time.monotonic()
+            return
+        next_deadline = self._deadline + self.period
+        if next_deadline <= now:
+            # The control/render/record path already consumed the frame
+            # budget.  Rebase without sleeping; sleeping a fresh full period
+            # here turns a 50-100 ms overloaded iteration into 90-140 ms and
+            # makes teleoperation visibly lag farther behind on every frame.
+            self._deadline = now
+            return
+        self._deadline = next_deadline
+        delay = next_deadline - time.monotonic()
         if delay > 0:
             time.sleep(delay)
 

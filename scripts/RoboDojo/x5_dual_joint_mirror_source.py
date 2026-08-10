@@ -436,6 +436,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--left-model", default="X5")
     parser.add_argument("--right-model", default="X5")
     parser.add_argument("--frequency-hz", type=float, default=100.0)
+    parser.add_argument("--follow-preview-s", type=float, default=0.04)
     parser.add_argument("--liveness-timeout-s", type=float, default=1.5)
     parser.add_argument("--home-rad", type=float, nargs=6, default=(0.0,) * 6)
     parser.add_argument("--home-gripper-fraction", type=float, default=1.0)
@@ -478,6 +479,7 @@ def _config_from_args(args: argparse.Namespace) -> X5HardwareConfig:
         active_joint_kp=tuple(args.active_joint_kp),
         active_joint_kd=tuple(args.active_joint_kd),
         teach_joint_kd=tuple(args.teach_joint_kd),
+        follow_preview_s=args.follow_preview_s,
         left_gripper_kp=args.left_gripper_kp,
         left_gripper_kd=args.left_gripper_kd,
         right_gripper_kp=args.right_gripper_kp,

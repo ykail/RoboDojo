@@ -328,6 +328,33 @@ def _state_deltas(
     }
 
 
+def _action_target_state(
+    action: dict[str, Any],
+) -> dict[str, tuple[np.ndarray, float]]:
+    """Extract the exact dual-X5 target that Isaac is about to execute."""
+
+    result: dict[str, tuple[np.ndarray, float]] = {}
+    for side in SIDES:
+        try:
+            joints = np.asarray(
+                action[f"{side}_arm_joint_state"],
+                dtype=np.float64,
+            ).reshape(-1)[:6]
+            gripper_values = np.asarray(
+                action[f"{side}_ee_joint_state"],
+                dtype=np.float64,
+            ).reshape(-1)
+            gripper = float(gripper_values[0])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise DualJointMirrorError(
+                f"invalid {side} policy target for X5 mirroring"
+            ) from exc
+        if joints.shape != (6,) or not np.isfinite(joints).all() or not math.isfinite(gripper):
+            raise DualJointMirrorError(f"non-finite {side} policy target for X5 mirroring")
+        result[side] = (joints.copy(), float(np.clip(gripper, 0.0, 1.0)))
+    return result
+
+
 def _manual_action(
     obs: dict[str, Any],
     sim_anchor: dict[str, tuple[np.ndarray, float]],
@@ -345,6 +372,32 @@ def _manual_action(
         # takeover itself cannot move either arm.
         action[f"{side}_ee_joint_state"][0] = item["leader_gripper_open_fraction"]
     return action
+
+
+class _ControlRateReporter:
+    def __init__(self, expected_hz: float) -> None:
+        self.expected_hz = float(expected_hz)
+        self.window_start = time.monotonic()
+        self.last_frame = self.window_start
+        self.frames = 0
+        self.max_gap_s = 0.0
+
+    def frame(self, mode: str) -> None:
+        now = time.monotonic()
+        self.max_gap_s = max(self.max_gap_s, now - self.last_frame)
+        self.last_frame = now
+        self.frames += 1
+        elapsed = now - self.window_start
+        if elapsed < 2.0:
+            return
+        print(
+            f"\n[X5 timing] mode={mode} control={self.frames / elapsed:.1f}Hz "
+            f"target={self.expected_hz:.1f}Hz max_gap={self.max_gap_s * 1000.0:.0f}ms",
+            flush=True,
+        )
+        self.window_start = now
+        self.frames = 0
+        self.max_gap_s = 0.0
 
 
 def run_piperx_dual_joint_test_episode(task_env: Any) -> None:
@@ -451,6 +504,7 @@ def run_piperx_policy_leader_mirror_episode(
         client.connect()
         obs = task_env.get_obs()
         follow_anchor = _measured_sim_state(task_env, robots)
+        follow_command = follow_anchor
         response = client.exchange(_zero_deltas(follow_anchor))
         if response["mode"] != "follow" or response["edge"] is not None:
             raise DualJointMirrorError("policy mirror source did not begin in stable follow mode")
@@ -475,6 +529,7 @@ def run_piperx_policy_leader_mirror_episode(
         pending_takeover_edge = 0
         pending_release_edge = 0
         chunk_id = -1
+        timing = _ControlRateReporter(float(task_env.obs_manager.collect_freq))
 
         while not task_env.is_episode_end():
             if mode == "manual":
@@ -482,6 +537,7 @@ def run_piperx_policy_leader_mirror_episode(
                 response = client.exchange(_state_deltas(current, follow_anchor))
                 if response["edge"] == "exit":
                     follow_anchor = current
+                    follow_command = current
                     zero = client.exchange(_zero_deltas(current))
                     if zero["mode"] != "follow":
                         raise DualJointMirrorError("source did not complete intervention exit")
@@ -499,6 +555,11 @@ def run_piperx_policy_leader_mirror_episode(
                 if response["mode"] != "manual" or manual_anchor is None:
                     raise DualJointMirrorError("manual sample arrived without a joint anchor")
                 action = _manual_action(obs, manual_anchor, response)
+                # Apply the freshest hardware sample before any synchronous
+                # image/dataset work.  Manual X5 targets are already sampled at
+                # the dataset rate, so the ordinary 8/10-step interpolation
+                # only adds 32 ms of avoidable lag.
+                task_env.take_action(action, interpolate=False)
                 if recorder is not None:
                     recorder.append(
                         obs=obs,
@@ -516,13 +577,13 @@ def run_piperx_policy_leader_mirror_episode(
                         },
                     )
                 pending_takeover_edge = 0
-                task_env.take_action(action)
                 pacer.wait()
                 obs = task_env.get_obs()
+                timing.frame("manual")
                 continue
 
             current = _measured_sim_state(task_env, robots)
-            response = client.exchange(_state_deltas(current, follow_anchor))
+            response = client.exchange(_state_deltas(follow_command, follow_anchor))
             if response["edge"] == "enter":
                 if not allow_intervention or response["mode"] != "manual":
                     raise DualJointMirrorError("unexpected intervention entry")
@@ -539,30 +600,43 @@ def run_piperx_policy_leader_mirror_episode(
             if response["mode"] != "follow":
                 raise DualJointMirrorError("policy mirror source left follow mode without an edge")
 
+            infer_start = time.monotonic()
             model_client.call(func_name="update_obs", obs=obs)
             actions = model_client.call(func_name="get_action")
+            print(
+                f"\n[X5 timing] policy inference={(time.monotonic() - infer_start) * 1000.0:.0f}ms",
+                flush=True,
+            )
             if not actions:
                 raise DualJointMirrorError("policy-v1 returned an empty action chunk")
             chunk_id += 1
             chunk_stale = False
             for action_index, action in enumerate(actions):
-                if allow_intervention:
-                    pre_state = _measured_sim_state(task_env, robots)
-                    pre = client.exchange(_state_deltas(pre_state, follow_anchor))
-                    if pre["edge"] == "enter":
-                        if pre["mode"] != "manual":
-                            raise DualJointMirrorError("unexpected intervention entry")
-                        task_env.piperx_intervention_occurred = True
-                        manual_anchor = pre_state
-                        mode = "manual"
-                        pending_takeover_edge = 1
-                        chunk_stale = True
-                        print(
-                            f"\n[{checkpoint_label} Isaac] manual ON; "
-                            "policy chunk discarded; simulation anchored.",
-                            flush=True,
-                        )
-                        break
+                # Send the exact policy target before Isaac executes it.  The
+                # physical X5 and simulator now start the same target together;
+                # no post-step PhysX measurement (and its PD noise/one-frame
+                # lag) is copied back to the real robot.
+                pre_state = _measured_sim_state(task_env, robots)
+                policy_target = _action_target_state(action)
+                pre = client.exchange(_state_deltas(policy_target, follow_anchor))
+                if pre["edge"] == "enter":
+                    if not allow_intervention or pre["mode"] != "manual":
+                        raise DualJointMirrorError("unexpected intervention entry")
+                    task_env.piperx_intervention_occurred = True
+                    manual_anchor = pre_state
+                    mode = "manual"
+                    pending_takeover_edge = 1
+                    chunk_stale = True
+                    print(
+                        f"\n[{checkpoint_label} Isaac] manual ON; "
+                        "policy chunk discarded; simulation anchored.",
+                        flush=True,
+                    )
+                    break
+                if pre["mode"] != "follow":
+                    raise DualJointMirrorError("source left follow mode without an edge")
+                follow_command = policy_target
+                task_env.take_action(action)
                 if recorder is not None:
                     recorder.append(
                         obs=obs,
@@ -580,27 +654,9 @@ def run_piperx_policy_leader_mirror_episode(
                         },
                     )
                 pending_release_edge = 0
-                task_env.take_action(action)
-                post_state = _measured_sim_state(task_env, robots)
-                post = client.exchange(_state_deltas(post_state, follow_anchor))
                 pacer.wait()
                 obs = task_env.get_obs()
-                if post["edge"] == "enter":
-                    if not allow_intervention or post["mode"] != "manual":
-                        raise DualJointMirrorError("unexpected intervention entry")
-                    task_env.piperx_intervention_occurred = True
-                    manual_anchor = post_state
-                    mode = "manual"
-                    pending_takeover_edge = 1
-                    chunk_stale = True
-                    print(
-                        f"\n[{checkpoint_label} Isaac] manual ON; "
-                        "policy chunk discarded; simulation anchored.",
-                        flush=True,
-                    )
-                    break
-                if post["mode"] != "follow":
-                    raise DualJointMirrorError("source left follow mode without an edge")
+                timing.frame("follow")
                 if task_env.is_episode_end() or action_index + 1 == len(actions):
                     break
                 model_client.call(func_name="update_obs", obs=obs)

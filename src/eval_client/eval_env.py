@@ -94,6 +94,14 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     },
                 )
             )
+            dual_record_value = os.environ.get(
+                "ROBODOJO_DUAL_MIRROR_RECORD",
+                "0",
+            ).strip().lower()
+            self.stream_eval_videos = not (
+                self.control_mode == "x5_policy_joint_intervention"
+                and dual_record_value in {"1", "true", "yes", "on"}
+            )
             self.layout_cycle = 0
             self.physx_monitor_enabled = bool(self.eval_cfg.get("physx_monitor_enabled", False))
             if self.physx_monitor_enabled:
@@ -419,7 +427,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             data = self.obs_manager.get_obs(env_idx_list=env_idx_list)
             data_list = []
             for env_idx in env_idx_list:
-                if not self.operator_driven and not self.observation_mode and (not self.end_flag[env_idx] or last_frame):
+                if (
+                    self.stream_eval_videos
+                    and not self.operator_driven
+                    and not self.observation_mode
+                    and (not self.end_flag[env_idx] or last_frame)
+                ):
                     self._stream_vision(env_idx, data[env_idx])
                 env_data = deepcopy(data[env_idx])
                 env_data["env_idx"] = env_idx
@@ -587,11 +600,15 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 raise ValueError(f"Multiple action types found in action dict keys: {action.keys()}")
             return action_type[0]
 
-        def take_action(self, action):
+        def take_action(self, action, *, interpolate=True):
             self.validate_action_dict(action)
-            self.take_action_batch([action], env_idx_list=[0])
+            self.take_action_batch(
+                [action],
+                env_idx_list=[0],
+                interpolate=interpolate,
+            )
 
-        def take_action_batch(self, actions_list, env_idx_list=None):
+        def take_action_batch(self, actions_list, env_idx_list=None, *, interpolate=True):
             if self.physx_monitor_enabled:
                 self._check_physx_broken_envs()
             control_info_list = []
@@ -682,7 +699,11 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                             }
                         else:
                             pass
-                control_seq = self.process_control_info(control_info, env_idx)
+                control_seq = self.process_control_info(
+                    control_info,
+                    env_idx,
+                    interpolate=interpolate,
+                )
                 control_info_list.append(control_seq)
 
             if len(control_info_list) > 0:
@@ -711,7 +732,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             """
             self.unstable_envs.add(env_idx)
 
-        def process_control_info(self, control_info, env_idx):
+        def process_control_info(self, control_info, env_idx, *, interpolate=True):
             """Expand one-step `control_info` into a per-step control sequence.
 
             This method returns a list with `interpolation_nums` control dicts
@@ -739,9 +760,12 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             interpolation_nums = int(self.obs_manager.collect_interval)
             if interpolation_nums <= 0:
                 return [deepcopy(control_info)]
-            direct_recovery_control = (
-                self.control_mode == "piperx_restore_recovery"
-                and bool(getattr(self, "piperx_intervention_occurred", False))
+            direct_control = (
+                not interpolate
+                or (
+                    self.control_mode == "piperx_restore_recovery"
+                    and bool(getattr(self, "piperx_intervention_occurred", False))
+                )
             )
 
             control_info_list = [deepcopy(control_info) for _ in range(interpolation_nums)]
@@ -760,9 +784,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     current_position = self.robot_manager.get_joint(robot, env_idx_list=[env_idx])[env_idx]
                     if current_position is not None:
                         interp_count = (
-                            0
-                            if direct_recovery_control
-                            else int(np.floor(interpolation_nums * 0.8))
+                            0 if direct_control else int(np.floor(interpolation_nums * 0.8))
                         )
 
                         current_arr = np.array(current_position)
@@ -784,9 +806,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                     ][0]
                     if current_position is not None:
                         interp_count = (
-                            0
-                            if direct_recovery_control
-                            else int(np.floor(interpolation_nums * 0.8))
+                            0 if direct_control else int(np.floor(interpolation_nums * 0.8))
                         )
 
                         scale = robot.gripper_scale

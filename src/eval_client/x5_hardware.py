@@ -81,6 +81,13 @@ class X5HardwareConfig:
     active_joint_kd: tuple[float, ...] = (2.5, 2.2, 2.2, 1.6, 1.6, 1.0)
     teach_joint_kd: tuple[float, ...] = (0.3, 0.3, 0.3, 0.2, 0.1, 0.1)
 
+    # Isaac supplies one joint target every 40 ms.  A zero-timestamp ARX
+    # command replaces the SDK interpolator with an instantaneous setpoint,
+    # which makes a nominally smooth 25 Hz trajectory visibly step.  Schedule
+    # each follow waypoint one control frame ahead so the SDK's 500 Hz thread
+    # linearly interpolates between consecutive targets.
+    follow_preview_s: float = 0.04
+
     left_gripper_kp: float = 2.0
     left_gripper_kd: float = 0.15
     right_gripper_kp: float = 3.0
@@ -115,6 +122,8 @@ class X5HardwareConfig:
             value = getattr(self, name)
             if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
                 raise ValueError(f"{name} must be positive when supplied")
+        if not math.isfinite(float(self.follow_preview_s)) or self.follow_preview_s < 0:
+            raise ValueError("follow_preview_s must be finite and non-negative")
 
 
 def _load_arx5_interface() -> Any:
@@ -290,19 +299,38 @@ class DualX5Hardware:
             normalized[side] = ArmTarget(clipped, min(1.0, max(0.0, fraction)))
         return DualTarget(normalized["left"], normalized["right"])
 
-    def _sdk_joint_state(self, side: str, target: ArmTarget) -> Any:
+    def _sdk_joint_state(
+        self,
+        side: str,
+        target: ArmTarget,
+        *,
+        preview_s: float = 0.0,
+    ) -> Any:
         assert self._sdk is not None
         command = self._sdk.JointState(JOINT_DOF)
         command.pos()[:] = target.q_rad
         low, high = self._gripper_ranges[side]
         command.gripper_pos = low + target.gripper_open_fraction * (high - low)
+        if preview_s > 0.0:
+            controller_time = float(self._controllers[side].get_timestamp())
+            if not math.isfinite(controller_time):
+                raise X5HardwareError(f"invalid {side} X5 controller timestamp")
+            command.timestamp = controller_time + preview_s
         return command
 
-    def _write(self, target: DualTarget) -> DualTarget:
+    def _write(self, target: DualTarget, *, preview_s: float = 0.0) -> DualTarget:
+        if not math.isfinite(float(preview_s)) or preview_s < 0.0:
+            raise X5HardwareError("X5 command preview must be finite and non-negative")
         applied = self._normalize_target(target)
         try:
             for side in SIDES:
-                self._controllers[side].set_joint_cmd(self._sdk_joint_state(side, applied.side(side)))
+                self._controllers[side].set_joint_cmd(
+                    self._sdk_joint_state(
+                        side,
+                        applied.side(side),
+                        preview_s=preview_s,
+                    )
+                )
         except BaseException as exc:
             self._mode = X5Mode.FAULT
             for controller in self._controllers.values():
@@ -347,7 +375,7 @@ class DualX5Hardware:
         self._require_connected()
         if self._mode not in {X5Mode.HOLD, X5Mode.FOLLOW}:
             raise X5HardwareError(f"cannot follow while dual X5 is in {self._mode.value} mode")
-        applied = self._write(target)
+        applied = self._write(target, preview_s=self.config.follow_preview_s)
         self._mode = X5Mode.FOLLOW
         return applied
 
@@ -408,7 +436,11 @@ class DualX5Hardware:
                     initial.gripper_open_fraction
                     + alpha * (goal_arm.gripper_open_fraction - initial.gripper_open_fraction),
                 )
-            self.follow(DualTarget(arms["left"], arms["right"]))
+            self._write(
+                DualTarget(arms["left"], arms["right"]),
+                preview_s=(duration_s / steps if duration_s > 0 else 0.0),
+            )
+            self._mode = X5Mode.FOLLOW
             if duration_s > 0:
                 self._sleep(duration_s / steps)
         applied = self._write(goal)

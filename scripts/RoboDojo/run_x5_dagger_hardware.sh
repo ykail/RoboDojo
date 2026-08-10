@@ -16,6 +16,7 @@ HOME_RAD_TEXT="${X5_HOME_RAD:-0 0 0 0 0 0}"
 HOME_GRIPPER_FRACTION="${X5_HOME_GRIPPER_FRACTION:-1.0}"
 HOME_DURATION_S="${X5_HOME_DURATION_S:-5}"
 FREQUENCY_HZ="${X5_FREQUENCY_HZ:-100}"
+FOLLOW_PREVIEW_S="${X5_FOLLOW_PREVIEW_S:-0.04}"
 HOTKEY_DISPLAY="${X5_HOTKEY_DISPLAY:-${DISPLAY:-:1}}"
 SDK_MODULE="${X5_SDK_MODULE:-arx5_interface}"
 IP_BIN="${IP_BIN:-ip}"
@@ -86,6 +87,7 @@ source_args=(
     --home-gripper-fraction "${HOME_GRIPPER_FRACTION}"
     --home-duration-s "${HOME_DURATION_S}"
     --frequency-hz "${FREQUENCY_HZ}"
+    --follow-preview-s "${FOLLOW_PREVIEW_S}"
     --display "${HOTKEY_DISPLAY}"
 )
 if is_true "${X5_SKIP_HOME:-0}"; then
@@ -101,6 +103,7 @@ export PYTHONPATH="${ROBODOJO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 echo "[X5 hardware] SDK and CAN preflight passed: left=${LEFT_CAN} right=${RIGHT_CAN}"
 echo "[X5 hardware] source=${SOURCE_HOST}:${SOURCE_PORT} protocol=robodojo_dual_joint_mirror_v1"
+echo "[X5 hardware] policy follow uses ${FOLLOW_PREVIEW_S}s ARX SDK interpolation"
 echo "[X5 hardware] only one global operator key is used: i toggles manual intervention ON/OFF"
 echo "[X5 hardware] terminal focus is not required for global i"
 echo "[X5 hardware] there is no s/r recording key; episode commit is owned by Isaac"

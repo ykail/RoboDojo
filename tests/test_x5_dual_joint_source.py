@@ -141,6 +141,7 @@ class JointMirrorSessionTest(unittest.TestCase):
         self.assertEqual((args.left_model, args.right_model), ("X5", "X5"))
         self.assertEqual(tuple(args.home_rad), (0.0,) * 6)
         self.assertEqual(args.home_gripper_fraction, 1.0)
+        self.assertEqual(args.follow_preview_s, 0.04)
         self.assertEqual(source.PROTOCOL, "robodojo_dual_joint_mirror_v1")
 
 

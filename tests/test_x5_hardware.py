@@ -22,6 +22,7 @@ class FakeJointState:
     def __init__(self, dof: int) -> None:
         self._pos = [0.0] * dof
         self.gripper_pos = 0.0
+        self.timestamp = 0.0
 
     def pos(self):
         return self._pos
@@ -45,7 +46,7 @@ class FakeController:
     def __init__(self, interface: str) -> None:
         self.interface = interface
         self.state = FakeJointState(6)
-        self.commands: list[tuple[tuple[float, ...], float]] = []
+        self.commands: list[tuple[tuple[float, ...], float, float]] = []
         self.gains: list[tuple[tuple[float, ...], tuple[float, ...], float, float]] = []
         self.damping_count = 0
         self.log_levels: list[object] = []
@@ -56,7 +57,7 @@ class FakeController:
     def set_joint_cmd(self, command) -> None:
         q = tuple(float(value) for value in command.pos())
         gripper = float(command.gripper_pos)
-        self.commands.append((q, gripper))
+        self.commands.append((q, gripper, float(command.timestamp)))
         self.state._pos[:] = q
         self.state.gripper_pos = gripper
 
@@ -70,6 +71,9 @@ class FakeController:
 
     def set_log_level(self, level) -> None:
         self.log_levels.append(level)
+
+    def get_timestamp(self) -> float:
+        return 10.0
 
 
 class FakeSdk:
@@ -138,8 +142,10 @@ class DualX5HardwareTest(unittest.TestCase):
         right_command = self.sdk.controllers["right-can"].commands[-1]
         self.assertEqual(left_command[0], applied.left.q_rad)
         self.assertAlmostEqual(left_command[1], 0.02)
+        self.assertAlmostEqual(left_command[2], 10.04)
         self.assertEqual(right_command[0], applied.right.q_rad)
         self.assertAlmostEqual(right_command[1], 0.06)
+        self.assertAlmostEqual(right_command[2], 10.04)
 
     def test_teach_then_hold_uses_current_pose_not_old_follow_target(self) -> None:
         old = DualTarget(
