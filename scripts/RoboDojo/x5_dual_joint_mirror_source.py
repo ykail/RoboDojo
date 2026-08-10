@@ -224,7 +224,7 @@ class JointMirrorSession:
 
 
 class _KeyReader:
-    """Read only i/q, globally through XInput with terminal fallback."""
+    """Read global ``i`` through XInput, with an ``i``/``q`` terminal fallback."""
 
     _LOCK_MASK = 1 << 1
     _MOD2_MASK = 1 << 4
@@ -265,10 +265,10 @@ class _KeyReader:
         result: dict[int, str] = {}
         for line in output.splitlines():
             match = re.match(r"^keycode\s+(\d+)\s*=\s*(\S+)", line)
-            if match and match.group(2) in {"i", "q"}:
+            if match and match.group(2) == "i":
                 result[int(match.group(1))] = match.group(2)
-        if set(result.values()) != {"i", "q"}:
-            raise RuntimeError(f"incomplete X11 i/q keymap: {result}")
+        if set(result.values()) != {"i"}:
+            raise RuntimeError(f"incomplete X11 i keymap: {result}")
         return result
 
     def _publish(self, kind: str, keycode: int | None, modifiers: int | None, repeated: bool) -> None:
@@ -358,7 +358,8 @@ class _KeyReader:
             if self._process.poll() is not None:
                 raise RuntimeError(f"xinput exited with status {self._process.returncode}")
             print(
-                f"[Dual X5] global hotkeys active on {self.display_name}: i=toggle, q=quit.",
+                f"[Dual X5] global hotkey active on {self.display_name}: i=toggle. "
+                "Stop only with Ctrl-C in this terminal while supporting both arms.",
                 flush=True,
             )
             return True
@@ -590,7 +591,8 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
             flush=True,
         )
         print(
-            f"[Dual X5] listening on {args.host}:{args.port}; i toggles intervention, q exits.",
+            f"[Dual X5] listening on {args.host}:{args.port}; i toggles intervention. "
+            "Stop only with Ctrl-C in this terminal while supporting both arms.",
             flush=True,
         )
         with _KeyReader(

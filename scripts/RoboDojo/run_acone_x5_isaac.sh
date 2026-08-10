@@ -6,11 +6,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROBODOJO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 CONDA_SH="/home/acone/miniconda3/etc/profile.d/conda.sh"
 MIN_FREE_GPU_MB="${ROBODOJO_MIN_FREE_GPU_MB:-12000}"
+DOCUMENTS_DIR="/home/acone/Documents"
+REQUIRED_DRIVER_MAJOR="580"
 
 [[ -f "${CONDA_SH}" ]] || {
     echo "[acOne Isaac][ERROR] Conda activation script is missing: ${CONDA_SH}" >&2
     exit 2
 }
+
+driver_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader -i 0 | head -n 1 | tr -d '[:space:]')"
+driver_major="${driver_version%%.*}"
+[[ "${driver_major}" =~ ^[0-9]+$ && "${driver_major}" == "${REQUIRED_DRIVER_MAJOR}" ]] || {
+    echo "[acOne Isaac][ERROR] Isaac Sim 5.1 requires R580 on acOne; found ${driver_version:-unknown}." >&2
+    echo "[acOne Isaac][ERROR] R595 crashes in RTX SceneDB before RoboDojo starts." >&2
+    exit 2
+}
+if [[ -e "${DOCUMENTS_DIR}" && ! -w "${DOCUMENTS_DIR}" ]]; then
+    echo "[acOne Isaac][ERROR] ${DOCUMENTS_DIR} is not writable." >&2
+    echo "[acOne Isaac][ERROR] Run: sudo chown acone:acone ${DOCUMENTS_DIR}" >&2
+    exit 2
+fi
+mkdir -p \
+    "${DOCUMENTS_DIR}/Kit/shared/screenshots" \
+    "${DOCUMENTS_DIR}/Kit/apps/Isaac-Sim/scripts/new_stage"
 
 source "${CONDA_SH}"
 conda activate RoboDojo

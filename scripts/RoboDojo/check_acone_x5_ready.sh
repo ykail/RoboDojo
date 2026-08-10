@@ -7,6 +7,8 @@ ROBODOJO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 X5_PYTHON="/home/acone/Robot_Lab/.venv/bin/python"
 WRITER_PYTHON="/home/acone/micromamba/envs/arx-py310/bin/python"
 MIN_FREE_GPU_MB="${ROBODOJO_MIN_FREE_GPU_MB:-12000}"
+DOCUMENTS_DIR="/home/acone/Documents"
+REQUIRED_DRIVER_MAJOR="580"
 
 die() {
     echo "[acOne preflight][ERROR] $*" >&2
@@ -19,6 +21,9 @@ die() {
 [[ -x "${X5_PYTHON}" ]] || die "ARX SDK Python is missing: ${X5_PYTHON}"
 [[ -x "${WRITER_PYTHON}" ]] || die "LeRobot writer Python is missing: ${WRITER_PYTHON}"
 [[ -d "${ROBODOJO_ROOT}/Assets/Robots" ]] || die "RoboDojo Assets are not ready"
+if [[ -e "${DOCUMENTS_DIR}" && ! -w "${DOCUMENTS_DIR}" ]]; then
+    die "Isaac user directory is not writable: ${DOCUMENTS_DIR}; run: sudo chown acone:acone ${DOCUMENTS_DIR}"
+fi
 
 "${X5_PYTHON}" -c \
     'import arx5_interface as arx5; print("[acOne preflight] ARX SDK:", arx5.__file__)'
@@ -41,9 +46,15 @@ DISPLAY="${DISPLAY:-:1}" xset q >/dev/null 2>&1 \
 ssh -o BatchMode=yes -o ConnectTimeout=5 hoo@10.19.127.58 true \
     || die "passwordless SSH from acOne to Hoo is unavailable"
 
+driver_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader -i 0 | head -n 1 | tr -d '[:space:]')"
+driver_major="${driver_version%%.*}"
+[[ "${driver_major}" =~ ^[0-9]+$ ]] || die "could not read the NVIDIA driver version"
+[[ "${driver_major}" == "${REQUIRED_DRIVER_MAJOR}" ]] \
+    || die "Isaac Sim 5.1 on acOne requires the R580 driver; ${driver_version} crashes in RTX SceneDB"
+
 free_gpu_mb="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 | tr -d '[:space:]')"
 [[ "${free_gpu_mb}" =~ ^[0-9]+$ ]] || die "could not read free memory on GPU 0"
 (( free_gpu_mb >= MIN_FREE_GPU_MB )) \
     || die "GPU 0 has ${free_gpu_mb} MiB free; stop the local policy process before Isaac"
 
-echo "[acOne preflight] READY: SDK, writer, Assets, CAN, X11, and Hoo SSH"
+echo "[acOne preflight] READY: SDK, writer, Assets, CAN, X11, Hoo SSH, and NVIDIA ${driver_version}"
