@@ -344,6 +344,33 @@ def _exit_for_shell_restart(env, fatal_msg):
     os._exit(99)
 
 
+def _has_cuda_illegal_memory_error(exc):
+    """Return true when an exception chain proves the CUDA context is poisoned."""
+
+    pending = [exc]
+    seen = set()
+    markers = (
+        "illegal memory access",
+        "cuda error 700",
+        "warp cuda error 700",
+    )
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        detail = f"{type(current).__name__}: {current}".lower()
+        if any(marker in detail for marker in markers):
+            return True
+        pending.extend(
+            (
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            )
+        )
+    return False
+
+
 def main():
     """Assemble the env config, build the eval env, and run the eval loop with
     PhysX crash/resume recovery until the requested episode count is reached.
@@ -986,6 +1013,11 @@ def main():
                 flush=True,
             )
             traceback.print_exc()
+            if _has_cuda_illegal_memory_error(e):
+                _exit_for_shell_restart(
+                    env,
+                    f"CUDA context was corrupted by {type(e).__name__}: {e}",
+                )
             if enable_monitor and get_monitor().is_fatal():
                 fatal_msg = get_monitor().get_fatal_message() or str(e)
                 if get_monitor().requires_shell_restart():

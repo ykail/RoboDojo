@@ -80,6 +80,7 @@ class _TaskEnv:
     def __init__(self):
         self.marker = -1
         self.get_obs_count = 0
+        self.render_count = 0
         self.camera_pipeline = [-101, -102]
         self.reward_manager = SimpleNamespace(
             score_completed_count=[0],
@@ -97,10 +98,15 @@ class _TaskEnv:
         self.manager.set_updates_enabled = set_updates_enabled
         self.capture_manager = self.manager
 
+    def render(self):
+        self.render_count += 1
+        self.camera_pipeline.pop(0)
+        self.camera_pipeline.append(self.marker)
+
     def get_obs(self):
         self.get_obs_count += 1
-        vision_marker = self.camera_pipeline.pop(0)
-        self.camera_pipeline.append(self.marker)
+        self.render()
+        vision_marker = self.camera_pipeline[0]
         return {
             "state": {"marker": np.asarray([self.marker], dtype=np.float32)},
             "vision": {
@@ -203,7 +209,8 @@ class DeferredQualityTest(unittest.TestCase):
         self.assertEqual(int(obs["state"]["marker"][0]), 9)
         self.assertEqual(task_env.reward_manager.score_completed_count[0], 9)
         self.assertEqual(task_env.reward_manager.final_score_completed_count[0], 19)
-        self.assertEqual(task_env.get_obs_count, 15)
+        self.assertEqual(task_env.get_obs_count, 5)
+        self.assertEqual(task_env.render_count, 15)
         self.assertTrue(
             all(
                 call == {
@@ -240,6 +247,7 @@ class DeferredQualityTest(unittest.TestCase):
         MODULE._set_data_camera_updates(task_env, True, label="CP13")
         self.assertEqual(task_env.manager.calls, [False, True])
         self.assertTrue(task_env.manager.updates_enabled)
+        self.assertEqual(task_env.render_count, MODULE._CAMERA_FRESH_FRAMES)
 
 
 if __name__ == "__main__":

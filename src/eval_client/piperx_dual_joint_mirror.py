@@ -521,17 +521,30 @@ def _data_camera_manager(task_env: Any) -> Any:
 def _set_data_camera_updates(task_env: Any, enabled: bool, *, label: str) -> None:
     manager = _data_camera_manager(task_env)
     manager.set_updates_enabled(bool(enabled))
+    if enabled:
+        # Do not ask the annotator for data on the same Kit update that
+        # re-enables its Hydra texture.  Populate a fresh RTX buffer first;
+        # this advances rendering only, never physics or the episode clock.
+        render = getattr(task_env, "render", None)
+        if not callable(render):
+            raise DualJointMirrorError("resumed data cameras cannot be warmed up")
+        for _ in range(_CAMERA_FRESH_FRAMES):
+            render()
     state = "RESUMED" if enabled else "PAUSED"
     print(f"\n[{label} cameras] {state}", flush=True)
 
 
 def _fresh_quality_obs(task_env: Any) -> dict[str, Any]:
-    obs: dict[str, Any] | None = None
-    for _ in range(_CAMERA_FRESH_FRAMES):
-        obs = task_env.get_obs()
-    if obs is None:  # Defensive; the fixed fresh count is always positive.
-        raise DualJointMirrorError("quality camera pipeline produced no observation")
-    return obs
+    # RTX tiled cameras publish two frames behind a direct simulator-state
+    # write. Advance those frames without touching the annotator buffer, then
+    # capture only the third frame. Reading all three used to launch Warp on
+    # the two stale buffers even though their observations were discarded.
+    render = getattr(task_env, "render", None)
+    if not callable(render):
+        raise DualJointMirrorError("quality camera pipeline cannot be advanced")
+    for _ in range(_CAMERA_FRESH_FRAMES - 1):
+        render()
+    return task_env.get_obs()
 
 
 def _restore_deferred_snapshot(
@@ -629,7 +642,9 @@ def _render_deferred_quality_segment(
         if render_error is not None:
             raise DualJointMirrorError(
                 "deferred quality rendering failed and the terminal simulator "
-                "state could not be restored"
+                "state could not be restored; first error was "
+                f"{type(render_error).__name__}: {render_error}; restore error was "
+                f"{type(restore_exc).__name__}: {restore_exc}"
             ) from restore_exc
         raise
 

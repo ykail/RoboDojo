@@ -195,21 +195,35 @@ class CameraView(XFormPrim):
         self._output_annotators = output_annotators
         self._annotators = dict()
         self.camera_resolution = camera_resolution
-        self._tiled_render_product = None
+        self._render_product = None
         self._updates_enabled = True
         self._setup_tiled_sensor()
 
     def __del__(self):
-        XFormPrim.__del__(self)
-        self._clean_up_tiled_sensor()
+        try:
+            self._clean_up_tiled_sensor()
+        except Exception:
+            pass
+        try:
+            XFormPrim.__del__(self)
+        except Exception:
+            pass
 
     def _clean_up_tiled_sensor(self):
         """Clean up the sensor by detaching annotators and destroying render products, and removing related prims."""
-        if self._tiled_render_product is not None:
-            # detach annotators from render product
-            self._tiled_annotator.detach([self._tiled_render_product.path])
-            # delete tiled render products
-            self._tiled_render_product.destroy()
+        render_product = getattr(self, "_render_product", None)
+        if render_product is None:
+            return
+        seen_annotators: set[int] = set()
+        for annotator in getattr(self, "_annotators", {}).values():
+            if id(annotator) in seen_annotators:
+                continue
+            annotator.detach([render_product.path])
+            seen_annotators.add(id(annotator))
+        render_product.destroy()
+        self._render_product = None
+        self._annotators.clear()
+        self._updates_enabled = False
 
     def set_updates_enabled(self, enabled: bool) -> None:
         """Pause this RTX render product without changing its render settings."""
@@ -226,6 +240,9 @@ class CameraView(XFormPrim):
             raise RuntimeError("tiled camera render product cannot be paused")
         setter(enabled)
         self._updates_enabled = enabled
+
+    def destroy(self) -> None:
+        self._clean_up_tiled_sensor()
 
     def _get_tiled_resolution(self, num_cameras, resolution) -> Tuple[int, int]:
         """Calculate the resolution for the tiled sensor based on the number of cameras and individual camera resolution.
@@ -252,6 +269,7 @@ class CameraView(XFormPrim):
             tile_resolution=self.camera_resolution,
             name=f"{self.name}_tiled_sensor",
         )
+        self._updates_enabled = True
         # define the annotators based on defined types
         self._render_product_path = self._render_product.path
         for annotator_type in self._output_annotators:
@@ -263,15 +281,15 @@ class CameraView(XFormPrim):
             # get annotator
             if annotator_type == "rgba" or annotator_type == "rgb":
                 self._annotators["rgba"] = rep.AnnotatorRegistry.get_annotator(
-                    "rgb", device="cuda", do_array_copy=False
+                    "rgb", device="cuda", do_array_copy=True
                 )
             elif annotator_type == "depth" or annotator_type == "distance_to_image_plane":
                 self._annotators["distance_to_image_plane"] = rep.AnnotatorRegistry.get_annotator(
-                    "distance_to_image_plane", device="cuda", do_array_copy=False
+                    "distance_to_image_plane", device="cuda", do_array_copy=True
                 )
             else:
                 self._annotators[annotator_type] = rep.AnnotatorRegistry.get_annotator(
-                    annotator_type, device="cuda", do_array_copy=False
+                    annotator_type, device="cuda", do_array_copy=True
                 )
         # attach the annotator to the render product
         for annotator in self._annotators.values():
@@ -317,7 +335,14 @@ class CameraView(XFormPrim):
         else:
             output_device = "cuda"
         # get the linear sensor data from the tiled annotator and (if needed) slice it to get only the RGB data
-        data = self._annotators[spec["name"]].get_data(device=output_device)
+        # The render product is deliberately paused during X5 intervention.
+        # Own the returned GPU buffer across that enable/disable boundary;
+        # Replicator's zero-copy view may otherwise refer to a recycled RTX
+        # allocation before the Warp reshape kernel has consumed it.
+        data = self._annotators[spec["name"]].get_data(
+            device=output_device,
+            do_array_copy=True,
+        )
         # check whether returned data is a dict (used for segmentation)
         if isinstance(data, dict):
             tiled_data: wp.array = data["data"]
@@ -343,6 +368,13 @@ class CameraView(XFormPrim):
             output_channels = channels  # Use channels directly (rgb has 4 channels from rgba)
             width, height = self.camera_resolution
             num_cameras = len(self.prims)
+            required_values = self.tiled_resolution[0] * self.tiled_resolution[1] * channels
+            available_values = int(getattr(tiled_data, "size", 0))
+            if available_values < required_values:
+                raise RuntimeError(
+                    "tiled camera output is not ready: "
+                    f"received {available_values} values, need {required_values}"
+                )
 
             # check if the data should be copied to the pre-allocated memory
             if out is None:

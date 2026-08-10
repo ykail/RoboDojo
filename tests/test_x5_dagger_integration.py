@@ -526,6 +526,25 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         self.assertIn("set_updates_enabled", mirror_source)
         self.assertIn("SimulatorStateSnapshotter", mirror_source)
         self.assertIn("restore_replay_frame", mirror_source)
+        self.assertIn("resumed data cameras cannot be warmed up", mirror_source)
+        self.assertIn("quality camera pipeline cannot be advanced", mirror_source)
+
+        camera_view_source = _source("env/camera_manager/capture/camera_view.py")
+        self.assertIn("do_array_copy=True", camera_view_source)
+        self.assertIn("def destroy(self) -> None", camera_view_source)
+        self.assertIn("tiled camera output is not ready", camera_view_source)
+
+        capture_manager_source = _source(
+            "env/camera_manager/capture/tiled_capture_manager.py"
+        )
+        self.assertIn("tiled_camera.destroy()", capture_manager_source)
+        self.assertIn("self._output_buffers.clear()", capture_manager_source)
+        self.assertIn("self.cameras = self.camera_manager.cameras", capture_manager_source)
+        self.assertIn("self._updates_enabled = False", capture_manager_source)
+
+        main_source = _source("src/eval_client/main.py")
+        self.assertIn("def _has_cuda_illegal_memory_error", main_source)
+        self.assertIn("CUDA context was corrupted", main_source)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,11 @@ class TiledCaptureManager:
         2. Get all render_product control
         3. Attach Annotator
         """
+        # CameraManager may replace these lists after a hard scene reset.
+        # Always bind to its current handles before creating render products.
+        self.cameras = self.camera_manager.cameras
+        self.camera_names = self.camera_manager.camera_names
+        self.num_cams = len(self.cameras[0])
         self.camera_prim_paths.clear()
         for env_id in range(self.num_envs):
             self.camera_prim_paths.append([])
@@ -203,6 +208,15 @@ class TiledCaptureManager:
         Only Hard Reset need which means if we reset simulation backend we need to initialize camera again
         Since Render product change, we also need to attch a new writer maybe
         """
+        for tiled_camera in self.tiled_cameras:
+            tiled_camera.destroy()
+        self.tiled_cameras.clear()
+        self.tiled_render_products.clear()
+        self.annotator.clear()
+        self.annotator_type.clear()
+        self.annotator_device.clear()
+        self._output_buffers.clear()
+        self._updates_enabled = True
         self.init_cameras()
 
     def destroy(self):
@@ -211,6 +225,8 @@ class TiledCaptureManager:
         This function will be called when we close the environment.
         """
 
+        for tiled_camera in self.tiled_cameras:
+            tiled_camera.destroy()
         self.annotator.clear()
         self.annotator_type.clear()
         self.annotator_device.clear()
@@ -218,6 +234,7 @@ class TiledCaptureManager:
         self.cameras.clear()
         self.camera_names.clear()
         self.sim = None
-        for rp in self.tiled_render_products:
-            rp.destroy()
+        self.tiled_render_products.clear()
+        self._output_buffers.clear()
+        self._updates_enabled = False
         self.camera_prim_paths.clear()
