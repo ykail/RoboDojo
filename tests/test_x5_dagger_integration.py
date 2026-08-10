@@ -385,15 +385,33 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         hardware = SCRIPT_DIR / "run_x5_dagger_hardware.sh"
         isaac = SCRIPT_DIR / "run_x5_dagger_isaac.sh"
         pen_holder = SCRIPT_DIR / "run_acone_x5_pen_holder_isaac.sh"
+        pen_holder_9999 = SCRIPT_DIR / "run_acone_x5_pen_holder_9999_isaac.sh"
         pen_tunnel = SCRIPT_DIR / "run_acone_x5_pen_holder_tunnel.sh"
         pen_policy = SCRIPT_DIR / "run_hoo_policy_pen_holder_9999_my.sh"
+        pen_policy_9999 = SCRIPT_DIR / "run_hoo_policy_pen_holder_9999.sh"
         missing = [
             str(script)
-            for script in (hardware, isaac, pen_holder, pen_tunnel, pen_policy)
+            for script in (
+                hardware,
+                isaac,
+                pen_holder,
+                pen_holder_9999,
+                pen_tunnel,
+                pen_policy,
+                pen_policy_9999,
+            )
             if not script.is_file()
         ]
         self.assertFalse(missing, f"missing X5 launcher(s): {missing}")
-        for script in (hardware, isaac, pen_holder, pen_tunnel, pen_policy):
+        for script in (
+            hardware,
+            isaac,
+            pen_holder,
+            pen_holder_9999,
+            pen_tunnel,
+            pen_policy,
+            pen_policy_9999,
+        ):
             with self.subTest(script=script.name):
                 self.assertTrue(
                     os.access(script, os.X_OK),
@@ -479,6 +497,30 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         ):
             with self.subTest(pen_policy_required=required):
                 self.assertIn(required, pen_policy_source)
+
+        pen_9999_source = pen_holder_9999.read_text(encoding="utf-8")
+        for required in (
+            'ROBODOJO_TASK="fill_pen_holder"',
+            'ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"',
+            "robodojo_fill_pen_holder_x5_online_dagger_9999_v1",
+            "pi05_robodojo_three_task_base/fill_pen_kong_toast_300_base_official_norm_v1/9999",
+            "ecc1a7451c3156b1e5f7533851dbb0222896206f",
+            "sha256:2b906f8e1d4932d7f7cb57aa2d8113f83efcc9f5fb35a0fc17c2934346c4eec2",
+            "run_acone_x5_isaac.sh",
+        ):
+            with self.subTest(pen_9999_required=required):
+                self.assertIn(required, pen_9999_source)
+
+        pen_policy_9999_source = pen_policy_9999.read_text(encoding="utf-8")
+        for required in (
+            'KAI0_ROOT="/home/hoo/RoboDojo/third_party/kai0"',
+            'CHECKPOINT_DIR="/home/hoo/checkpoints/9999"',
+            "pi05_robodojo_three_task_base/fill_pen_kong_toast_300_base_official_norm_v1/9999",
+            "ecc1a7451c3156b1e5f7533851dbb0222896206f",
+            "sha256:2b906f8e1d4932d7f7cb57aa2d8113f83efcc9f5fb35a0fc17c2934346c4eec2",
+        ):
+            with self.subTest(pen_policy_9999_required=required):
+                self.assertIn(required, pen_policy_9999_source)
 
         mirror_source = _source("src/eval_client/piperx_dual_joint_mirror.py")
         self.assertIn("set_updates_enabled", mirror_source)
