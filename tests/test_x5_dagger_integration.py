@@ -386,13 +386,14 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         isaac = SCRIPT_DIR / "run_x5_dagger_isaac.sh"
         pen_holder = SCRIPT_DIR / "run_acone_x5_pen_holder_isaac.sh"
         pen_tunnel = SCRIPT_DIR / "run_acone_x5_pen_holder_tunnel.sh"
+        pen_policy = SCRIPT_DIR / "run_hoo_policy_pen_holder_9999_my.sh"
         missing = [
             str(script)
-            for script in (hardware, isaac, pen_holder, pen_tunnel)
+            for script in (hardware, isaac, pen_holder, pen_tunnel, pen_policy)
             if not script.is_file()
         ]
         self.assertFalse(missing, f"missing X5 launcher(s): {missing}")
-        for script in (hardware, isaac, pen_holder, pen_tunnel):
+        for script in (hardware, isaac, pen_holder, pen_tunnel, pen_policy):
             with self.subTest(script=script.name):
                 self.assertTrue(
                     os.access(script, os.X_OK),
@@ -456,6 +457,8 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             'ROBODOJO_CHECKPOINT_ID="fill_pen_holder/9999_my"',
             'ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"',
             "robodojo_fill_pen_holder_x5_online_dagger_9999_my_v1",
+            "76d26714c276c9a4812066854d248111382fe591",
+            "sha256:7e3cbf579a37640a13c0d152cd5913b9142437627db1e5c33b4266602c2c46ab",
             "run_acone_x5_isaac.sh",
         ):
             with self.subTest(pen_holder_required=required):
@@ -464,6 +467,17 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         pen_tunnel_source = pen_tunnel.read_text(encoding="utf-8")
         self.assertIn('ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"', pen_tunnel_source)
         self.assertIn('HOO_POLICY_PORT="${HOO_POLICY_PORT:-18081}"', pen_tunnel_source)
+
+        pen_policy_source = pen_policy.read_text(encoding="utf-8")
+        for required in (
+            'KAI0_ROOT="/home/hoo/kai0-output-engine-policy-v1"',
+            'CHECKPOINT_DIR="/home/hoo/checkpoints/9999_my"',
+            'CHECKPOINT_ID="fill_pen_holder/9999_my"',
+            "76d26714c276c9a4812066854d248111382fe591",
+            "sha256:7e3cbf579a37640a13c0d152cd5913b9142437627db1e5c33b4266602c2c46ab",
+        ):
+            with self.subTest(pen_policy_required=required):
+                self.assertIn(required, pen_policy_source)
 
         mirror_source = _source("src/eval_client/piperx_dual_joint_mirror.py")
         self.assertIn("set_updates_enabled", mirror_source)
