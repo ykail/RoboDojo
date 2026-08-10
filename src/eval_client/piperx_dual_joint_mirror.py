@@ -8,6 +8,7 @@ import os
 import socket
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -375,29 +376,100 @@ def _manual_action(
 
 
 class _ControlRateReporter:
+    _PHASES = ("source", "physics", "record_wait", "pacer", "vision")
+
     def __init__(self, expected_hz: float) -> None:
         self.expected_hz = float(expected_hz)
         self.window_start = time.monotonic()
         self.last_frame = self.window_start
         self.frames = 0
         self.max_gap_s = 0.0
+        self.phase_total_s = {name: 0.0 for name in self._PHASES}
+        self.phase_max_s = {name: 0.0 for name in self._PHASES}
 
-    def frame(self, mode: str) -> None:
+    def frame(self, mode: str, **phases_s: float) -> None:
         now = time.monotonic()
         self.max_gap_s = max(self.max_gap_s, now - self.last_frame)
         self.last_frame = now
         self.frames += 1
+        for name in self._PHASES:
+            value = max(0.0, float(phases_s.get(name, 0.0)))
+            self.phase_total_s[name] += value
+            self.phase_max_s[name] = max(self.phase_max_s[name], value)
         elapsed = now - self.window_start
         if elapsed < 2.0:
             return
+        phase_text = " ".join(
+            f"{name}={self.phase_total_s[name] * 1000.0 / self.frames:.0f}/"
+            f"{self.phase_max_s[name] * 1000.0:.0f}ms"
+            for name in self._PHASES
+        )
         print(
             f"\n[X5 timing] mode={mode} control={self.frames / elapsed:.1f}Hz "
-            f"target={self.expected_hz:.1f}Hz max_gap={self.max_gap_s * 1000.0:.0f}ms",
+            f"target={self.expected_hz:.1f}Hz max_gap={self.max_gap_s * 1000.0:.0f}ms "
+            f"avg/max {phase_text}",
             flush=True,
         )
         self.window_start = now
         self.frames = 0
         self.max_gap_s = 0.0
+        self.phase_total_s = {name: 0.0 for name in self._PHASES}
+        self.phase_max_s = {name: 0.0 for name in self._PHASES}
+
+
+class _SinglePendingRecorder:
+    """Overlap one acknowledged LeRobot frame with the next render/capture.
+
+    There is deliberately only one pending frame: ordering and writer errors
+    remain strict, memory stays bounded to one RGB observation, and a writer
+    that cannot sustain the control rate still applies honest backpressure.
+    """
+
+    def __init__(self, recorder: Any) -> None:
+        self.recorder = recorder
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lerobot-submit")
+        self._pending: Future | None = None
+        self._closed = False
+
+    @property
+    def record_dir(self) -> str:
+        return self.recorder.record_dir
+
+    def wait(self) -> float:
+        if self._pending is None:
+            return 0.0
+        started = time.monotonic()
+        pending = self._pending
+        self._pending = None
+        pending.result()
+        return time.monotonic() - started
+
+    def append(self, **kwargs: Any) -> float:
+        wait_s = self.wait()
+        self._pending = self._executor.submit(self.recorder.append, **kwargs)
+        return wait_s
+
+    def finalize(self, **kwargs: Any) -> Any:
+        try:
+            self.wait()
+            return self.recorder.finalize(**kwargs)
+        finally:
+            self.close()
+
+    def discard(self, **kwargs: Any) -> None:
+        try:
+            try:
+                self.wait()
+            except Exception:
+                pass
+            self.recorder.finalize(**kwargs)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._executor.shutdown(wait=True)
 
 
 def run_piperx_dual_joint_test_episode(task_env: Any) -> None:
@@ -493,7 +565,7 @@ def run_piperx_policy_leader_mirror_episode(
     hardware_label = "ARX X5" if profile == "arx_x5_identity_joint_v1" else "PiPER-X"
 
     client = DualJointMirrorClient()
-    recorder: Any | None = None
+    recorder: _SinglePendingRecorder | None = None
     recorder_finalized = False
     robots = _target_robots(task_env)
     pacer = RealtimePacer(
@@ -511,7 +583,7 @@ def run_piperx_policy_leader_mirror_episode(
         if record_enabled:
             from src.eval_client.lerobot_stream_recorder import recorder_for_env
 
-            recorder = recorder_for_env(task_env)
+            recorder = _SinglePendingRecorder(recorder_for_env(task_env))
         checkpoint_label = "CP13" if recorder is not None else "CP12"
         print(
             (
@@ -533,8 +605,10 @@ def run_piperx_policy_leader_mirror_episode(
 
         while not task_env.is_episode_end():
             if mode == "manual":
+                source_started = time.monotonic()
                 current = _measured_sim_state(task_env, robots)
                 response = client.exchange(_state_deltas(current, follow_anchor))
+                source_s = time.monotonic() - source_started
                 if response["edge"] == "exit":
                     follow_anchor = current
                     follow_command = current
@@ -559,9 +633,12 @@ def run_piperx_policy_leader_mirror_episode(
                 # image/dataset work.  Manual X5 targets are already sampled at
                 # the dataset rate, so the ordinary 8/10-step interpolation
                 # only adds 32 ms of avoidable lag.
+                physics_started = time.monotonic()
                 task_env.take_action(action, interpolate=False)
+                physics_s = time.monotonic() - physics_started
+                record_wait_s = 0.0
                 if recorder is not None:
-                    recorder.append(
+                    record_wait_s = recorder.append(
                         obs=obs,
                         policy_action=None,
                         human_action=action,
@@ -577,9 +654,20 @@ def run_piperx_policy_leader_mirror_episode(
                         },
                     )
                 pending_takeover_edge = 0
+                pacer_started = time.monotonic()
                 pacer.wait()
+                pacer_s = time.monotonic() - pacer_started
+                vision_started = time.monotonic()
                 obs = task_env.get_obs()
-                timing.frame("manual")
+                vision_s = time.monotonic() - vision_started
+                timing.frame(
+                    "manual",
+                    source=source_s,
+                    physics=physics_s,
+                    record_wait=record_wait_s,
+                    pacer=pacer_s,
+                    vision=vision_s,
+                )
                 continue
 
             current = _measured_sim_state(task_env, robots)
@@ -616,9 +704,11 @@ def run_piperx_policy_leader_mirror_episode(
                 # physical X5 and simulator now start the same target together;
                 # no post-step PhysX measurement (and its PD noise/one-frame
                 # lag) is copied back to the real robot.
+                source_started = time.monotonic()
                 pre_state = _measured_sim_state(task_env, robots)
                 policy_target = _action_target_state(action)
                 pre = client.exchange(_state_deltas(policy_target, follow_anchor))
+                source_s = time.monotonic() - source_started
                 if pre["edge"] == "enter":
                     if not allow_intervention or pre["mode"] != "manual":
                         raise DualJointMirrorError("unexpected intervention entry")
@@ -636,9 +726,12 @@ def run_piperx_policy_leader_mirror_episode(
                 if pre["mode"] != "follow":
                     raise DualJointMirrorError("source left follow mode without an edge")
                 follow_command = policy_target
+                physics_started = time.monotonic()
                 task_env.take_action(action)
+                physics_s = time.monotonic() - physics_started
+                record_wait_s = 0.0
                 if recorder is not None:
-                    recorder.append(
+                    record_wait_s = recorder.append(
                         obs=obs,
                         policy_action=action,
                         human_action=None,
@@ -654,9 +747,20 @@ def run_piperx_policy_leader_mirror_episode(
                         },
                     )
                 pending_release_edge = 0
+                pacer_started = time.monotonic()
                 pacer.wait()
+                pacer_s = time.monotonic() - pacer_started
+                vision_started = time.monotonic()
                 obs = task_env.get_obs()
-                timing.frame("follow")
+                vision_s = time.monotonic() - vision_started
+                timing.frame(
+                    "follow",
+                    source=source_s,
+                    physics=physics_s,
+                    record_wait=record_wait_s,
+                    pacer=pacer_s,
+                    vision=vision_s,
+                )
                 if task_env.is_episode_end() or action_index + 1 == len(actions):
                     break
                 model_client.call(func_name="update_obs", obs=obs)
@@ -681,7 +785,7 @@ def run_piperx_policy_leader_mirror_episode(
             print(f"[CP13 Isaac] saved LeRobot episode -> {saved_path}", flush=True)
     except Exception:
         if recorder is not None and not recorder_finalized:
-            recorder.finalize(accepted=False, success=False, reason="exception")
+            recorder.discard(accepted=False, success=False, reason="exception")
             recorder_finalized = True
         raise
     finally:

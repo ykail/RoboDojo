@@ -87,6 +87,11 @@ class X5HardwareConfig:
     # each follow waypoint one control frame ahead so the SDK's 500 Hz thread
     # linearly interpolates between consecutive targets.
     follow_preview_s: float = 0.04
+    # The full Isaac quality path can deliver waypoints much slower than its
+    # nominal 25 Hz timestamps.  Stretch the SDK interpolation to the measured
+    # command interval, capped so a policy-inference pause cannot schedule an
+    # arbitrarily distant target.
+    follow_preview_max_s: float = 0.50
 
     left_gripper_kp: float = 2.0
     left_gripper_kd: float = 0.15
@@ -124,6 +129,11 @@ class X5HardwareConfig:
                 raise ValueError(f"{name} must be positive when supplied")
         if not math.isfinite(float(self.follow_preview_s)) or self.follow_preview_s < 0:
             raise ValueError("follow_preview_s must be finite and non-negative")
+        if (
+            not math.isfinite(float(self.follow_preview_max_s))
+            or self.follow_preview_max_s < self.follow_preview_s
+        ):
+            raise ValueError("follow_preview_max_s must be finite and >= follow_preview_s")
 
 
 def _load_arx5_interface() -> Any:
@@ -158,6 +168,7 @@ class DualX5Hardware:
         self._mode = X5Mode.DISCONNECTED
         self._latched_target: DualTarget | None = None
         self._sample_seq = 0
+        self._last_follow_command_ns: int | None = None
 
     @property
     def mode(self) -> X5Mode:
@@ -360,6 +371,7 @@ class DualX5Hardware:
 
     def enter_hold(self) -> DualState:
         self._require_connected()
+        self._last_follow_command_ns = None
         current = self.read()
         current_target = self.target_from_state(current)
         # Overwrite any old SDK target before restoring position gains, then
@@ -375,7 +387,17 @@ class DualX5Hardware:
         self._require_connected()
         if self._mode not in {X5Mode.HOLD, X5Mode.FOLLOW}:
             raise X5HardwareError(f"cannot follow while dual X5 is in {self._mode.value} mode")
-        applied = self._write(target, preview_s=self.config.follow_preview_s)
+        now_ns = self._monotonic_ns()
+        preview_s = float(self.config.follow_preview_s)
+        if self._last_follow_command_ns is not None:
+            interval_s = (now_ns - self._last_follow_command_ns) / 1_000_000_000.0
+            if math.isfinite(interval_s) and interval_s > 0.0:
+                preview_s = min(
+                    max(interval_s, preview_s),
+                    float(self.config.follow_preview_max_s),
+                )
+        self._last_follow_command_ns = now_ns
+        applied = self._write(target, preview_s=preview_s)
         self._mode = X5Mode.FOLLOW
         return applied
 
@@ -385,6 +407,7 @@ class DualX5Hardware:
             self.enter_hold()
         target = self.latched_target
         applied = self._write(target)
+        self._last_follow_command_ns = None
         self._mode = X5Mode.HOLD
         return applied
 
@@ -450,6 +473,7 @@ class DualX5Hardware:
     def close(self) -> None:
         if not self.is_connected:
             self._mode = X5Mode.DISCONNECTED
+            self._last_follow_command_ns = None
             return
         try:
             if self._mode != X5Mode.FAULT:
@@ -466,5 +490,6 @@ class DualX5Hardware:
         self._controller_configs.clear()
         self._gripper_ranges.clear()
         self._latched_target = None
+        self._last_follow_command_ns = None
         self._sdk = None
         self._mode = X5Mode.DISCONNECTED

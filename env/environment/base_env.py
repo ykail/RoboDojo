@@ -1,4 +1,5 @@
 from collections.abc import Sequence, Sequence as SequenceABC
+import math
 import os
 from typing import Any
 
@@ -180,7 +181,8 @@ class BaseEnv(gym.Env):
             config (DictConfig): The configuration for the environment. This comes from hydra yaml.
         """
         physx_config = _resolve_sim_section(DEFAULT_PHYSX_CONFIG, self.config.get("physx"))
-        render_config = _resolve_sim_section(DEFAULT_RENDER_CONFIG, self.config.get("render"))
+        render_overrides = self.config.get("render")
+        render_config = _resolve_sim_section(DEFAULT_RENDER_CONFIG, render_overrides)
         rendering_mode_override = os.environ.get("ROBODOJO_RENDERING_MODE")
         if rendering_mode_override:
             if rendering_mode_override not in _RENDERING_MODES:
@@ -189,10 +191,29 @@ class BaseEnv(gym.Env):
                     f"got {rendering_mode_override!r}"
                 )
             render_config["rendering_mode"] = rendering_mode_override
+            if rendering_mode_override != "quality":
+                # IsaacLab loads the selected rendering-mode preset first and
+                # then applies every non-None RenderCfg value.  RoboDojo's
+                # quality defaults (DLAA, reflections, GI, translucency, ...)
+                # would otherwise silently overwrite the balanced/performance
+                # preset requested above.  Preserve task-specific overrides,
+                # but let all untouched fields come from the requested preset.
+                explicit_keys = (
+                    set(render_overrides.keys()) if render_overrides is not None else set()
+                )
+                for key in _RENDER_KEYS:
+                    if key != "rendering_mode" and key not in explicit_keys:
+                        render_config[key] = None
         frequency_settings = _resolve_sim_section(
             DEFAULT_FREQUENCY_SETTINGS,
             self.config.get("frequency_settings"),
         )
+        rate_limit_override = os.environ.get("ROBODOJO_MAIN_RATE_LIMIT_HZ")
+        if rate_limit_override:
+            rate_limit_hz = float(rate_limit_override)
+            if not math.isfinite(rate_limit_hz) or rate_limit_hz <= 0.0:
+                raise ValueError("ROBODOJO_MAIN_RATE_LIMIT_HZ must be finite and positive")
+            frequency_settings["/app/runLoops/main/rateLimitFrequency"] = rate_limit_hz
 
         _apply_render_settings(self.sim_cfg.sim.render, render_config, frequency_settings)
         _apply_physx_settings(self.sim_cfg.sim.physx, physx_config)

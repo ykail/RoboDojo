@@ -77,6 +77,13 @@ export DISPLAY="${DISPLAY:-:1}"
 export XAUTHORITY="${XAUTHORITY:-/run/user/$(id -u)/gdm/Xauthority}"
 export OMNI_KIT_ACCEPT_EULA=YES
 export ROBODOJO_REALTIME=1
+# Three 640x480 RTX sensors plus the GUI make RoboDojo's quality preset run at
+# only about 3-5 Hz even on the Hoo RTX 5080.  X5 teleoperation needs the
+# latency-oriented preset; callers can still opt back into quality explicitly.
+export ROBODOJO_RENDERING_MODE="${ROBODOJO_RENDERING_MODE:-performance}"
+# make_toast uses dt=4 ms and ten physics steps per 25 Hz action.  The old
+# 125 Hz Kit cap alone could consume roughly 80 ms before camera rendering.
+export ROBODOJO_MAIN_RATE_LIMIT_HZ="${ROBODOJO_MAIN_RATE_LIMIT_HZ:-250}"
 export ROBODOJO_MAX_BASH_RETRIES="${ROBODOJO_MAX_BASH_RETRIES:-1}"
 export ROBODOJO_DUAL_MIRROR_HOST="${SOURCE_HOST}"
 export ROBODOJO_DUAL_MIRROR_PORT="${SOURCE_PORT}"
@@ -90,6 +97,8 @@ echo "[X5 Isaac] Hoo policy=ws://127.0.0.1:${POLICY_PORT}"
 echo "[X5 Isaac] hardware=${SOURCE_HOST}:${SOURCE_PORT} protocol=${MIRROR_PROTOCOL}"
 echo "[X5 Isaac] profile=${MIRROR_PROFILE} signs=[+1,+1,+1,+1,+1,+1]"
 echo "[X5 Isaac] dataset=${DATASET_PATH}"
+echo "[X5 Isaac] rendering=${ROBODOJO_RENDERING_MODE} (set ROBODOJO_RENDERING_MODE=quality to override)"
+echo "[X5 Isaac] Kit main-loop cap=${ROBODOJO_MAIN_RATE_LIMIT_HZ}Hz"
 echo "[X5 Isaac] use the global i key to enter/leave intervention; terminal focus is not required"
 echo "[X5 Isaac] an episode is committed automatically at its terminal outcome"
 
