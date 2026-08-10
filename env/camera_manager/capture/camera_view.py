@@ -201,11 +201,7 @@ class CameraView(XFormPrim):
 
     def __del__(self):
         try:
-            self._clean_up_tiled_sensor()
-        except Exception:
-            pass
-        try:
-            XFormPrim.__del__(self)
+            self.destroy()
         except Exception:
             pass
 
@@ -264,7 +260,27 @@ class CameraView(XFormPrim):
         self._updates_enabled = enabled
 
     def destroy(self) -> None:
-        self._clean_up_tiled_sensor()
+        try:
+            self._clean_up_tiled_sensor()
+        except Exception as exc:
+            print(
+                "[camera cleanup] tiled sensor teardown warning: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        try:
+            # XFormPrim registers PHYSICS_READY, POST_RESET and, critically,
+            # PRIM_DELETION callbacks through weakref.proxy(self).  Calling its
+            # inherited __del__ is insufficient because Prim.__del__ dispatches
+            # back to this override.  Explicitly destroy the base here so no
+            # dead weakref remains when CameraManager removes the camera prims.
+            XFormPrim.destroy(self)
+        except Exception as exc:
+            print(
+                "[camera cleanup] XFormPrim callbacks were already unavailable: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _get_tiled_resolution(self, num_cameras, resolution) -> Tuple[int, int]:
         """Calculate the resolution for the tiled sensor based on the number of cameras and individual camera resolution.
