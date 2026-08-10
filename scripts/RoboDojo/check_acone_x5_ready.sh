@@ -32,6 +32,10 @@ for can_name in can1 can3; do
         || die "CAN interface is not UP: ${can_name}"
 done
 
+conflicting_owners="$(pgrep -af 'lerobot-record-ui|lerobot_record|inference_pi0_arx_acone' || true)"
+[[ -z "${conflicting_owners}" ]] \
+    || die "another ARX process may own the arms/CAN: ${conflicting_owners}"
+
 DISPLAY="${DISPLAY:-:1}" xset q >/dev/null 2>&1 \
     || die "X11 display is unavailable: ${DISPLAY:-:1}"
 ssh -o BatchMode=yes -o ConnectTimeout=5 hoo@10.19.127.58 true \

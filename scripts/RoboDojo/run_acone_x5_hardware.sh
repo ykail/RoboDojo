@@ -4,6 +4,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
+conflicting_owners="$(pgrep -af 'lerobot-record-ui|lerobot_record|inference_pi0_arx_acone' || true)"
+if [[ -n "${conflicting_owners}" ]]; then
+    echo "[acOne hardware][ERROR] Another ARX process may own the arms/CAN:" >&2
+    echo "${conflicting_owners}" >&2
+    exit 2
+fi
+
 export X5_PYTHON="/home/acone/Robot_Lab/.venv/bin/python"
 export X5_LEFT_CAN="can1"
 export X5_RIGHT_CAN="can3"
