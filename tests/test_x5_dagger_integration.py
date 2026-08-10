@@ -473,6 +473,7 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             'KAI0_ROOT="/home/hoo/kai0-output-engine-policy-v1"',
             'CHECKPOINT_DIR="/home/hoo/checkpoints/9999_my"',
             'CHECKPOINT_ID="fill_pen_holder/9999_my"',
+            "another policy server is using the GPU",
             "76d26714c276c9a4812066854d248111382fe591",
             "sha256:7e3cbf579a37640a13c0d152cd5913b9142437627db1e5c33b4266602c2c46ab",
         ):

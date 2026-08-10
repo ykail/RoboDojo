@@ -11,6 +11,7 @@ EXPECTED_CHECKPOINT_DIGEST="sha256:7e3cbf579a37640a13c0d152cd5913b9142437627db1e
 POLICY_HOST="127.0.0.1"
 POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"
 POLICY_RUN_DIR="${ROBODOJO_POLICY_RUN_DIR:-/home/hoo/.local/state/kai0/robodojo_policy_v1}"
+MIN_FREE_GPU_MB="${ROBODOJO_MIN_FREE_POLICY_GPU_MB:-14000}"
 
 die() {
     echo "[Hoo pen-holder policy][ERROR] $*" >&2
@@ -31,6 +32,13 @@ actual_commit="$(git -C "${KAI0_ROOT}" rev-parse --verify HEAD)"
     || die "Kai0 commit mismatch: ${actual_commit}"
 [[ -z "$(git -C "${KAI0_ROOT}" status --porcelain=v1 --untracked-files=normal)" ]] \
     || die "Kai0 compatibility worktree is dirty"
+conflicting_policy="$(pgrep -af 'serve_robodojo_policy.py' || true)"
+[[ -z "${conflicting_policy}" ]] || die \
+    "another policy server is using the GPU; stop it first: ${conflicting_policy}"
+free_gpu_mb="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 | tr -d '[:space:]')"
+[[ "${free_gpu_mb}" =~ ^[0-9]+$ ]] || die "could not read free GPU memory"
+(( free_gpu_mb >= MIN_FREE_GPU_MB )) || die \
+    "GPU 0 has only ${free_gpu_mb} MiB free; need at least ${MIN_FREE_GPU_MB} MiB"
 if (exec 3<>"/dev/tcp/${POLICY_HOST}/${POLICY_PORT}") >/dev/null 2>&1; then
     die "policy port is already in use: ${POLICY_HOST}:${POLICY_PORT}"
 fi
