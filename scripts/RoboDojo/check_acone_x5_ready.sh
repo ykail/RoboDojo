@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROBODOJO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 X5_PYTHON="/home/acone/Robot_Lab/.venv/bin/python"
 WRITER_PYTHON="/home/acone/micromamba/envs/arx-py310/bin/python"
+MIN_FREE_GPU_MB="${ROBODOJO_MIN_FREE_GPU_MB:-12000}"
 
 die() {
     echo "[acOne preflight][ERROR] $*" >&2
@@ -33,5 +34,10 @@ DISPLAY="${DISPLAY:-:1}" xset q >/dev/null 2>&1 \
     || die "X11 display is unavailable: ${DISPLAY:-:1}"
 ssh -o BatchMode=yes -o ConnectTimeout=5 hoo@10.19.127.58 true \
     || die "passwordless SSH from acOne to Hoo is unavailable"
+
+free_gpu_mb="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 | tr -d '[:space:]')"
+[[ "${free_gpu_mb}" =~ ^[0-9]+$ ]] || die "could not read free memory on GPU 0"
+(( free_gpu_mb >= MIN_FREE_GPU_MB )) \
+    || die "GPU 0 has ${free_gpu_mb} MiB free; stop the local policy process before Isaac"
 
 echo "[acOne preflight] READY: SDK, writer, Assets, CAN, X11, and Hoo SSH"
