@@ -87,9 +87,8 @@ export DISPLAY="${DISPLAY:-:1}"
 export XAUTHORITY="${XAUTHORITY:-/run/user/$(id -u)/gdm/Xauthority}"
 export OMNI_KIT_ACCEPT_EULA=YES
 export ROBODOJO_REALTIME=1
-# Keep the official visual domain. During intervention the three data-camera
-# render products are paused and their quality frames are rendered afterwards
-# from exact simulator snapshots.
+# Keep the official visual domain.  Policy and intervention frames are both
+# captured online so Right only drains the encoder and commits the episode.
 export ROBODOJO_RENDERING_MODE=quality
 # Keep the stock CPU tensor pipeline: RoboDojo's reward and scene logic passes
 # poses to NumPy/Shapely.  The CUDA/Fabric path is experimental and can be
@@ -115,6 +114,7 @@ echo "[X5 Isaac] hardware=${SOURCE_HOST}:${SOURCE_PORT} protocol=${MIRROR_PROTOC
 echo "[X5 Isaac] profile=${MIRROR_PROFILE} signs=[+1,+1,+1,+1,+1,+1]"
 echo "[X5 Isaac] dataset=${DATASET_PATH}"
 echo "[X5 Isaac] rendering=${ROBODOJO_RENDERING_MODE} (official quality is the default)"
+echo "[X5 Isaac] recording=online RGB for policy and intervention; no deferred replay on Right"
 echo "[X5 Isaac] CUDA tensor/Fabric pipeline=${ROBODOJO_X5_CUDA_PIPELINE} (0 is the supported default)"
 echo "[X5 Isaac] Kit main-loop cap=${ROBODOJO_MAIN_RATE_LIMIT_HZ}Hz"
 echo "[X5 Isaac] global keys: i=intervene, Left=discard/retry, Right=save/next"

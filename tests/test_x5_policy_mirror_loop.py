@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -63,11 +65,14 @@ class _TaskEnv:
         self.reward_manager = SimpleNamespace(get_reward=lambda *, final_check: [0.0])
         self.piperx_intervention_occurred = False
         self.capture_updates: list[bool] = []
+        self.get_obs_count = 0
         self.capture_manager = SimpleNamespace(
             set_updates_enabled=self.capture_updates.append,
         )
 
     def get_obs(self):
+        self.events.append("get_obs")
+        self.get_obs_count += 1
         return _obs()
 
     def take_action(self, action, *, interpolate=True):
@@ -112,6 +117,47 @@ class _Client:
         return None
 
 
+class _Recorder:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.frames: list[dict] = []
+        self.finishes: list[dict] = []
+        self.record_dir = "/tmp/x5-online-test"
+
+    def append(self, **kwargs):
+        self.events.append("record")
+        self.frames.append(kwargs)
+
+    def finalize(self, **kwargs):
+        self.events.append("finalize")
+        self.finishes.append(kwargs)
+        return self.record_dir if kwargs.get("accepted") else None
+
+
+class _SynchronousPendingRecorder:
+    """Deterministic test double for the production one-frame async wrapper."""
+
+    def __init__(self, recorder):
+        self.recorder = recorder
+
+    @property
+    def record_dir(self):
+        return self.recorder.record_dir
+
+    def append(self, **kwargs):
+        self.recorder.append(**kwargs)
+        return 0.0
+
+    def finalize(self, **kwargs):
+        return self.recorder.finalize(**kwargs)
+
+    def discard(self, **kwargs):
+        self.recorder.finalize(**kwargs)
+
+    def close(self):
+        return None
+
+
 def _response(*, mode="follow", edge=None, terminal=None, delta=0.0) -> dict:
     return {
         "mode": mode,
@@ -128,6 +174,75 @@ def _response(*, mode="follow", edge=None, terminal=None, delta=0.0) -> dict:
 
 
 class X5PolicyMirrorLoopTest(unittest.TestCase):
+    def test_recording_manual_frame_is_online_obs_t_action_t_before_next_obs(self) -> None:
+        events: list[str] = []
+        client = _Client(
+            [
+                _response(),
+                _response(mode="manual", edge="enter"),
+                _response(mode="manual", delta=0.1),
+                _response(mode="manual", terminal="save"),
+            ],
+            events,
+        )
+        task = _TaskEnv(events)
+        task.is_episode_end = lambda: False
+        recorder = _Recorder(events)
+        recorder_module = ModuleType("src.eval_client.lerobot_stream_recorder")
+        recorder_module.recorder_for_env = lambda _task_env: recorder
+
+        with mock.patch.object(
+            mirror, "DualJointMirrorClient", return_value=client
+        ), mock.patch.object(
+            mirror, "_SinglePendingRecorder", _SynchronousPendingRecorder
+        ), mock.patch.dict(
+            sys.modules,
+            {"src.eval_client.lerobot_stream_recorder": recorder_module},
+        ), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "1",
+                "ROBODOJO_REALTIME": "0",
+            },
+        ):
+            mirror.run_piperx_policy_leader_mirror_episode(
+                task,
+                _Model(),
+                allow_intervention=True,
+            )
+
+        self.assertEqual(len(recorder.frames), 1)
+        frame = recorder.frames[0]
+        np.testing.assert_allclose(
+            frame["obs"]["state"]["left_arm_joint_state"],
+            np.zeros(6),
+        )
+        np.testing.assert_allclose(
+            frame["executed_action"]["left_arm_joint_state"],
+            np.full(6, 0.1),
+        )
+        self.assertEqual(
+            frame["control"],
+            {
+                "action_source": "human",
+                "intervention_mask": 1,
+                "active_arm": "both",
+                "takeover_edge": 1,
+                "chunk_id": -1,
+                "chunk_index": -1,
+                "timestamp": frame["control"]["timestamp"],
+            },
+        )
+        self.assertLess(events.index("record"), events.index("take_action"))
+        self.assertGreater(events.index("get_obs", 1), events.index("take_action"))
+        self.assertEqual(task.get_obs_count, 2)
+        self.assertEqual(task.capture_updates, [])
+        self.assertEqual(
+            recorder.finishes,
+            [{"accepted": True, "success": False, "reason": "operator_accept_next"}],
+        )
+
     def test_left_discards_and_requests_same_layout_retry(self) -> None:
         events: list[str] = []
         client = _Client([_response(), _response(terminal="retry")], events)
