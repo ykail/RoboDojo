@@ -385,9 +385,14 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         hardware = SCRIPT_DIR / "run_x5_dagger_hardware.sh"
         isaac = SCRIPT_DIR / "run_x5_dagger_isaac.sh"
         pen_holder = SCRIPT_DIR / "run_acone_x5_pen_holder_isaac.sh"
-        missing = [str(script) for script in (hardware, isaac, pen_holder) if not script.is_file()]
+        pen_tunnel = SCRIPT_DIR / "run_acone_x5_pen_holder_tunnel.sh"
+        missing = [
+            str(script)
+            for script in (hardware, isaac, pen_holder, pen_tunnel)
+            if not script.is_file()
+        ]
         self.assertFalse(missing, f"missing X5 launcher(s): {missing}")
-        for script in (hardware, isaac, pen_holder):
+        for script in (hardware, isaac, pen_holder, pen_tunnel):
             with self.subTest(script=script.name):
                 self.assertTrue(
                     os.access(script, os.X_OK),
@@ -449,11 +454,16 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         for required in (
             'ROBODOJO_TASK="fill_pen_holder"',
             'ROBODOJO_CHECKPOINT_ID="fill_pen_holder/9999_my"',
+            'ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"',
             "robodojo_fill_pen_holder_x5_online_dagger_9999_my_v1",
             "run_acone_x5_isaac.sh",
         ):
             with self.subTest(pen_holder_required=required):
                 self.assertIn(required, pen_source)
+
+        pen_tunnel_source = pen_tunnel.read_text(encoding="utf-8")
+        self.assertIn('ROBODOJO_POLICY_PORT="${ROBODOJO_POLICY_PORT:-18081}"', pen_tunnel_source)
+        self.assertIn('HOO_POLICY_PORT="${HOO_POLICY_PORT:-18081}"', pen_tunnel_source)
 
         mirror_source = _source("src/eval_client/piperx_dual_joint_mirror.py")
         self.assertIn("set_updates_enabled", mirror_source)
