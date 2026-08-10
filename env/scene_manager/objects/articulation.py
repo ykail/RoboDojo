@@ -232,8 +232,18 @@ class ArticulationObject(SingleArticulation):
     def initialize(self):
         self.physics_sim_view = SimulationManager.get_physics_sim_view()
         super().initialize(physics_sim_view=self.physics_sim_view)
-        self.upper_joint_positions = self.dof_properties["upper"].copy()
-        self.lower_joint_positions = self.dof_properties["lower"].copy()
+        # Isaac Sim 5.1's SingleArticulation.dof_properties builds a NumPy
+        # structured array by assigning backend tensors directly.  That works
+        # on the stock CPU tensor pipeline, but raises when the articulation
+        # view is CUDA-backed.  This object only needs the joint limits, so read
+        # that tensor directly and perform the device transfer explicitly.
+        joint_limits = self._articulation_view.get_dof_limits()[0]
+        if isinstance(joint_limits, torch.Tensor):
+            joint_limits = joint_limits.detach().cpu().numpy()
+        else:
+            joint_limits = np.asarray(joint_limits)
+        self.lower_joint_positions = joint_limits[:, 0].copy()
+        self.upper_joint_positions = joint_limits[:, 1].copy()
         self.initial_joint_positions = self.get_current_joint_positions()
         self.app = omni.kit.app.get_app()
         self.app.update()
