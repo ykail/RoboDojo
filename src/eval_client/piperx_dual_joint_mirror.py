@@ -32,6 +32,18 @@ class DualJointMirrorError(RuntimeError):
     pass
 
 
+def _mark_dual_operator_end(task_env: Any, *, rejected: bool) -> None:
+    if rejected:
+        task_env.success[0] = False
+    else:
+        try:
+            reward = task_env.reward_manager.get_reward(final_check=True)
+            task_env.success[0] = bool(reward[0] > 1 - 1e-3)
+        except Exception:
+            task_env.success[0] = False
+    task_env.end_flag[0] = True
+
+
 _CAMERA_FRESH_FRAMES = 3
 
 
@@ -728,6 +740,7 @@ def run_piperx_policy_leader_mirror_episode(
     record_frame_index = 0
     recorder_finalized = False
     camera_paused = False
+    terminal_request: str | None = None
     robots = _target_robots(task_env)
     pacer = RealtimePacer(
         frequency=float(task_env.obs_manager.collect_freq),
@@ -766,12 +779,28 @@ def run_piperx_policy_leader_mirror_episode(
         chunk_id = -1
         timing = _ControlRateReporter(float(task_env.obs_manager.collect_freq))
 
+        def consume_terminal(source_response: dict[str, Any]) -> bool:
+            nonlocal mode, terminal_request
+            requested = source_response.get("terminal")
+            if requested is None:
+                return False
+            if requested not in {"save", "retry"}:
+                raise DualJointMirrorError(f"unknown X5 terminal request {requested!r}")
+            terminal_request = requested
+            mode = "follow"
+            _mark_dual_operator_end(task_env, rejected=requested == "retry")
+            action = "SAVE/NEXT" if requested == "save" else "DISCARD/RETRY"
+            print(f"\n[{checkpoint_label} Isaac] operator requested {action}.", flush=True)
+            return True
+
         while not task_env.is_episode_end():
             if mode == "manual":
                 source_started = time.monotonic()
                 current = _measured_sim_state(task_env, robots)
                 response = client.exchange(_state_deltas(current, follow_anchor))
                 source_s = time.monotonic() - source_started
+                if consume_terminal(response):
+                    break
                 if response["edge"] == "exit":
                     follow_anchor = current
                     follow_command = current
@@ -862,6 +891,8 @@ def run_piperx_policy_leader_mirror_episode(
 
             current = _measured_sim_state(task_env, robots)
             response = client.exchange(_state_deltas(follow_command, follow_anchor))
+            if consume_terminal(response):
+                break
             if response["edge"] == "enter":
                 if not allow_intervention or response["mode"] != "manual":
                     raise DualJointMirrorError("unexpected intervention entry")
@@ -906,6 +937,9 @@ def run_piperx_policy_leader_mirror_episode(
                 policy_target = _action_target_state(action)
                 pre = client.exchange(_state_deltas(policy_target, follow_anchor))
                 source_s = time.monotonic() - source_started
+                if consume_terminal(pre):
+                    chunk_stale = True
+                    break
                 if pre["edge"] == "enter":
                     if not allow_intervention or pre["mode"] != "manual":
                         raise DualJointMirrorError("unexpected intervention entry")
@@ -992,14 +1026,21 @@ def run_piperx_policy_leader_mirror_episode(
                 if task_env.is_episode_end() or action_index + 1 == len(actions):
                     break
                 model_client.call(func_name="update_obs", obs=obs)
+            if terminal_request is not None:
+                break
             if chunk_stale:
                 continue
         terminal_state = (
             snapshotter.capture(record_frame_index)
-            if recorder is not None and deferred_frames and snapshotter is not None
+            if (
+                terminal_request != "retry"
+                and recorder is not None
+                and deferred_frames
+                and snapshotter is not None
+            )
             else None
         )
-        if mode == "follow":
+        if mode == "follow" and terminal_request is None:
             # The source keeps pursuing its latest target between requests.
             # Let the physical arms finish the final simulator move before END
             # converts that in-flight target into a hold at the measured pose.
@@ -1012,7 +1053,7 @@ def run_piperx_policy_leader_mirror_episode(
                 label=checkpoint_label,
             )
             camera_paused = False
-        if recorder is not None and deferred_frames:
+        if recorder is not None and deferred_frames and terminal_request != "retry":
             if snapshotter is None or terminal_state is None:
                 raise DualJointMirrorError(
                     "CP13 terminal state is unavailable for deferred quality rendering"
@@ -1031,16 +1072,37 @@ def run_piperx_policy_leader_mirror_episode(
                 checkpoint_label=checkpoint_label,
             )
             deferred_frames.clear()
-        elif mode == "manual":
+        elif mode == "manual" and terminal_request != "retry":
             # CP12 has no deferred writer, but an episode may terminate while
             # its data cameras are paused.  Publish the terminal scene again.
             obs = _fresh_quality_obs(task_env)
+        if terminal_request == "retry":
+            deferred_frames.clear()
+            if recorder is not None:
+                recorder.discard(
+                    accepted=False,
+                    success=False,
+                    reason="operator_discard_retry",
+                )
+                recorder_finalized = True
+            print(
+                f"[{checkpoint_label} Isaac] discarded current candidate; "
+                "resetting the same layout.",
+                flush=True,
+            )
+            from src.eval_client.intervention_loop import InterventionRejected
+
+            raise InterventionRejected()
         if recorder is not None:
             success = bool(task_env.success[0])
             saved_path = recorder.finalize(
                 accepted=True,
                 success=success,
-                reason="task_success" if success else "task_failure",
+                reason=(
+                    "operator_accept_next"
+                    if terminal_request == "save"
+                    else ("task_success" if success else "task_failure")
+                ),
             )
             recorder_finalized = True
             if saved_path is None:

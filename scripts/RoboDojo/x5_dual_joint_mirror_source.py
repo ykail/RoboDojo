@@ -128,17 +128,39 @@ class JointMirrorSession:
         self.mode = "follow"
         self.require_zero = True
         self.pending_transition: str | None = None
+        self.pending_terminal: str | None = None
+        self.terminal_delivered: str | None = None
         self.manual_anchor: DualState | None = None
         self.follow_anchor = hardware.latched_target
         self.ended = False
 
     def toggle_intervention(self) -> bool:
-        if self.ended or self.pending_transition is not None:
+        if (
+            self.ended
+            or self.pending_transition is not None
+            or self.pending_terminal is not None
+            or self.terminal_delivered is not None
+        ):
             return False
         self.pending_transition = "enter" if self.mode == "follow" else "exit"
         return True
 
-    def _response(self, request_type: str, seq: int, edge: str | None) -> dict[str, Any]:
+    def request_terminal(self, terminal: str) -> bool:
+        if terminal not in {"save", "retry"}:
+            raise X5SourceError(f"invalid terminal request {terminal!r}")
+        if self.ended or self.pending_terminal is not None or self.terminal_delivered is not None:
+            return False
+        self.pending_terminal = terminal
+        self.pending_transition = None
+        return True
+
+    def _response(
+        self,
+        request_type: str,
+        seq: int,
+        edge: str | None,
+        terminal: str | None = None,
+    ) -> dict[str, Any]:
         measured = self.hardware.read()
         follow_target = self.hardware.latched_target
         sides: dict[str, dict[str, Any]] = {}
@@ -169,7 +191,7 @@ class JointMirrorSession:
             "seq": seq,
             "mode": self.mode,
             "edge": edge,
-            "terminal": None,
+            "terminal": terminal,
             "sides": sides,
         }
 
@@ -190,6 +212,20 @@ class JointMirrorSession:
 
         if request_type == "joint_mirror":
             assert parsed is not None
+            if self.pending_terminal is not None:
+                # A terminal boundary dominates intervention edges.  Latch the
+                # current physical pose with active gains before acknowledging
+                # the key; run_server performs the slower smooth HOME move
+                # after the client has sent END.
+                self.hardware.enter_hold()
+                self.mode = "follow"
+                self.manual_anchor = None
+                self.follow_anchor = self.hardware.latched_target
+                self.require_zero = True
+                terminal = self.pending_terminal
+                self.pending_terminal = None
+                self.terminal_delivered = terminal
+                return self._response(request_type, seq, None, terminal)
             if self.pending_transition == "enter":
                 self.manual_anchor = self.hardware.enter_teach()
                 self.mode = "manual"
@@ -224,7 +260,7 @@ class JointMirrorSession:
 
 
 class _KeyReader:
-    """Read global ``i`` through XInput, with an ``i``/``q`` terminal fallback."""
+    """Read global i/arrow hotkeys through XInput with a terminal fallback."""
 
     _LOCK_MASK = 1 << 1
     _MOD2_MASK = 1 << 4
@@ -262,13 +298,14 @@ class _KeyReader:
             stderr=subprocess.STDOUT,
             timeout=3.0,
         )
+        wanted = {"i": "i", "Left": "left", "Right": "right"}
         result: dict[int, str] = {}
         for line in output.splitlines():
             match = re.match(r"^keycode\s+(\d+)\s*=\s*(\S+)", line)
-            if match and match.group(2) == "i":
-                result[int(match.group(1))] = match.group(2)
-        if set(result.values()) != {"i"}:
-            raise RuntimeError(f"incomplete X11 i keymap: {result}")
+            if match and match.group(2) in wanted:
+                result[int(match.group(1))] = wanted[match.group(2)]
+        if set(result.values()) != set(wanted.values()):
+            raise RuntimeError(f"incomplete X11 i/Left/Right keymap: {result}")
         return result
 
     def _publish(self, kind: str, keycode: int | None, modifiers: int | None, repeated: bool) -> None:
@@ -358,7 +395,8 @@ class _KeyReader:
             if self._process.poll() is not None:
                 raise RuntimeError(f"xinput exited with status {self._process.returncode}")
             print(
-                f"[Dual X5] global hotkey active on {self.display_name}: i=toggle. "
+                f"[Dual X5] global hotkeys active on {self.display_name}: "
+                "i=toggle, Left=discard/retry, Right=save/next. "
                 "Stop only with Ctrl-C in this terminal while supporting both arms.",
                 flush=True,
             )
@@ -395,7 +433,14 @@ class _KeyReader:
                 except queue.Empty:
                     return None
         if self.tty_enabled and select.select([sys.stdin], [], [], 0.0)[0]:
-            key = sys.stdin.read(1).lower()
+            key = sys.stdin.read(1)
+            if key == "\x1b" and select.select([sys.stdin], [], [], 0.02)[0]:
+                suffix = sys.stdin.read(1)
+                if suffix == "[" and select.select([sys.stdin], [], [], 0.02)[0]:
+                    arrow = sys.stdin.read(1)
+                    return {"D": "left", "C": "right"}.get(arrow)
+                return None
+            key = key.lower()
             return key if key in {"i", "q"} else None
         return None
 
@@ -500,8 +545,8 @@ def _serve_connection(
     *,
     period_s: float,
     liveness_timeout_s: float,
-) -> tuple[bool, bool]:
-    """Return ``(quit_requested, clean_end)`` after one client connection."""
+) -> tuple[bool, bool, str | None]:
+    """Return ``(quit_requested, clean_end, terminal)`` for one connection."""
 
     session = JointMirrorSession(hardware)
     conn.settimeout(min(0.1, max(0.005, period_s)))
@@ -511,13 +556,21 @@ def _serve_connection(
         key = keys.poll()
         if key == "q":
             session.disconnect()
-            return True, False
+            return True, False, session.terminal_delivered
         if key == "i" and session.toggle_intervention():
             print(
                 f"\n[Dual X5] intervention {session.pending_transition} requested; "
                 "waiting for the next Isaac boundary.",
                 flush=True,
             )
+        elif key in {"left", "right"}:
+            terminal = "retry" if key == "left" else "save"
+            if session.request_terminal(terminal):
+                label = "discard/retry" if terminal == "retry" else "save/next"
+                print(
+                    f"\n[Dual X5] {label} requested; holding at the next Isaac boundary.",
+                    flush=True,
+                )
         try:
             chunk = conn.recv(65536)
         except socket.timeout:
@@ -527,13 +580,13 @@ def _serve_connection(
                     "[Dual X5][WARN] Isaac liveness timed out; holding both arms.",
                     flush=True,
                 )
-                return False, False
+                return False, False, session.terminal_delivered
             continue
         except OSError:
             chunk = b""
         if not chunk:
             session.disconnect()
-            return False, False
+            return False, False, session.terminal_delivered
         buffer += chunk
         if len(buffer) > 1024 * 1024:
             session.disconnect()
@@ -556,7 +609,7 @@ def _serve_connection(
             elif edge == "exit":
                 print("\n[Dual X5] manual control OFF; holding the release pose.", flush=True)
             if session.ended:
-                return False, True
+                return False, True, session.terminal_delivered
 
 
 def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = None) -> None:
@@ -593,7 +646,8 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
             flush=True,
         )
         print(
-            f"[Dual X5] listening on {args.host}:{args.port}; i toggles intervention. "
+            f"[Dual X5] listening on {args.host}:{args.port}; "
+            "i toggles intervention, Left discards/retries, Right saves/advances. "
             "Stop only with Ctrl-C in this terminal while supporting both arms.",
             flush=True,
         )
@@ -613,7 +667,7 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
                 print("[Dual X5] Isaac connected; follow anchor is the current hold pose.", flush=True)
                 with conn:
                     try:
-                        quit_requested, clean_end = _serve_connection(
+                        quit_requested, clean_end, terminal_request = _serve_connection(
                             conn,
                             hardware,
                             keys,
@@ -624,6 +678,21 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
                         hardware.enter_hold()
                         print(f"[Dual X5][WARN] connection ended: {exc}", flush=True)
                         clean_end = False
+                        terminal_request = None
+                if terminal_request is not None and not quit_requested:
+                    label = "discard/retry" if terminal_request == "retry" else "save/next"
+                    print(
+                        f"[Dual X5] {label} acknowledged; moving both arms smoothly "
+                        f"to HOME over {args.home_duration_s:.1f}s.",
+                        flush=True,
+                    )
+                    hardware.move_home(
+                        tuple(args.home_rad),
+                        args.home_gripper_fraction,
+                        duration_s=args.home_duration_s,
+                        frequency_hz=args.frequency_hz,
+                    )
+                    print("[Dual X5] HOME reached; ready for the next episode.", flush=True)
                 if not quit_requested:
                     print(
                         "[Dual X5] episode ended; arms remain held and the source is ready for the next Isaac connection."

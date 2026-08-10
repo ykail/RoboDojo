@@ -230,6 +230,13 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             ),
             "main.py must apply the policy-v1/live-window single-env checks to X5",
         )
+        self.assertTrue(
+            any(
+                {"keyboard_intervention", X5_CONTROL_MODE} <= values
+                for values in mode_sets
+            ),
+            "X5 collection must be operator-driven so task step limits cannot end it",
+        )
 
         eval_tree = _tree("src/eval_client/eval_env.py")
         route = None
@@ -377,9 +384,10 @@ class X5DaggerIntegrationTest(unittest.TestCase):
     def test_x5_launchers_are_foreground_and_pin_the_integration_contract(self):
         hardware = SCRIPT_DIR / "run_x5_dagger_hardware.sh"
         isaac = SCRIPT_DIR / "run_x5_dagger_isaac.sh"
-        missing = [str(script) for script in (hardware, isaac) if not script.is_file()]
+        pen_holder = SCRIPT_DIR / "run_acone_x5_pen_holder_isaac.sh"
+        missing = [str(script) for script in (hardware, isaac, pen_holder) if not script.is_file()]
         self.assertFalse(missing, f"missing X5 launcher(s): {missing}")
-        for script in (hardware, isaac):
+        for script in (hardware, isaac, pen_holder):
             with self.subTest(script=script.name):
                 self.assertTrue(
                     os.access(script, os.X_OK),
@@ -422,18 +430,30 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             "ROBODOJO_RENDERING_MODE=quality",
             'ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-0}"',
             "--control-mode x5_policy_joint_intervention",
-            'CHECKPOINT_ID="RoboDojo-sim-arx_x5-joint-0/59999"',
+            'TASK="${ROBODOJO_TASK:-make_toast}"',
+            'CHECKPOINT_ID="${ROBODOJO_CHECKPOINT_ID:-RoboDojo-sim-arx_x5-joint-0/59999}"',
             "--checkpoint-id",
             '--external-policy-server-url "ws://127.0.0.1:${POLICY_PORT}"',
-            'EXPECTED_KAI0_COMMIT="ecc1a7451c3156b1e5f7533851dbb0222896206f"',
+            'EXPECTED_KAI0_COMMIT="${ROBODOJO_EXPECTED_KAI0_COMMIT-ecc1a7451c3156b1e5f7533851dbb0222896206f}"',
             "--expected-kai0-commit",
-            'EXPECTED_CHECKPOINT_DIGEST="sha256:70bb68139ba717553d9a9d9c3055bb322b85046d729377ee46eaaf997c1eaac4"',
+            'EXPECTED_CHECKPOINT_DIGEST="${ROBODOJO_EXPECTED_CHECKPOINT_DIGEST-sha256:70bb68139ba717553d9a9d9c3055bb322b85046d729377ee46eaaf997c1eaac4}"',
             "--expected-checkpoint-digest",
+            "ROBODOJO_DUAL_MIRROR_TIMEOUT_S",
             "eval_kai0_pi05.sh",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, isaac_source)
         self.assertNotIn("run_x5_dagger_hardware.sh", isaac_source)
+
+        pen_source = pen_holder.read_text(encoding="utf-8")
+        for required in (
+            'ROBODOJO_TASK="fill_pen_holder"',
+            'ROBODOJO_CHECKPOINT_ID="fill_pen_holder/9999_my"',
+            "robodojo_fill_pen_holder_x5_online_dagger_9999_my_v1",
+            "run_acone_x5_isaac.sh",
+        ):
+            with self.subTest(pen_holder_required=required):
+                self.assertIn(required, pen_source)
 
         mirror_source = _source("src/eval_client/piperx_dual_joint_mirror.py")
         self.assertIn("set_updates_enabled", mirror_source)

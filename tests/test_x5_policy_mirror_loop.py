@@ -59,6 +59,8 @@ class _TaskEnv:
         self.actions: list[tuple[dict, bool]] = []
         self.events = events
         self.success = [True]
+        self.end_flag = [False]
+        self.reward_manager = SimpleNamespace(get_reward=lambda *, final_check: [0.0])
         self.piperx_intervention_occurred = False
         self.capture_updates: list[bool] = []
         self.capture_manager = SimpleNamespace(
@@ -110,11 +112,11 @@ class _Client:
         return None
 
 
-def _response(*, mode="follow", edge=None, delta=0.0) -> dict:
+def _response(*, mode="follow", edge=None, terminal=None, delta=0.0) -> dict:
     return {
         "mode": mode,
         "edge": edge,
-        "terminal": None,
+        "terminal": terminal,
         "sides": {
             side: {
                 "leader_delta_q_rad": np.full(6, delta),
@@ -126,6 +128,51 @@ def _response(*, mode="follow", edge=None, delta=0.0) -> dict:
 
 
 class X5PolicyMirrorLoopTest(unittest.TestCase):
+    def test_left_discards_and_requests_same_layout_retry(self) -> None:
+        events: list[str] = []
+        client = _Client([_response(), _response(terminal="retry")], events)
+        task = _TaskEnv(events)
+        with mock.patch.object(mirror, "DualJointMirrorClient", return_value=client), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "0",
+                "ROBODOJO_REALTIME": "0",
+            },
+        ):
+            from src.eval_client.intervention_loop import InterventionRejected
+
+            with self.assertRaises(InterventionRejected):
+                mirror.run_piperx_policy_leader_mirror_episode(
+                    task,
+                    _Model(),
+                    allow_intervention=True,
+                )
+
+        self.assertEqual(task.actions, [])
+        self.assertEqual((task.success, task.end_flag), ([False], [True]))
+
+    def test_right_finishes_without_waiting_for_task_step_limit(self) -> None:
+        events: list[str] = []
+        client = _Client([_response(), _response(terminal="save")], events)
+        task = _TaskEnv(events)
+        with mock.patch.object(mirror, "DualJointMirrorClient", return_value=client), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "0",
+                "ROBODOJO_REALTIME": "0",
+            },
+        ):
+            mirror.run_piperx_policy_leader_mirror_episode(
+                task,
+                _Model(),
+                allow_intervention=True,
+            )
+
+        self.assertEqual(task.actions, [])
+        self.assertEqual((task.success, task.end_flag), ([False], [True]))
+
     def test_policy_target_reaches_hardware_before_same_sim_action(self) -> None:
         events: list[str] = []
         client = _Client([_response(), _response(), _response()], events)

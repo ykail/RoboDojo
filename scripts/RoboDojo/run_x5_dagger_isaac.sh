@@ -8,7 +8,8 @@ POLICY_PORT="${ROBODOJO_POLICY_PORT:-18080}"
 SOURCE_HOST="${ROBODOJO_X5_SOURCE_HOST:-127.0.0.1}"
 SOURCE_PORT="${ROBODOJO_X5_SOURCE_PORT:-8770}"
 DATASET_ROOT="${ROBODOJO_LEROBOT_ROOT:-${HOME}/data/lerobot}"
-DATASET_ID="${ROBODOJO_LEROBOT_REPO_ID:-robodojo_make_toast_x5_online_dagger_v1}"
+TASK="${ROBODOJO_TASK:-make_toast}"
+DATASET_ID="${ROBODOJO_LEROBOT_REPO_ID:-robodojo_${TASK}_x5_online_dagger_v1}"
 DATASET_PATH="${DATASET_ROOT%/}/${DATASET_ID}"
 LEROBOT_PYTHON="${X5_LEROBOT_PYTHON:-${ROBODOJO_LEROBOT_PYTHON:-${HOME}/vibe_code/kai0-robodojo-policy-v1/.venv/bin/python}}"
 EVAL_NUM="${ROBODOJO_EVAL_NUM:-1}"
@@ -17,9 +18,9 @@ SEED="${ROBODOJO_SEED:-0}"
 POLICY_SEED="${ROBODOJO_POLICY_SEED:-${SEED}}"
 ENCODER_THREADS="${ROBODOJO_LEROBOT_ENCODER_THREADS:-2}"
 
-CHECKPOINT_ID="RoboDojo-sim-arx_x5-joint-0/59999"
-EXPECTED_KAI0_COMMIT="ecc1a7451c3156b1e5f7533851dbb0222896206f"
-EXPECTED_CHECKPOINT_DIGEST="sha256:70bb68139ba717553d9a9d9c3055bb322b85046d729377ee46eaaf997c1eaac4"
+CHECKPOINT_ID="${ROBODOJO_CHECKPOINT_ID:-RoboDojo-sim-arx_x5-joint-0/59999}"
+EXPECTED_KAI0_COMMIT="${ROBODOJO_EXPECTED_KAI0_COMMIT-ecc1a7451c3156b1e5f7533851dbb0222896206f}"
+EXPECTED_CHECKPOINT_DIGEST="${ROBODOJO_EXPECTED_CHECKPOINT_DIGEST-sha256:70bb68139ba717553d9a9d9c3055bb322b85046d729377ee46eaaf997c1eaac4}"
 MIRROR_PROTOCOL="robodojo_dual_joint_mirror_v1"
 MIRROR_PROFILE="arx_x5_identity_joint_v1"
 
@@ -50,11 +51,9 @@ if ! (exec 3<>"/dev/tcp/${SOURCE_HOST}/${SOURCE_PORT}") >/dev/null 2>&1; then
 fi
 
 args=(
-    --task make_toast
+    --task "${TASK}"
     --checkpoint-id "${CHECKPOINT_ID}"
     --external-policy-server-url "ws://127.0.0.1:${POLICY_PORT}"
-    --expected-kai0-commit "${EXPECTED_KAI0_COMMIT}"
-    --expected-checkpoint-digest "${EXPECTED_CHECKPOINT_DIGEST}"
     --lerobot-python "${LEROBOT_PYTHON}"
     --lerobot-root "${DATASET_ROOT}"
     --lerobot-repo-id "${DATASET_ID}"
@@ -66,6 +65,13 @@ args=(
     --policy-seed "${POLICY_SEED}"
     --control-mode x5_policy_joint_intervention
 )
+
+if [[ -n "${EXPECTED_KAI0_COMMIT}" ]]; then
+    args+=(--expected-kai0-commit "${EXPECTED_KAI0_COMMIT}")
+fi
+if [[ -n "${EXPECTED_CHECKPOINT_DIGEST}" ]]; then
+    args+=(--expected-checkpoint-digest "${EXPECTED_CHECKPOINT_DIGEST}")
+fi
 
 if [[ -e "${DATASET_PATH}" || -L "${DATASET_PATH}" ]]; then
     [[ -f "${DATASET_PATH}/meta/info.json" ]] \
@@ -92,21 +98,23 @@ export ROBODOJO_MAIN_RATE_LIMIT_HZ="${ROBODOJO_MAIN_RATE_LIMIT_HZ:-250}"
 export ROBODOJO_MAX_BASH_RETRIES="${ROBODOJO_MAX_BASH_RETRIES:-1}"
 export ROBODOJO_DUAL_MIRROR_HOST="${SOURCE_HOST}"
 export ROBODOJO_DUAL_MIRROR_PORT="${SOURCE_PORT}"
+export ROBODOJO_DUAL_MIRROR_TIMEOUT_S="${ROBODOJO_DUAL_MIRROR_TIMEOUT_S:-15}"
 export ROBODOJO_DUAL_MIRROR_PROTOCOL="${MIRROR_PROTOCOL}"
 export ROBODOJO_DUAL_MIRROR_PROFILE="${MIRROR_PROFILE}"
 export ROBODOJO_DUAL_MIRROR_RECORD=1
 export ROBODOJO_X5_CODE_ROOT="${ROBODOJO_ROOT}"
-export ROBODOJO_RUN_ID="x5_online_dagger_$(date -u +%Y%m%dT%H%M%S%NZ)_$$_${RANDOM}"
+export ROBODOJO_RUN_ID="x5_${TASK}_online_dagger_$(date -u +%Y%m%dT%H%M%S%NZ)_$$_${RANDOM}"
 
 echo "[X5 Isaac] Hoo policy=ws://127.0.0.1:${POLICY_PORT}"
+echo "[X5 Isaac] task=${TASK} checkpoint=${CHECKPOINT_ID}"
 echo "[X5 Isaac] hardware=${SOURCE_HOST}:${SOURCE_PORT} protocol=${MIRROR_PROTOCOL}"
 echo "[X5 Isaac] profile=${MIRROR_PROFILE} signs=[+1,+1,+1,+1,+1,+1]"
 echo "[X5 Isaac] dataset=${DATASET_PATH}"
 echo "[X5 Isaac] rendering=${ROBODOJO_RENDERING_MODE} (official quality is the default)"
 echo "[X5 Isaac] CUDA tensor/Fabric pipeline=${ROBODOJO_X5_CUDA_PIPELINE} (0 is the supported default)"
 echo "[X5 Isaac] Kit main-loop cap=${ROBODOJO_MAIN_RATE_LIMIT_HZ}Hz"
-echo "[X5 Isaac] use the global i key to enter/leave intervention; terminal focus is not required"
-echo "[X5 Isaac] an episode is committed automatically at its terminal outcome"
+echo "[X5 Isaac] global keys: i=intervene, Left=discard/retry, Right=save/next"
+echo "[X5 Isaac] operator collection has no task step limit"
 
 cd "${ROBODOJO_ROOT}"
 exec bash scripts/RoboDojo/eval_kai0_pi05.sh "${args[@]}"

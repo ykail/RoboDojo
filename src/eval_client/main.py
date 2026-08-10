@@ -480,6 +480,7 @@ def main():
         "piperx_joint_j1",
         "piperx_sim_follow_j1",
         "piperx_dual_joint_test",
+        "x5_policy_joint_intervention",
         "piperx_restore_recovery",
     }
     observation_mode = control_mode == "keyboard_observe"

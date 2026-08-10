@@ -134,6 +134,29 @@ class JointMirrorSessionTest(unittest.TestCase):
         self.assertEqual((ended["type"], ended["seq"], ended["mode"], ended["edge"]), ("end", 2, "follow", None))
         self.assertTrue(self.session.ended)
 
+    def test_left_terminal_holds_and_emits_one_retry_boundary(self) -> None:
+        self.session.handle(request(1))
+        self.assertTrue(self.session.request_terminal("retry"))
+
+        response = self.session.handle(request(2, q=(0.2,) * 6))
+
+        self.assertEqual((response["mode"], response["edge"], response["terminal"]), ("follow", None, "retry"))
+        self.assertIn("enter_hold", self.hardware.calls)
+        self.assertFalse(self.session.toggle_intervention())
+        heartbeat = self.session.handle({"type": "heartbeat", "seq": 3})
+        self.assertIsNone(heartbeat["terminal"])
+
+    def test_right_terminal_overrides_manual_mode(self) -> None:
+        self.session.handle(request(1))
+        self.session.toggle_intervention()
+        self.session.handle(request(2))
+        self.assertTrue(self.session.request_terminal("save"))
+
+        response = self.session.handle(request(3))
+
+        self.assertEqual((response["mode"], response["edge"], response["terminal"]), ("follow", None, "save"))
+        self.assertIsNone(self.session.manual_anchor)
+
     def test_cli_defaults_are_stable_for_launcher(self) -> None:
         args = source.build_arg_parser().parse_args([])
         self.assertEqual((args.host, args.port), ("127.0.0.1", 8770))
