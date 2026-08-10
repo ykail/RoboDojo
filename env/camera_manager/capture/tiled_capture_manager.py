@@ -45,6 +45,7 @@ class TiledCaptureManager:
         # Pre-allocated output buffers for each camera and annotator to reduce memory allocation
         # Format: {cam_id: {annotator_name: wp.array}}
         self._output_buffers: dict = {}
+        self._updates_enabled = True
 
     def initialize(self, sim: IsaacRLEnv):
         """
@@ -173,6 +174,27 @@ class TiledCaptureManager:
             data.append(cam_data)
         return data
 
+    @property
+    def updates_enabled(self) -> bool:
+        return self._updates_enabled
+
+    def set_updates_enabled(self, enabled: bool) -> None:
+        """Pause/resume all data-camera render products without changing quality."""
+
+        enabled = bool(enabled)
+        if enabled == self._updates_enabled:
+            return
+        changed = []
+        try:
+            for tiled_camera in self.tiled_cameras:
+                tiled_camera.set_updates_enabled(enabled)
+                changed.append(tiled_camera)
+        except Exception:
+            for tiled_camera in reversed(changed):
+                tiled_camera.set_updates_enabled(not enabled)
+            raise
+        self._updates_enabled = enabled
+
     def reset(
         self,
     ):
@@ -181,6 +203,15 @@ class TiledCaptureManager:
         Only Hard Reset need which means if we reset simulation backend we need to initialize camera again
         Since Render product change, we also need to attch a new writer maybe
         """
+        for tiled_camera in self.tiled_cameras:
+            tiled_camera.destroy()
+        self.tiled_cameras.clear()
+        self.tiled_render_products.clear()
+        self.annotator.clear()
+        self.annotator_type.clear()
+        self.annotator_device.clear()
+        self._output_buffers.clear()
+        self._updates_enabled = True
         self.init_cameras()
 
     def destroy(self):
@@ -189,6 +220,8 @@ class TiledCaptureManager:
         This function will be called when we close the environment.
         """
 
+        for tiled_camera in self.tiled_cameras:
+            tiled_camera.destroy()
         self.annotator.clear()
         self.annotator_type.clear()
         self.annotator_device.clear()
@@ -196,6 +229,5 @@ class TiledCaptureManager:
         self.cameras.clear()
         self.camera_names.clear()
         self.sim = None
-        for rp in self.tiled_render_products:
-            rp.destroy()
+        self.tiled_render_products.clear()
         self.camera_prim_paths.clear()

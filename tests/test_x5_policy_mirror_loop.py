@@ -60,6 +60,10 @@ class _TaskEnv:
         self.events = events
         self.success = [True]
         self.piperx_intervention_occurred = False
+        self.capture_updates: list[bool] = []
+        self.capture_manager = SimpleNamespace(
+            set_updates_enabled=self.capture_updates.append,
+        )
 
     def get_obs(self):
         return _obs()
@@ -67,6 +71,9 @@ class _TaskEnv:
     def take_action(self, action, *, interpolate=True):
         self.events.append("take_action")
         self.actions.append((action, interpolate))
+
+    def render(self):
+        self.events.append("render")
 
     def is_episode_end(self):
         return bool(self.actions)
@@ -165,6 +172,7 @@ class X5PolicyMirrorLoopTest(unittest.TestCase):
             task.actions[0][0]["left_arm_joint_state"],
             np.full(6, 0.1),
         )
+        self.assertEqual(task.capture_updates, [False, True])
 
 
 if __name__ == "__main__":

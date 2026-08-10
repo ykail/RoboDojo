@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -28,6 +30,9 @@ _JOINT_PROFILES = {
 
 class DualJointMirrorError(RuntimeError):
     pass
+
+
+_CAMERA_FRESH_FRAMES = 3
 
 
 def _joint_signs_for_profile(profile: str) -> np.ndarray:
@@ -376,7 +381,7 @@ def _manual_action(
 
 
 class _ControlRateReporter:
-    _PHASES = ("source", "physics", "record_wait", "pacer", "vision")
+    _PHASES = ("source", "snapshot", "physics", "record_wait", "pacer", "vision")
 
     def __init__(self, expected_hz: float) -> None:
         self.expected_hz = float(expected_hz)
@@ -470,6 +475,157 @@ class _SinglePendingRecorder:
         if not self._closed:
             self._closed = True
             self._executor.shutdown(wait=True)
+
+
+@dataclass(frozen=True)
+class _SnapshotReplay:
+    """The two ReplayFrame fields needed by ``restore_replay_frame``."""
+
+    manifest: dict[str, Any]
+    state: dict[str, np.ndarray]
+
+
+@dataclass(frozen=True)
+class _DeferredQualityFrame:
+    """One ordered pre-action frame waiting for original-quality RGB."""
+
+    sim_state: dict[str, np.ndarray]
+    policy_action: dict[str, Any] | None
+    executed_action: dict[str, Any]
+    control: dict[str, Any]
+
+
+def _data_camera_manager(task_env: Any) -> Any:
+    manager = getattr(task_env, "capture_manager", None)
+    if manager is None:
+        manager = getattr(getattr(task_env, "obs_manager", None), "capture_manager", None)
+    if manager is None or not callable(getattr(manager, "set_updates_enabled", None)):
+        raise DualJointMirrorError(
+            "X5 manual camera fast path requires a pausable tiled capture manager"
+        )
+    return manager
+
+
+def _set_data_camera_updates(task_env: Any, enabled: bool, *, label: str) -> None:
+    manager = _data_camera_manager(task_env)
+    manager.set_updates_enabled(bool(enabled))
+    state = "RESUMED" if enabled else "PAUSED"
+    print(f"\n[{label} cameras] {state}", flush=True)
+
+
+def _fresh_quality_obs(task_env: Any) -> dict[str, Any]:
+    obs: dict[str, Any] | None = None
+    for _ in range(_CAMERA_FRESH_FRAMES):
+        obs = task_env.get_obs()
+    if obs is None:  # Defensive; the fixed fresh count is always positive.
+        raise DualJointMirrorError("quality camera pipeline produced no observation")
+    return obs
+
+
+def _restore_deferred_snapshot(
+    task_env: Any,
+    snapshotter: Any,
+    state: dict[str, np.ndarray],
+) -> None:
+    from src.eval_client.sim_state_restore import restore_replay_frame
+
+    restore_replay_frame(
+        task_env,
+        _SnapshotReplay(manifest=snapshotter.manifest, state=state),
+        _prime_camera_pipeline=False,
+        _refresh_camera_pipeline=False,
+        _reset_episode=False,
+    )
+
+
+def _render_deferred_quality_segment(
+    task_env: Any,
+    recorder: _SinglePendingRecorder,
+    snapshotter: Any,
+    frames: list[_DeferredQualityFrame],
+    terminal_state: dict[str, np.ndarray],
+    *,
+    checkpoint_label: str,
+) -> dict[str, Any]:
+    """Render one deferred suffix offline, then put the live sim back exactly.
+
+    Cameras must already be resumed.  Policy frames before this segment may
+    still be pending in the writer, so drain that single future before adding
+    the deferred frames.  After the first intervention the suffix contains
+    both human and policy frames.  Every RGB observation is rendered from its
+    matching pre-action snapshot and appended in the original episode order.
+    """
+
+    total = len(frames)
+    if total <= 0:
+        _restore_deferred_snapshot(task_env, snapshotter, terminal_state)
+        return _fresh_quality_obs(task_env)
+
+    prior_wait_s = recorder.wait()
+    print(
+        f"[{checkpoint_label} deferred] rendering {total} post-takeover frame(s) "
+        f"with original quality; previous-writer-wait={prior_wait_s * 1000.0:.0f}ms",
+        flush=True,
+    )
+    started = time.monotonic()
+    rendered = 0
+    render_error: BaseException | None = None
+    terminal_obs: dict[str, Any] | None = None
+    try:
+        for index, frame in enumerate(frames, start=1):
+            _restore_deferred_snapshot(task_env, snapshotter, frame.sim_state)
+            # Tiled RTX may expose one or two previously submitted frames after
+            # a direct PhysX/Fabric state write.  Hold the exact same snapshot
+            # for three quality renders and keep only the last observation.
+            # This is intentionally correctness-first post-processing; it does
+            # not run while the operator is controlling the X5.
+            frame_obs = _fresh_quality_obs(task_env)
+            recorder.append(
+                obs=frame_obs,
+                policy_action=frame.policy_action,
+                human_action=(
+                    frame.executed_action
+                    if frame.policy_action is None
+                    else None
+                ),
+                executed_action=frame.executed_action,
+                control=frame.control,
+            )
+            rendered = index
+            if index == 1 or index == total or index % 25 == 0:
+                elapsed = max(time.monotonic() - started, 1e-6)
+                print(
+                    f"[{checkpoint_label} deferred] {index}/{total} "
+                    f"({index / elapsed:.1f} quality frames/s)",
+                    flush=True,
+                )
+    except BaseException as exc:
+        render_error = exc
+
+    # Offline rendering repeatedly rewinds the world.  Always restore the
+    # state at which the operator released intervention (or the episode ended)
+    # before policy control or shutdown is allowed to continue.
+    try:
+        _restore_deferred_snapshot(task_env, snapshotter, terminal_state)
+        terminal_obs = _fresh_quality_obs(task_env)
+        print(
+            f"[{checkpoint_label} deferred] terminal state restored after "
+            f"{rendered}/{total} rendered frame(s)",
+            flush=True,
+        )
+    except BaseException as restore_exc:
+        if render_error is not None:
+            raise DualJointMirrorError(
+                "deferred quality rendering failed and the terminal simulator "
+                "state could not be restored"
+            ) from restore_exc
+        raise
+
+    if render_error is not None:
+        raise render_error
+    if terminal_obs is None:  # Defensive: successful restoration returns one.
+        raise DualJointMirrorError("terminal quality observation is unavailable")
+    return terminal_obs
 
 
 def run_piperx_dual_joint_test_episode(task_env: Any) -> None:
@@ -566,7 +722,12 @@ def run_piperx_policy_leader_mirror_episode(
 
     client = DualJointMirrorClient()
     recorder: _SinglePendingRecorder | None = None
+    snapshotter: Any | None = None
+    deferred_frames: list[_DeferredQualityFrame] = []
+    deferred_mode = False
+    record_frame_index = 0
     recorder_finalized = False
+    camera_paused = False
     robots = _target_robots(task_env)
     pacer = RealtimePacer(
         frequency=float(task_env.obs_manager.collect_freq),
@@ -582,8 +743,10 @@ def run_piperx_policy_leader_mirror_episode(
             raise DualJointMirrorError("policy mirror source did not begin in stable follow mode")
         if record_enabled:
             from src.eval_client.lerobot_stream_recorder import recorder_for_env
+            from src.eval_client.sim_state_snapshot import SimulatorStateSnapshotter
 
             recorder = _SinglePendingRecorder(recorder_for_env(task_env))
+            snapshotter = SimulatorStateSnapshotter(task_env)
         checkpoint_label = "CP13" if recorder is not None else "CP12"
         print(
             (
@@ -617,7 +780,17 @@ def run_piperx_policy_leader_mirror_episode(
                         raise DualJointMirrorError("source did not complete intervention exit")
                     mode = "follow"
                     manual_anchor = None
-                    obs = task_env.get_obs()
+                    _set_data_camera_updates(
+                        task_env,
+                        True,
+                        label=checkpoint_label,
+                    )
+                    camera_paused = False
+                    # Do not render the buffered CP13 frames here: policy must
+                    # resume immediately and the policy websocket must not sit
+                    # idle for minutes.  Three static camera updates produce a
+                    # fresh post-intervention observation for new inference.
+                    obs = _fresh_quality_obs(task_env)
                     pending_takeover_edge = 0
                     pending_release_edge = -1
                     print(
@@ -629,6 +802,35 @@ def run_piperx_policy_leader_mirror_episode(
                 if response["mode"] != "manual" or manual_anchor is None:
                     raise DualJointMirrorError("manual sample arrived without a joint anchor")
                 action = _manual_action(obs, manual_anchor, response)
+                record_wait_s = 0.0
+                snapshot_s = 0.0
+                if recorder is not None:
+                    if snapshotter is None:
+                        raise DualJointMirrorError(
+                            "CP13 deferred recorder has no simulator snapshotter"
+                        )
+                    control = {
+                        "action_source": "human",
+                        "intervention_mask": 1,
+                        "active_arm": "both",
+                        "takeover_edge": pending_takeover_edge,
+                        "chunk_id": chunk_id,
+                        "chunk_index": -1,
+                        "timestamp": time.monotonic(),
+                    }
+                    # Capture before physics.  This is the exact S_t paired
+                    # with the human action A_t that follows it.
+                    snapshot_started = time.monotonic()
+                    deferred_frames.append(
+                        _DeferredQualityFrame(
+                            sim_state=snapshotter.capture(record_frame_index),
+                            policy_action=None,
+                            executed_action=deepcopy(action),
+                            control=control,
+                        )
+                    )
+                    record_frame_index += 1
+                    snapshot_s = time.monotonic() - snapshot_started
                 # Apply the freshest hardware sample before any synchronous
                 # image/dataset work.  Manual X5 targets are already sampled at
                 # the dataset rate, so the ordinary 8/10-step interpolation
@@ -636,33 +838,21 @@ def run_piperx_policy_leader_mirror_episode(
                 physics_started = time.monotonic()
                 task_env.take_action(action, interpolate=False)
                 physics_s = time.monotonic() - physics_started
-                record_wait_s = 0.0
-                if recorder is not None:
-                    record_wait_s = recorder.append(
-                        obs=obs,
-                        policy_action=None,
-                        human_action=action,
-                        executed_action=action,
-                        control={
-                            "action_source": "human",
-                            "intervention_mask": 1,
-                            "active_arm": "both",
-                            "takeover_edge": pending_takeover_edge,
-                            "chunk_id": chunk_id,
-                            "chunk_index": -1,
-                            "timestamp": time.monotonic(),
-                        },
-                    )
                 pending_takeover_edge = 0
                 pacer_started = time.monotonic()
                 pacer.wait()
                 pacer_s = time.monotonic() - pacer_started
                 vision_started = time.monotonic()
-                obs = task_env.get_obs()
+                # Keep the GUI responsive while the three training-camera
+                # render products are paused.  ``obs`` deliberately stays at
+                # the last full policy observation; _manual_action overwrites
+                # all dual-arm and gripper targets.
+                task_env.render()
                 vision_s = time.monotonic() - vision_started
                 timing.frame(
                     "manual",
                     source=source_s,
+                    snapshot=snapshot_s,
                     physics=physics_s,
                     record_wait=record_wait_s,
                     pacer=pacer_s,
@@ -678,7 +868,14 @@ def run_piperx_policy_leader_mirror_episode(
                 task_env.piperx_intervention_occurred = True
                 manual_anchor = current
                 mode = "manual"
+                deferred_mode = deferred_mode or recorder is not None
                 pending_takeover_edge = 1
+                _set_data_camera_updates(
+                    task_env,
+                    False,
+                    label=checkpoint_label,
+                )
+                camera_paused = True
                 print(
                     f"\n[{checkpoint_label} Isaac] manual ON; "
                     "policy chunk discarded; simulation anchored.",
@@ -715,8 +912,15 @@ def run_piperx_policy_leader_mirror_episode(
                     task_env.piperx_intervention_occurred = True
                     manual_anchor = pre_state
                     mode = "manual"
+                    deferred_mode = deferred_mode or recorder is not None
                     pending_takeover_edge = 1
                     chunk_stale = True
+                    _set_data_camera_updates(
+                        task_env,
+                        False,
+                        label=checkpoint_label,
+                    )
+                    camera_paused = True
                     print(
                         f"\n[{checkpoint_label} Isaac] manual ON; "
                         "policy chunk discarded; simulation anchored.",
@@ -726,26 +930,49 @@ def run_piperx_policy_leader_mirror_episode(
                 if pre["mode"] != "follow":
                     raise DualJointMirrorError("source left follow mode without an edge")
                 follow_command = policy_target
+                policy_control = {
+                    "action_source": "policy",
+                    "intervention_mask": 0,
+                    "active_arm": "both",
+                    "takeover_edge": pending_release_edge,
+                    "chunk_id": chunk_id,
+                    "chunk_index": action_index,
+                    "timestamp": time.monotonic(),
+                }
+                snapshot_s = 0.0
+                if recorder is not None and deferred_mode:
+                    if snapshotter is None:
+                        raise DualJointMirrorError(
+                            "CP13 deferred recorder has no simulator snapshotter"
+                        )
+                    # Once the first intervention begins, keep every later
+                    # policy and human frame in this single ordered stream.
+                    # It is rendered only after client.end(), so rollout and
+                    # policy communication never wait for offline cameras.
+                    snapshot_started = time.monotonic()
+                    deferred_frames.append(
+                        _DeferredQualityFrame(
+                            sim_state=snapshotter.capture(record_frame_index),
+                            policy_action=deepcopy(action),
+                            executed_action=deepcopy(action),
+                            control=policy_control,
+                        )
+                    )
+                    record_frame_index += 1
+                    snapshot_s = time.monotonic() - snapshot_started
                 physics_started = time.monotonic()
                 task_env.take_action(action)
                 physics_s = time.monotonic() - physics_started
                 record_wait_s = 0.0
-                if recorder is not None:
+                if recorder is not None and not deferred_mode:
                     record_wait_s = recorder.append(
                         obs=obs,
                         policy_action=action,
                         human_action=None,
                         executed_action=action,
-                        control={
-                            "action_source": "policy",
-                            "intervention_mask": 0,
-                            "active_arm": "both",
-                            "takeover_edge": pending_release_edge,
-                            "chunk_id": chunk_id,
-                            "chunk_index": action_index,
-                            "timestamp": time.monotonic(),
-                        },
+                        control=policy_control,
                     )
+                    record_frame_index += 1
                 pending_release_edge = 0
                 pacer_started = time.monotonic()
                 pacer.wait()
@@ -756,6 +983,7 @@ def run_piperx_policy_leader_mirror_episode(
                 timing.frame(
                     "follow",
                     source=source_s,
+                    snapshot=snapshot_s,
                     physics=physics_s,
                     record_wait=record_wait_s,
                     pacer=pacer_s,
@@ -766,12 +994,47 @@ def run_piperx_policy_leader_mirror_episode(
                 model_client.call(func_name="update_obs", obs=obs)
             if chunk_stale:
                 continue
+        terminal_state = (
+            snapshotter.capture(record_frame_index)
+            if recorder is not None and deferred_frames and snapshotter is not None
+            else None
+        )
         if mode == "follow":
             # The source keeps pursuing its latest target between requests.
             # Let the physical arms finish the final simulator move before END
             # converts that in-flight target into a hold at the measured pose.
             time.sleep(1.0)
         client.end()
+        if camera_paused:
+            _set_data_camera_updates(
+                task_env,
+                True,
+                label=checkpoint_label,
+            )
+            camera_paused = False
+        if recorder is not None and deferred_frames:
+            if snapshotter is None or terminal_state is None:
+                raise DualJointMirrorError(
+                    "CP13 terminal state is unavailable for deferred quality rendering"
+                )
+            print(
+                f"[{checkpoint_label} deferred] rollout complete; hardware source ended; "
+                "starting one ordered original-quality render pass",
+                flush=True,
+            )
+            obs = _render_deferred_quality_segment(
+                task_env,
+                recorder,
+                snapshotter,
+                deferred_frames,
+                terminal_state,
+                checkpoint_label=checkpoint_label,
+            )
+            deferred_frames.clear()
+        elif mode == "manual":
+            # CP12 has no deferred writer, but an episode may terminate while
+            # its data cameras are paused.  Publish the terminal scene again.
+            obs = _fresh_quality_obs(task_env)
         if recorder is not None:
             success = bool(task_env.success[0])
             saved_path = recorder.finalize(
@@ -783,12 +1046,30 @@ def run_piperx_policy_leader_mirror_episode(
             if saved_path is None:
                 raise DualJointMirrorError("dual-leader episode ended before any frame was recorded")
             print(f"[CP13 Isaac] saved LeRobot episode -> {saved_path}", flush=True)
-    except Exception:
+    except BaseException:
+        try:
+            client.end()
+        except Exception:
+            pass
         if recorder is not None and not recorder_finalized:
             recorder.discard(accepted=False, success=False, reason="exception")
             recorder_finalized = True
         raise
     finally:
+        if camera_paused:
+            try:
+                _set_data_camera_updates(task_env, True, label="X5 recovery")
+                camera_paused = False
+                print(
+                    "[X5 recovery] data cameras restored after an exception",
+                    flush=True,
+                )
+            except Exception as camera_exc:
+                print(
+                    f"[X5 recovery] ERROR: could not resume data cameras: "
+                    f"{type(camera_exc).__name__}: {camera_exc}",
+                    flush=True,
+                )
         client.close()
 
 

@@ -216,6 +216,7 @@ from src.eval_client.restore_recovery_queue import (
     completed_queue_ids,
     load_recovery_queue,
 )
+from src.eval_client.sim_runtime_profile import apply_x5_cuda_pipeline
 from src.eval_client.sim_state_restore import restore_replay_frame
 from utils.cluttered_generator import UnStableError
 from utils.load_file import load_yaml
@@ -644,6 +645,17 @@ def main():
     OmegaConf.update(env_cfg, "eval_cfg.num_envs", num_envs, force_add=True)
     env_cfg = process_randomization(env_cfg)
     env_cfg, eval_num = process_config(env_cfg, task_name=task_name)
+    x5_sim_device = apply_x5_cuda_pipeline(
+        env_cfg,
+        control_mode=control_mode,
+        device_id=args_cli.device_id,
+    )
+    if x5_sim_device is not None:
+        print(
+            "[main] X5 simulation pipeline: "
+            f"device={x5_sim_device} (physical GPU {args_cli.device_id}) "
+            "use_fabric=True physx=force-gpu"
+        )
     if replay_frame is not None:
         OmegaConf.update(
             env_cfg,

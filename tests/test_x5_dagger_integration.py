@@ -419,6 +419,8 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             'export ROBODOJO_DUAL_MIRROR_PROFILE="${MIRROR_PROFILE}"',
             "ROBODOJO_DUAL_MIRROR_RECORD=1",
             "ROBODOJO_X5_CODE_ROOT",
+            "ROBODOJO_RENDERING_MODE=quality",
+            'ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-1}"',
             "--control-mode x5_policy_joint_intervention",
             'CHECKPOINT_ID="RoboDojo-sim-arx_x5-joint-0/59999"',
             "--checkpoint-id",
@@ -432,6 +434,11 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, isaac_source)
         self.assertNotIn("run_x5_dagger_hardware.sh", isaac_source)
+
+        mirror_source = _source("src/eval_client/piperx_dual_joint_mirror.py")
+        self.assertIn("set_updates_enabled", mirror_source)
+        self.assertIn("SimulatorStateSnapshotter", mirror_source)
+        self.assertIn("restore_replay_frame", mirror_source)
 
 
 if __name__ == "__main__":

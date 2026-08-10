@@ -125,6 +125,8 @@ def restore_replay_frame(
     replay: ReplayFrame,
     *,
     _prime_camera_pipeline: bool = True,
+    _refresh_camera_pipeline: bool = True,
+    _reset_episode: bool = True,
 ) -> RestoreSummary:
     """Restore physical state for one already-reset, single-environment task."""
 
@@ -180,9 +182,29 @@ def restore_replay_frame(
                 np.zeros_like(np.asarray(state[key])), controls[name]["velocity"]
             )
 
-    task_env.take_action_cnt[0] = 0
-    task_env.success[0] = True
-    task_env.end_flag[0] = False
+    if _reset_episode:
+        task_env.take_action_cnt[0] = 0
+        task_env.success[0] = True
+        task_env.end_flag[0] = False
+    else:
+        task_env.take_action_cnt[0] = int(
+            np.asarray(state.get("task.take_action_count", task_env.take_action_cnt[0])).item()
+        )
+        task_env.success[0] = bool(
+            np.asarray(state.get("task.success", task_env.success[0])).item()
+        )
+        task_env.end_flag[0] = bool(
+            np.asarray(state.get("task.end_flag", task_env.end_flag[0])).item()
+        )
+        reward_manager = getattr(task_env, "reward_manager", None)
+        if reward_manager is not None:
+            for state_name, attribute_name in (
+                ("reward.score_completed_count", "score_completed_count"),
+                ("reward.final_score_completed_count", "final_score_completed_count"),
+            ):
+                values = getattr(reward_manager, attribute_name, None)
+                if state_name in state and values is not None:
+                    values[0] = int(np.asarray(state[state_name]).item())
 
     sim = getattr(task_env, "sim", None)
     scene = getattr(sim, "scene", None)
@@ -231,11 +253,12 @@ def restore_replay_frame(
         update(dt=0.0)
     if callable(forward):
         forward()
-    task_env.render()
-    if callable(get_obs):
-        get_obs()
+    if _refresh_camera_pipeline:
+        task_env.render()
+        if callable(get_obs):
+            get_obs()
 
-    if _prime_camera_pipeline:
+    if _prime_camera_pipeline and _refresh_camera_pipeline:
         # Replicator's tiled RGB annotators publish two frames behind physics.
         # Prime them through the normal RoboDojo control path before hardware
         # alignment or recording, then restore the selected snapshot a second
@@ -261,6 +284,8 @@ def restore_replay_frame(
             task_env,
             replay,
             _prime_camera_pipeline=False,
+            _refresh_camera_pipeline=True,
+            _reset_episode=_reset_episode,
         )
     return RestoreSummary(
         robots=len(robot_descriptors),
