@@ -14,6 +14,8 @@ die() {
 }
 
 [[ "$(id -un)" == "acone" ]] || die "expected user acone"
+[[ -z "$(git -C "${ROBODOJO_ROOT}" status --porcelain=v1 --untracked-files=normal)" ]] \
+    || die "RoboDojo worktree is dirty; provenance would be ambiguous"
 [[ -x "${X5_PYTHON}" ]] || die "ARX SDK Python is missing: ${X5_PYTHON}"
 [[ -x "${WRITER_PYTHON}" ]] || die "LeRobot writer Python is missing: ${WRITER_PYTHON}"
 [[ -d "${ROBODOJO_ROOT}/Assets/Robots" ]] || die "RoboDojo Assets are not ready"
