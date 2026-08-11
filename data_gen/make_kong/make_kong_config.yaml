@@ -76,6 +76,12 @@ reference:
         - -0.49885454773902893
         - -0.7079491019248962
         - 0.4999517798423767
+    release_transit:
+      position: [0.388452, -0.142469, 1.033798]
+      quaternion: [-0.073229, -0.411592, -0.073308, 0.905459]
+    release_approach:
+      position: [0.442527, -0.144266, 0.986008]
+      quaternion: [0.001225, -0.341424, -0.005032, 0.939895]
     right_release:
       position:
       - 0.4391520023345947
@@ -146,6 +152,12 @@ reference:
         - -0.4988691806793213
         - -0.7080062627792358
         - 0.499856173992157
+    release_transit:
+      position: [0.390704, -0.142491, 1.036905]
+      quaternion: [-0.06663, -0.414694, -0.067407, 0.905011]
+    release_approach:
+      position: [0.439295, -0.144339, 0.987531]
+      quaternion: [-0.000092, -0.350643, -0.002812, 0.936505]
     right_release:
       position:
       - 0.4365136921405792
@@ -216,6 +228,12 @@ reference:
         - -0.4989871382713318
         - -0.7078941464424133
         - 0.4998968541622162
+    release_transit:
+      position: [0.434695, -0.150477, 1.040116]
+      quaternion: [-0.000979, -0.354009, -0.004755, 0.935229]
+    release_approach:
+      position: [0.437246, -0.147911, 0.922598]
+      quaternion: [0.002066, -0.353783, -0.007229, 0.935297]
     right_release:
       position:
       - 0.4357652962207794
@@ -286,6 +304,12 @@ reference:
         - -0.4988100826740265
         - -0.7079825401306152
         - 0.499948650598526
+    release_transit:
+      position: [0.390086, -0.142651, 1.037394]
+      quaternion: [-0.066319, -0.417586, -0.0678, 0.903674]
+    release_approach:
+      position: [0.438499, -0.144478, 0.988383]
+      quaternion: [-0.000097, -0.353135, -0.002675, 0.935569]
     right_release:
       position:
       - 0.43582189083099365
@@ -297,3 +321,32 @@ reference:
       - -0.35176247358322144
       - -0.002618825063109398
       - 0.93608558177948
+
+replacement:
+  pickup:
+    local_position_offset: [-0.10533081, 0.00288495, -0.10834995]
+    quaternion: [0.6469, -0.2821, 0.2886, 0.6471]
+    pregrasp_height: 0.05
+    lift_height: 0.045
+  gripper:
+    pickup_opening: 1.0
+    carry_opening: 0.57
+    right_grasp_opening: 0.25
+    release_opening: 1.0
+  phases:
+    pickup_open_duration: 0.25
+    pickup_close_duration: 0.15
+    pickup_lift_duration: 0.35
+    handoff_right_grasp_duration: 0.40
+    handoff_left_release_duration: 0.35
+    left_retract_clearance: 0.12
+    release_lateral_height_offset: 0.04
+    release_open_duration: 0.40
+    release_drop_offset: 0.008
+    settle_steps: 30
+  verification:
+    attachment_position_tolerance: 0.04
+    attachment_angle_tolerance: 30.0
+    minimum_lift: 0.02
+    pile_position_tolerance: 0.03
+  obstacle_labels: [mahjong4_0, mahjong4_1, other0, other1, other2, mahjong9_0]

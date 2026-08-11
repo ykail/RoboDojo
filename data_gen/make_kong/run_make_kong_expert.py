@@ -30,13 +30,13 @@ PARSER.add_argument("--device-id", type=int, default=0)
 PARSER.add_argument(
     "--record",
     action="store_true",
-    help="Record the cam_head view to an MP4, including the failed portion of an unsuccessful episode.",
+    help="Record all three synchronized target-robot camera views and a numeric trace.",
 )
 PARSER.add_argument(
-    "--video-path",
+    "--output-dir",
     type=Path,
-    default="tmp/make_kong_expert_cam_head.mp4",
-    help="Output path for --record (default: ).",
+    default=None,
+    help="Output directory for --record (default: tmp/make_kong/seed{seed}/group_{target_group}).",
 )
 AppLauncher.add_app_launcher_args(PARSER)
 ARGS = PARSER.parse_args()
@@ -63,21 +63,43 @@ from env.seed_manager.seed_manager import SeedManager
 from task.RoboDojo import task_registry
 from utils.load_file import load_yaml
 from utils.pipeline_utils import process_config, process_randomization
-from utils.save_file import VideoStreamWriter
+from utils.save_file import VideoStreamWriter, save_json
 
 
-class HeadVideoRecorder:
-    """Stream the single environment's head camera to an MP4."""
+class EpisodeRecorder:
+    """Record synchronized target-robot views and 16-D state/action transitions."""
 
-    def __init__(self, env: MakeKongEnvironment, output_path: Path, fps: float = 25.0):
+    camera_output_names = {
+        "cam_head": "cam_high",
+        "cam_left_wrist": "cam_left_wrist",
+        "cam_right_wrist": "cam_right_wrist",
+    }
+
+    def __init__(
+        self,
+        env: MakeKongEnvironment,
+        output_dir: Path,
+        phase_provider,
+        fps: float = 25.0,
+    ):
         self.env = env
-        self.output_path = output_path
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.phase_provider = phase_provider
         self.fps = fps
+        self.sample_interval = max(1, int(round(1.0 / (float(env.robot_manager.dt) * fps))))
         camera_names = env.camera_manager.camera_names[0]
-        if "cam_head" not in camera_names:
-            raise RuntimeError(f"cam_head is unavailable; cameras={camera_names}")
-        self.camera_id = camera_names.index("cam_head")
-        self.writer: VideoStreamWriter | None = None
+        missing = [name for name in self.camera_output_names if name not in camera_names]
+        if missing:
+            raise RuntimeError(f"Required cameras are unavailable: {missing}; cameras={camera_names}")
+        self.camera_ids = [camera_names.index(name) for name in self.camera_output_names]
+        self.output_names = [self.camera_output_names[name] for name in self.camera_output_names]
+        self.writers: dict[str, VideoStreamWriter] = {}
+        self.pending_frame: dict[str, object] | None = None
+        self.records: list[dict[str, object]] = []
+        self.frame_index = 0
+        self.sim_steps = 0
+        self.closed = False
 
     def warmup(self, render_frames: int = 12) -> None:
         """Allow newly created render products to populate before the first read."""
@@ -85,24 +107,123 @@ class HeadVideoRecorder:
         for _ in range(render_frames):
             self.env.render()
 
-    def capture(self) -> None:
-        self.env.render()
-        captured = self.env.capture_manager.step(env_ids=[0], cam_ids=[self.camera_id])
-        if not captured or "rgb" not in captured[0]:
-            raise RuntimeError("cam_head RGB capture is unavailable.")
-        frame = np.asarray(captured[0]["rgb"][0]["data"])
-        if frame.ndim != 3 or frame.shape[-1] < 3 or frame.shape[0] == 0 or frame.shape[1] == 0:
-            raise RuntimeError(f"Unexpected cam_head RGB frame shape: {frame.shape}")
-        frame = np.ascontiguousarray(frame[..., :3], dtype=np.uint8)
-        if self.writer is None:
-            height, width = frame.shape[:2]
-            self.writer = VideoStreamWriter(str(self.output_path), height, width, 3, fps=self.fps)
-        self.writer.append(frame)
+    def _state_vector(self) -> np.ndarray:
+        values = []
+        for arm_name in ("left_arm", "right_arm"):
+            robot = self.env.robot_manager.get_robot_by_arm_name(arm_name)
+            pose = np.asarray(
+                self.env.robot_manager.get_real_endpose(robot, env_idx_list=[0])[0],
+                dtype=np.float32,
+            )
+            gripper = np.asarray(
+                self.env.robot_manager.get_end_effector_real_val(robot, env_idx_list=[0])[0],
+                dtype=np.float32,
+            )
+            opening = float(np.mean(gripper))
+            if robot.gripper_move["sign"] == 1:
+                opening = (opening - robot.gripper_scale[0]) / (
+                    robot.gripper_scale[1] - robot.gripper_scale[0]
+                )
+            else:
+                opening = (robot.gripper_scale[1] - opening) / (
+                    robot.gripper_scale[1] - robot.gripper_scale[0]
+                )
+            values.extend(pose.tolist())
+            values.append(float(np.clip(opening, 0.0, 1.0)))
+        return np.asarray(values, dtype=np.float32)
 
-    def close(self) -> None:
-        if self.writer is not None:
-            self.writer.close(announce=False)
-            self.writer = None
+    def _capture_images(self) -> dict[str, np.ndarray]:
+        self.env.render()
+        captured = self.env.capture_manager.step(env_ids=[0], cam_ids=self.camera_ids)
+        if len(captured) != len(self.output_names):
+            raise RuntimeError(f"Expected {len(self.output_names)} camera captures, got {len(captured)}.")
+        images = {}
+        for output_name, camera_data in zip(self.output_names, captured):
+            if "rgb" not in camera_data:
+                raise RuntimeError(f"{output_name} RGB capture is unavailable.")
+            frame = np.asarray(camera_data["rgb"][0]["data"])
+            if frame.ndim != 3 or frame.shape[-1] < 3 or frame.shape[0] == 0 or frame.shape[1] == 0:
+                raise RuntimeError(f"Unexpected {output_name} RGB frame shape: {frame.shape}")
+            images[output_name] = np.ascontiguousarray(frame[..., :3], dtype=np.uint8)
+        return images
+
+    def _capture_period_start(self) -> None:
+        self.pending_frame = {
+            "state": self._state_vector(),
+            "images": self._capture_images(),
+            "phase": str(self.phase_provider()),
+            "start_sim_step": self.sim_steps,
+        }
+
+    def _finish_period(self, *, complete: bool = True) -> None:
+        if self.pending_frame is None:
+            return
+        images = self.pending_frame["images"]
+        if not isinstance(images, dict):
+            raise RuntimeError("Recorder pending frame has invalid image data.")
+        for output_name in self.output_names:
+            frame = images[output_name]
+            if not isinstance(frame, np.ndarray):
+                raise RuntimeError(f"Recorder frame for {output_name} is not an ndarray.")
+            if output_name not in self.writers:
+                height, width = frame.shape[:2]
+                self.writers[output_name] = VideoStreamWriter(
+                    str(self.output_dir / f"{output_name}.mp4"),
+                    height,
+                    width,
+                    3,
+                    fps=self.fps,
+                )
+            self.writers[output_name].append(frame)
+        state = self.pending_frame["state"]
+        if not isinstance(state, np.ndarray):
+            raise RuntimeError("Recorder pending state is not an ndarray.")
+        self.records.append(
+            {
+                "frame_index": self.frame_index,
+                "timestamp": self.frame_index / self.fps,
+                "state": state.tolist(),
+                "action": self._state_vector().tolist(),
+                "phase": self.pending_frame["phase"],
+                "sim_step": self.pending_frame["start_sim_step"],
+                "sample_steps": self.sim_steps - self.pending_frame["start_sim_step"],
+                "complete_period": complete,
+            }
+        )
+        self.frame_index += 1
+        self.pending_frame = None
+
+    def start(self) -> None:
+        self.warmup()
+        self._capture_period_start()
+
+    def on_sim_step(self, original_sim_step, render: bool = True) -> None:
+        if self.pending_frame is None:
+            self._capture_period_start()
+        original_sim_step(render=render)
+        self.sim_steps += 1
+        if self.sim_steps % self.sample_interval == 0:
+            self._finish_period()
+
+    def close(self, result: dict[str, object] | None = None) -> None:
+        if self.closed:
+            return
+        if self.pending_frame is not None:
+            self._finish_period(complete=False)
+        for writer in self.writers.values():
+            writer.close(announce=False)
+        trace = {
+            "fps": self.fps,
+            "state_dim": 16,
+            "action_dim": 16,
+            "camera_names": self.output_names,
+            "frame_count": len(self.records),
+            "records": self.records,
+        }
+        if result is not None:
+            trace["result"] = result
+        save_json(trace, self.output_dir / "trace.json", indent=2, ensure_ascii=False)
+        self.closed = True
 
 
 def build_config() -> DictConfig:
@@ -206,6 +327,7 @@ def main() -> int:
     task_class = build_task_class(ARGS.target_group)
     env = task_class(config, SIMULATION_APP)
     recorder = None
+    result = None
     try:
         reset_seed_layout(env, config)
 
@@ -213,31 +335,32 @@ def main() -> int:
         generator.reset()
 
         if ARGS.record:
-            video_path = ARGS.video_path
-            recorder = HeadVideoRecorder(env, video_path, fps=25.0)
-            recorder.warmup()
-            recorder.capture()
+            output_dir = ARGS.output_dir or (
+                Path("tmp")
+                / "make_kong"
+                / f"seed_{ARGS.seed}"
+                / f"group_{ARGS.target_group if ARGS.target_group is not None else 'random'}"
+            )
+            recorder = EpisodeRecorder(
+                env,
+                output_dir,
+                phase_provider=lambda: generator.states[-1] if generator.states else "UNKNOWN",
+                fps=25.0,
+            )
+            recorder.start()
             original_sim_step = env.sim_step
-            sim_steps = 0
-            sample_interval = max(1, int(round(1.0 / (float(config.sim.dt) * 25.0))))
 
             def recorded_sim_step(render: bool = True) -> None:
-                nonlocal sim_steps
-                original_sim_step(render=render)
-                sim_steps += 1
-                if sim_steps % sample_interval == 0:
-                    recorder.capture()
+                recorder.on_sim_step(original_sim_step, render=render)
 
             env.sim_step = recorded_sim_step
 
         result = generator.run_episode(reset=False)
-        if recorder is not None:
-            recorder.capture()
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         return 0 if result.success else 1
     finally:
         if recorder is not None:
-            recorder.close()
+            recorder.close(result.to_dict() if result is not None else None)
         env.close()
 
 

