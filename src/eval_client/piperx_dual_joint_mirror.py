@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import math
 import os
+from pathlib import Path
 import socket
 import threading
 import time
@@ -37,6 +38,114 @@ def _env_flag(name: str, default: str = "0") -> bool:
     if value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
         raise DualJointMirrorError(f"{name} must be a boolean")
     return value in {"1", "true", "yes", "on"}
+
+
+def _online_target_episodes() -> int | None:
+    value = os.environ.get("ROBODOJO_X5_TARGET_EPISODES", "").strip()
+    if not value:
+        return None
+    if not value.isdigit() or int(value) <= 0:
+        raise DualJointMirrorError(
+            "ROBODOJO_X5_TARGET_EPISODES must be a positive integer"
+        )
+    return int(value)
+
+
+def _online_collection_state(task_env: Any) -> tuple[int, dict[str, Any] | None]:
+    """Validate the durable online dataset before counting or resuming it."""
+
+    root_text = os.environ.get("ROBODOJO_LEROBOT_ROOT", "").strip()
+    repo_id = os.environ.get("ROBODOJO_LEROBOT_REPO_ID", "").strip()
+    if not root_text or not repo_id:
+        raise DualJointMirrorError(
+            "online collection requires ROBODOJO_LEROBOT_ROOT and "
+            "ROBODOJO_LEROBOT_REPO_ID"
+        )
+    root = Path(root_text).expanduser().resolve()
+    dataset = (root / repo_id).resolve()
+    try:
+        dataset.relative_to(root)
+    except ValueError as exc:
+        raise DualJointMirrorError("LeRobot dataset id escapes its root") from exc
+    if not dataset.exists():
+        return 0, None
+    info_path = dataset / "meta" / "info.json"
+    if not info_path.exists():
+        raise DualJointMirrorError(
+            f"existing LeRobot output has no metadata: {info_path}"
+        )
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        count = int(info["total_episodes"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DualJointMirrorError(
+            f"cannot read committed LeRobot episode count from {info_path}: {exc}"
+        ) from exc
+    if count < 0:
+        raise DualJointMirrorError(f"invalid LeRobot total_episodes={count}")
+
+    sidecar_dir = dataset / "meta" / "robodojo" / "episodes"
+    sidecars = sorted(sidecar_dir.glob("episode_*.json"))
+    expected_paths = [sidecar_dir / f"episode_{index:07d}.json" for index in range(count)]
+    if sidecars != expected_paths:
+        raise DualJointMirrorError(
+            "online LeRobot resume cannot prove a continuous sidecar history: "
+            f"info episodes={count}, sidecars={[path.name for path in sidecars]}"
+        )
+
+    expected_task = str(getattr(task_env, "task_name", ""))
+    expected_provenance = getattr(task_env, "policy_provenance", None)
+    if not isinstance(expected_provenance, dict):
+        raise DualJointMirrorError(
+            "online LeRobot resume requires live policy-v1 provenance"
+        )
+    provenance_keys = ("checkpoint_id", "checkpoint_digest", "code_revision", "dirty")
+    if any(expected_provenance.get(key) is None for key in provenance_keys):
+        raise DualJointMirrorError(
+            f"incomplete live policy provenance: {expected_provenance!r}"
+        )
+
+    last: dict[str, Any] | None = None
+    for index, path in enumerate(sidecars):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DualJointMirrorError(
+                f"cannot read online LeRobot sidecar {path}: {exc}"
+            ) from exc
+        if int(payload.get("episode_index", -1)) != index:
+            raise DualJointMirrorError(
+                f"online LeRobot sidecar index mismatch in {path}"
+            )
+        if payload.get("robodojo_timing_resample") != "sim_step_exact_25hz_v1":
+            raise DualJointMirrorError(
+                f"online LeRobot sidecar {path.name} uses incompatible timing; "
+                "use a new --dataset-id"
+            )
+        if payload.get("robodojo_task") != expected_task:
+            raise DualJointMirrorError(
+                f"online LeRobot task mismatch in {path.name}: "
+                f"{payload.get('robodojo_task')!r} != {expected_task!r}"
+            )
+        if payload.get("robodojo_control_mode") != "x5_policy_joint_intervention":
+            raise DualJointMirrorError(
+                f"online LeRobot control-mode mismatch in {path.name}"
+            )
+        actual_provenance = payload.get("robodojo_policy_provenance")
+        if not isinstance(actual_provenance, dict) or any(
+            actual_provenance.get(key) != expected_provenance.get(key)
+            for key in provenance_keys
+        ):
+            raise DualJointMirrorError(
+                f"online LeRobot policy provenance mismatch in {path.name}; "
+                "use a new --dataset-id"
+            )
+        last = payload
+    return count, last
+
+
+def _online_committed_episode_count(task_env: Any) -> int:
+    return _online_collection_state(task_env)[0]
 
 
 def _mark_dual_operator_end(task_env: Any, *, rejected: bool) -> None:
@@ -821,6 +930,11 @@ def run_piperx_policy_leader_mirror_episode(
         raise DualJointMirrorError("ROBODOJO_DUAL_MIRROR_RECORD must be a boolean")
     record_enabled = record_value in {"1", "true", "yes", "on"}
     raw_capture_enabled = _env_flag("ROBODOJO_X5_RAW_CAPTURE", "0")
+    online_target_episodes = (
+        _online_target_episodes()
+        if record_enabled and not raw_capture_enabled
+        else None
+    )
     if record_enabled and not allow_intervention:
         raise DualJointMirrorError("dual-leader recording requires intervention mode")
     if raw_capture_enabled and (record_enabled or not allow_intervention):
@@ -838,6 +952,17 @@ def run_piperx_policy_leader_mirror_episode(
             "does not retarget PiPER-X joint signs"
         )
     hardware_label = "ARX X5" if profile == "arx_x5_identity_joint_v1" else "PiPER-X"
+
+    if online_target_episodes is not None:
+        completed = _online_committed_episode_count(task_env)
+        if completed >= online_target_episodes:
+            task_env.lerobot_collection_complete = True
+            print(
+                f"[LEROBOT] target already complete: {completed}/"
+                f"{online_target_episodes}; no new candidate started.",
+                flush=True,
+            )
+            return
 
     client = DualJointMirrorClient()
     recorder: _SinglePendingRecorder | None = None
@@ -1410,6 +1535,16 @@ def run_piperx_policy_leader_mirror_episode(
             if saved_path is None:
                 raise DualJointMirrorError("dual-leader episode ended before any frame was recorded")
             print(f"[CP13 Isaac] saved LeRobot episode -> {saved_path}", flush=True)
+            if online_target_episodes is not None:
+                completed = _online_committed_episode_count(task_env)
+                task_env.lerobot_collection_complete = (
+                    completed >= online_target_episodes
+                )
+                print(
+                    f"[LEROBOT] durable progress={completed}/"
+                    f"{online_target_episodes}",
+                    flush=True,
+                )
     except BaseException:
         try:
             client.end()

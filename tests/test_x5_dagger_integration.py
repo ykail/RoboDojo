@@ -461,8 +461,9 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             "ROBODOJO_DUAL_MIRROR_RECORD=1",
             "ROBODOJO_X5_CODE_ROOT",
             "ROBODOJO_RENDERING_MODE=quality",
-            "recording=online RGB for policy and intervention",
-            "manual timing=wall-time zero-order hold resampled to 25Hz",
+            'ROBODOJO_LEROBOT_TIMING_CONTRACT="sim_step_exact_25hz_v1"',
+            "recording=one complete policy+human LeRobot episode per Right",
+            "timing=one real simulator transition per 25Hz row; no fill frames",
             'ROBODOJO_X5_CUDA_PIPELINE="${ROBODOJO_X5_CUDA_PIPELINE:-0}"',
             "--control-mode x5_policy_joint_intervention",
             'TASK="${ROBODOJO_TASK:-make_toast}"',
@@ -492,8 +493,9 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             'payload.get("checkpoint_digest", "")',
             'export ROBODOJO_EXPECTED_KAI0_COMMIT="${EXPECTED_KAI0_COMMIT}"',
             'export ROBODOJO_EXPECTED_CHECKPOINT_DIGEST="${EXPECTED_CHECKPOINT_DIGEST}"',
-            "_timing25_v2",
-            "manual timing=wall-time zero-order hold resampled to 25Hz",
+            "_simstep25_v3",
+            "one Right = one complete policy+human LeRobot episode",
+            "timing=one simulator transition per 25Hz row; no fill frames",
             "run_x5_dagger_isaac.sh",
         ):
             with self.subTest(generic_acone_required=required):
@@ -541,7 +543,7 @@ class X5DaggerIntegrationTest(unittest.TestCase):
             "--task fill_pen_holder",
             "--checkpoint-id fill_pen_holder/9999_my",
             '--port "${ROBODOJO_POLICY_PORT:-18081}"',
-            "robodojo_fill_pen_holder_x5_online_dagger_9999_my_timing25_v2",
+            "robodojo_fill_pen_holder_x5_online_dagger_9999_my_simstep25_v3",
             "run_acone_x5_isaac.sh",
         ):
             with self.subTest(pen_holder_required=required):
@@ -565,7 +567,7 @@ class X5DaggerIntegrationTest(unittest.TestCase):
         for required in (
             "--task fill_pen_holder",
             '--port "${ROBODOJO_POLICY_PORT:-18081}"',
-            "robodojo_fill_pen_holder_x5_online_dagger_9999_timing25_v2",
+            "robodojo_fill_pen_holder_x5_online_dagger_9999_simstep25_v3",
             "pi05_robodojo_three_task_base/fill_pen_kong_toast_300_base_official_norm_v1/9999",
             "run_acone_x5_isaac.sh",
         ):

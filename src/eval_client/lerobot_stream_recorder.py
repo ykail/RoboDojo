@@ -570,6 +570,18 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         policy_provenance = {}
     checkpoint_id = policy_provenance.get("checkpoint_id")
     control_mode = getattr(task_env, "control_mode", "keyboard_intervention")
+    timing_contract = os.environ.get(
+        "ROBODOJO_LEROBOT_TIMING_CONTRACT",
+        "manual_wall_time_zoh_25hz_v1",
+    ).strip()
+    if timing_contract not in {
+        "manual_wall_time_zoh_25hz_v1",
+        "sim_step_exact_25hz_v1",
+    }:
+        raise ValueError(
+            "ROBODOJO_LEROBOT_TIMING_CONTRACT must be "
+            "manual_wall_time_zoh_25hz_v1 or sim_step_exact_25hz_v1"
+        )
     metadata = {
         "task_name": getattr(task_env, "task_name", os.environ.get("ROBODOJO_TASK_NAME", "")),
         "env_config": getattr(task_env, "config_name", os.environ.get("ROBODOJO_ENV_CFG", "")),
@@ -590,6 +602,7 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         "xpolicylab_commit": _git_revision(project_root / "XPolicyLab"),
         "run_id": os.environ.get("ROBODOJO_RUN_ID", ""),
         "control_mode": control_mode,
+        "timing_contract": timing_contract,
     }
     restore_lineage = getattr(task_env, "restore_lineage", None)
     if isinstance(restore_lineage, dict):

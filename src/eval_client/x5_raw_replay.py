@@ -505,6 +505,13 @@ def _replay_one_segment(
         _ReplayState(manifest=deepcopy(replay_manifest), state=segment.takeover_state),
         _reset_episode=False,
     )
+    # A captured task/reward terminal flag must not turn a replay into one
+    # applied action followed by hundreds of silently skipped rows.  Replay is
+    # operator-driven and owns its exact action count.
+    if hasattr(task_env, "end_flag"):
+        task_env.end_flag[0] = False
+    if hasattr(task_env, "success"):
+        task_env.success[0] = True
     task_env.policy_provenance = deepcopy(provenance)
     task_env.policy_runtime = "robodojo_policy_v1"
     task_env.restore_lineage = {

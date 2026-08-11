@@ -533,6 +533,7 @@ def main():
         "piperx_sim_follow_j1",
         "piperx_dual_joint_test",
         "x5_policy_joint_intervention",
+        "x5_raw_replay_25hz",
         "piperx_restore_recovery",
     }
     observation_mode = control_mode == "keyboard_observe"
@@ -999,6 +1000,27 @@ def main():
                     f"layout={next_layout}.",
                     flush=True,
                 )
+    elif (
+        control_mode == "x5_policy_joint_intervention"
+        and os.environ.get("ROBODOJO_DUAL_MIRROR_RECORD", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        from src.eval_client.piperx_dual_joint_mirror import (
+            _online_collection_state,
+        )
+
+        committed_count, metadata = _online_collection_state(env)
+        if metadata is not None:
+            next_layout, next_cycle = env.seed_manager.resume_cyclic_after(
+                metadata.get("robodojo_layout_id"),
+                metadata.get("robodojo_layout_cycle"),
+            )
+            print(
+                "[LEROBOT] resumed layout cursor after "
+                f"{committed_count} commit(s): next cycle={next_cycle} "
+                f"layout={next_layout}.",
+                flush=True,
+            )
     if operator_driven:
         env.env_seeds = env.seed_manager.get_cyclic_seeds(max_count=1)
     elif eval_time >= eval_num:
@@ -1018,9 +1040,11 @@ def main():
             env.reset(seed=env.env_seeds)
             env.run_eval()
             env.seed_manager.eval_step()
-            if bool(getattr(env, "raw_collection_complete", False)):
+            if bool(getattr(env, "raw_collection_complete", False)) or bool(
+                getattr(env, "lerobot_collection_complete", False)
+            ):
                 print(
-                    "[X5 raw] requested durable bundle count reached; "
+                    "[X5 collection] requested durable episode count reached; "
                     "collection is stopping normally.",
                     flush=True,
                 )
@@ -1048,7 +1072,8 @@ def main():
         except InterventionRejected:
             print("[Intervention] rejected attempt does not count; retrying the same layout.")
             env.set_next_policy_reset_reason(ResetReason.OPERATOR_RETRY)
-            env.close()
+            if control_mode != "x5_policy_joint_intervention":
+                env.close()
             retry_round = True
         except InterventionSavedForRetry as request:
             print(
@@ -1087,7 +1112,6 @@ def main():
             # dataset, missing environment, or a second writer holding the
             # dataset lock.  Stop cleanly instead of reloading Isaac forever.
             print(f"[Intervention][FATAL] {e}", flush=True)
-            env.close()
             operator_fatal_error = e
             operator_stop_requested = True
         except PiperXBridgeError as e:
@@ -1095,7 +1119,6 @@ def main():
             # already entered fail-closed hold/disable and the staged episode
             # was discarded by the control loop.
             print(f"[PiPER-X DAgger][FATAL] {e}", flush=True)
-            env.close()
             operator_fatal_error = e
             operator_stop_requested = True
         except PiperXJointJ1Exit:
@@ -1103,7 +1126,6 @@ def main():
             operator_stop_requested = True
         except PiperXJointJ1Error as e:
             print(f"[J1 checkpoint][FATAL] {e}", flush=True)
-            env.close()
             operator_fatal_error = e
             operator_stop_requested = True
         except DualJointMirrorError as e:
@@ -1116,7 +1138,6 @@ def main():
                 "The hardware source remains responsible for active hold.",
                 flush=True,
             )
-            env.close()
             operator_fatal_error = e
             operator_stop_requested = True
         except KeyboardInterrupt as e:
@@ -1157,13 +1178,27 @@ def main():
                 bad_envs = sorted(bad)
             else:
                 if operator_driven:
-                    print(
-                        "[Intervention] current candidate was discarded after an error; "
-                        "retrying the same layout."
-                    )
-                    env.set_next_policy_reset_reason(ResetReason.SIMULATOR_RECOVERY)
-                    env.close()
-                    retry_round = True
+                    if control_mode == "x5_policy_joint_intervention":
+                        # The online writer has already rolled back its current
+                        # candidate.  Do not tear down/recreate Replicator in
+                        # the same process: that path has produced invalid
+                        # annotator weakrefs and SIGABRT.  Close all subsystems
+                        # once through the unified final-shutdown path below.
+                        print(
+                            "[X5 DAgger][FATAL] current candidate was discarded; "
+                            "stopping without an in-process camera rebuild.",
+                            flush=True,
+                        )
+                        operator_fatal_error = e
+                        operator_stop_requested = True
+                    else:
+                        print(
+                            "[Intervention] current candidate was discarded after an error; "
+                            "retrying the same layout."
+                        )
+                        env.set_next_policy_reset_reason(ResetReason.SIMULATOR_RECOVERY)
+                        env.close()
+                        retry_round = True
                 elif policy_runtime == "robodojo_policy_v1":
                     print(
                         "[PolicyV1][FATAL] local policy-v1 integration error; "
@@ -1238,7 +1273,12 @@ def main():
                 f"layout={env.env_seeds[0]} cycle={env.seed_manager.cycle_index}"
             )
 
-        env.close()
+        # X5 collection reuses the live simulator and Replicator camera graph.
+        # Hard-closing/recreating it after every Right caused invalid annotator
+        # weakrefs and pybind SIGABRTs.  The next env.reset() performs the
+        # intended scene/layout soft reset.
+        if control_mode != "x5_policy_joint_intervention":
+            env.close()
 
     if operator_fatal_error is None:
         _delete_resume_manifest(env)
@@ -1250,6 +1290,7 @@ def main():
     close_lerobot_stream_session()
     close_piperx_bridge_session()
     _close_model_client(env)
+    env._robodojo_final_shutdown = True
     env.close()
     simulation_app.close()
     if operator_fatal_error is not None:

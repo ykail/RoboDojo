@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 from types import ModuleType
 from types import SimpleNamespace
 from pathlib import Path
@@ -200,6 +202,132 @@ def _response(
 
 
 class X5PolicyMirrorLoopTest(unittest.TestCase):
+    @staticmethod
+    def _online_identity_task() -> SimpleNamespace:
+        return SimpleNamespace(
+            task_name="fill_pen_holder",
+            policy_provenance={
+                "checkpoint_id": "fill_pen_holder/59999",
+                "checkpoint_digest": "sha256:" + "a" * 64,
+                "code_revision": "b" * 40,
+                "dirty": False,
+            },
+        )
+
+    def test_online_resume_validates_contiguous_identity_before_counting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "lerobot"
+            dataset = root / "dataset"
+            sidecars = dataset / "meta/robodojo/episodes"
+            sidecars.mkdir(parents=True)
+            (dataset / "meta/info.json").write_text(
+                json.dumps({"total_episodes": 1}), encoding="utf-8",
+            )
+            task = self._online_identity_task()
+            payload = {
+                "episode_index": 0,
+                "robodojo_timing_resample": "sim_step_exact_25hz_v1",
+                "robodojo_task": task.task_name,
+                "robodojo_control_mode": "x5_policy_joint_intervention",
+                "robodojo_policy_provenance": task.policy_provenance,
+                "robodojo_layout_id": 4,
+                "robodojo_layout_cycle": 2,
+            }
+            (sidecars / "episode_0000000.json").write_text(
+                json.dumps(payload), encoding="utf-8",
+            )
+            with mock.patch.dict(
+                mirror.os.environ,
+                {
+                    "ROBODOJO_LEROBOT_ROOT": str(root),
+                    "ROBODOJO_LEROBOT_REPO_ID": "dataset",
+                },
+            ):
+                count, last = mirror._online_collection_state(task)
+            self.assertEqual(count, 1)
+            self.assertEqual(last["robodojo_layout_id"], 4)
+
+    def test_online_target_cannot_accept_old_timing_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "lerobot"
+            dataset = root / "dataset"
+            sidecars = dataset / "meta/robodojo/episodes"
+            sidecars.mkdir(parents=True)
+            (dataset / "meta/info.json").write_text(
+                json.dumps({"total_episodes": 1}), encoding="utf-8",
+            )
+            task = self._online_identity_task()
+            (sidecars / "episode_0000000.json").write_text(
+                json.dumps({
+                    "episode_index": 0,
+                    "robodojo_timing_resample": "manual_wall_time_zoh_25hz_v1",
+                    "robodojo_task": task.task_name,
+                    "robodojo_control_mode": "x5_policy_joint_intervention",
+                    "robodojo_policy_provenance": task.policy_provenance,
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                mirror.os.environ,
+                {
+                    "ROBODOJO_LEROBOT_ROOT": str(root),
+                    "ROBODOJO_LEROBOT_REPO_ID": "dataset",
+                },
+            ), self.assertRaisesRegex(
+                mirror.DualJointMirrorError, "incompatible timing",
+            ):
+                mirror._online_collection_state(task)
+
+    def test_right_commits_one_complete_policy_manual_policy_episode(self) -> None:
+        events: list[str] = []
+        client = _Client(
+            [
+                _response(), _response(), _response(),
+                _response(mode="manual", edge="enter"),
+                _response(mode="manual", delta=0.1),
+                _response(mode="follow", edge="exit"),
+                _response(), _response(), _response(),
+                _response(terminal="save"),
+            ],
+            events,
+        )
+        task = _TaskEnv(events)
+        task.is_episode_end = lambda: False
+        recorder = _Recorder(events)
+        recorder_module = ModuleType("src.eval_client.lerobot_stream_recorder")
+        recorder_module.recorder_for_env = lambda _task_env: recorder
+        with mock.patch.object(
+            mirror, "DualJointMirrorClient", return_value=client
+        ), mock.patch.object(
+            mirror, "_SinglePendingRecorder", _SynchronousPendingRecorder
+        ), mock.patch.dict(
+            sys.modules,
+            {"src.eval_client.lerobot_stream_recorder": recorder_module},
+        ), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "1",
+                "ROBODOJO_X5_RAW_CAPTURE": "0",
+                "ROBODOJO_X5_TARGET_EPISODES": "",
+                "ROBODOJO_REALTIME": "0",
+            },
+        ):
+            mirror.run_piperx_policy_leader_mirror_episode(
+                task, _Model(), allow_intervention=True,
+            )
+        self.assertEqual(
+            [frame["control"]["action_source"] for frame in recorder.frames],
+            ["policy", "human", "policy"],
+        )
+        self.assertEqual(
+            [frame["control"]["intervention_mask"] for frame in recorder.frames],
+            [0, 1, 0],
+        )
+        self.assertEqual(len(recorder.finishes), 1)
+        self.assertTrue(recorder.finishes[0]["accepted"])
+        self.assertEqual(recorder.finishes[0]["reason"], "operator_accept_next")
+
     def test_raw_mode_atomically_commits_two_takeover_segments(self) -> None:
         events: list[str] = []
 

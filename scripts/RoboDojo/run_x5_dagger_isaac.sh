@@ -9,7 +9,7 @@ SOURCE_HOST="${ROBODOJO_X5_SOURCE_HOST:-127.0.0.1}"
 SOURCE_PORT="${ROBODOJO_X5_SOURCE_PORT:-8770}"
 DATASET_ROOT="${ROBODOJO_LEROBOT_ROOT:-${HOME}/data/lerobot}"
 TASK="${ROBODOJO_TASK:-make_toast}"
-DATASET_ID="${ROBODOJO_LEROBOT_REPO_ID:-robodojo_${TASK}_x5_online_dagger_timing25_v2}"
+DATASET_ID="${ROBODOJO_LEROBOT_REPO_ID:-robodojo_${TASK}_x5_online_dagger_simstep25_v3}"
 DATASET_PATH="${DATASET_ROOT%/}/${DATASET_ID}"
 LEROBOT_PYTHON="${X5_LEROBOT_PYTHON:-${ROBODOJO_LEROBOT_PYTHON:-${HOME}/vibe_code/kai0-robodojo-policy-v1/.venv/bin/python}}"
 EVAL_NUM="${ROBODOJO_EVAL_NUM:-1}"
@@ -53,11 +53,11 @@ done
     || die "ROBODOJO_EXPECTED_CHECKPOINT_DIGEST must be the digest discovered from policy HELLO"
 [[ "${CAPTURE_MODE}" == "online" || "${CAPTURE_MODE}" == "raw-deferred" ]] \
     || die "ROBODOJO_X5_CAPTURE_MODE must be online or raw-deferred"
+[[ "${TARGET_EPISODES}" =~ ^[1-9][0-9]*$ ]] \
+    || die "ROBODOJO_X5_TARGET_EPISODES must be a positive integer"
 if [[ "${CAPTURE_MODE}" == "raw-deferred" ]]; then
     [[ -n "${RAW_ROOT}" && -d "${RAW_ROOT}" ]] \
         || die "ROBODOJO_X5_RAW_ROOT must be an existing directory in raw-deferred mode"
-    [[ "${TARGET_EPISODES}" =~ ^[1-9][0-9]*$ ]] \
-        || die "ROBODOJO_X5_TARGET_EPISODES must be a positive integer"
 fi
 
 if ! (exec 3<>"/dev/tcp/127.0.0.1/${POLICY_PORT}") >/dev/null 2>&1; then
@@ -98,6 +98,9 @@ export DISPLAY="${DISPLAY:-:1}"
 export XAUTHORITY="${XAUTHORITY:-/run/user/$(id -u)/gdm/Xauthority}"
 export OMNI_KIT_ACCEPT_EULA=YES
 export ROBODOJO_REALTIME=1
+# A dataset row is one completed 25 Hz simulator control transition.  Never
+# stretch slow wall-clock collection by cloning observation/action rows.
+export ROBODOJO_LEROBOT_TIMING_CONTRACT="sim_step_exact_25hz_v1"
 # Keep the official visual domain.  Policy and intervention frames are both
 # captured online so Right only drains the encoder and commits the episode.
 export ROBODOJO_RENDERING_MODE=quality
@@ -135,8 +138,9 @@ if [[ "${CAPTURE_MODE}" == "raw-deferred" ]]; then
     echo "[X5 Isaac] raw=${RAW_ROOT} target=${TARGET_EPISODES}; completed bundles auto-resume"
 else
     echo "[X5 Isaac] dataset=${DATASET_PATH}"
-    echo "[X5 Isaac] recording=online RGB for policy and intervention"
-    echo "[X5 Isaac] manual timing=wall-time zero-order hold resampled to 25Hz"
+    echo "[X5 Isaac] recording=one complete policy+human LeRobot episode per Right"
+    echo "[X5 Isaac] timing=one real simulator transition per 25Hz row; no fill frames"
+    echo "[X5 Isaac] target=${TARGET_EPISODES}; completed episodes auto-resume"
 fi
 echo "[X5 Isaac] CUDA tensor/Fabric pipeline=${ROBODOJO_X5_CUDA_PIPELINE} (0 is the supported default)"
 echo "[X5 Isaac] Kit main-loop cap=${ROBODOJO_MAIN_RATE_LIMIT_HZ}Hz"

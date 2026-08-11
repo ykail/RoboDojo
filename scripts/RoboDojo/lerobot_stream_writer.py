@@ -822,6 +822,34 @@ def _write_robodojo_episode_metadata(
     return target
 
 
+def _validate_resume_timing_contract(
+    dataset_root: Path,
+    *,
+    total_episodes: int,
+    expected: str,
+) -> None:
+    """Refuse to mix incompatible time semantics in one training dataset."""
+
+    if total_episodes <= 0:
+        return
+    sidecar_dir = dataset_root / _ROBODOJO_EPISODE_METADATA_DIR
+    sidecars = sorted(sidecar_dir.glob("episode_*.json"))
+    if len(sidecars) != total_episodes:
+        raise ValueError(
+            "existing dataset cannot prove one timing contract per episode: "
+            f"episodes={total_episodes}, sidecars={len(sidecars)}"
+        )
+    for path in sidecars:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        actual = payload.get("robodojo_timing_resample")
+        if actual != expected:
+            raise ValueError(
+                f"refusing to mix timing contracts in {dataset_root}: "
+                f"{path.name} has {actual!r}, requested {expected!r}. "
+                "Use a new --dataset-id."
+            )
+
+
 def _clear_episode(dataset: Any) -> None:
     clear = getattr(dataset, "clear_episode_buffer", None)
     if callable(clear):
@@ -1002,7 +1030,11 @@ def serve(
     source_wall_origin_s: float | None = None
     source_wall_elapsed_s: list[float] = []
     source_is_manual: list[bool] = []
+    manual_source_frame_count = 0
+    previous_manual_wall_s: float | None = None
+    max_manual_source_gap_s = 0.0
     manual_resampler: _ManualWallTimeResampler | None = None
+    timing_contract = "manual_wall_time_zoh_25hz_v1"
     try:
         dataset, _created = dataset_opener(config)
         total_episodes = int(getattr(dataset.meta, "total_episodes", 0))
@@ -1048,9 +1080,32 @@ def serve(
                 source_wall_origin_s = None
                 source_wall_elapsed_s = []
                 source_is_manual = []
+                manual_source_frame_count = 0
+                previous_manual_wall_s = None
+                max_manual_source_gap_s = 0.0
+                timing_contract = str(
+                    metadata.get(
+                        "timing_contract",
+                        "manual_wall_time_zoh_25hz_v1",
+                    )
+                )
+                if timing_contract not in {
+                    "manual_wall_time_zoh_25hz_v1",
+                    "sim_step_exact_25hz_v1",
+                }:
+                    raise ValueError(
+                        f"unsupported LeRobot timing contract: {timing_contract!r}"
+                    )
+                if timing_contract == "sim_step_exact_25hz_v1":
+                    _validate_resume_timing_contract(
+                        config.dataset_root,
+                        total_episodes=int(getattr(dataset.meta, "total_episodes", 0)),
+                        expected=timing_contract,
+                    )
                 manual_resampler = (
                     _ManualWallTimeResampler(config.fps, emit_frame)
                     if metadata.get("control_mode") == "x5_policy_joint_intervention"
+                    and timing_contract == "manual_wall_time_zoh_25hz_v1"
                     else None
                 )
                 active = True
@@ -1060,6 +1115,7 @@ def serve(
                     raise RuntimeError("Received frame without begin")
                 source_frame_count += 1
                 is_manual = _is_manual_frame(message)
+                manual_source_frame_count += int(is_manual)
                 has_intervention = has_intervention or is_manual
                 if manual_resampler is not None:
                     wall_timestamp_s = _control_wall_time(message)
@@ -1099,6 +1155,23 @@ def serve(
                         manual_resampler.finish_before(manual_end_timestamp)
                         emit_frame(message, wall_timestamp_s)
                 else:
+                    if timing_contract == "sim_step_exact_25hz_v1":
+                        wall_timestamp_s = _control_wall_time(message)
+                        if source_wall_origin_s is None:
+                            source_wall_origin_s = wall_timestamp_s
+                        source_wall_elapsed_s.append(
+                            max(0.0, wall_timestamp_s - source_wall_origin_s)
+                        )
+                        source_is_manual.append(is_manual)
+                        if is_manual:
+                            if previous_manual_wall_s is not None:
+                                max_manual_source_gap_s = max(
+                                    max_manual_source_gap_s,
+                                    wall_timestamp_s - previous_manual_wall_s,
+                                )
+                            previous_manual_wall_s = wall_timestamp_s
+                        else:
+                            previous_manual_wall_s = None
                     emit_frame(message, 0.0)
                 _wait_for_encoder_headroom(dataset, config.encoder_wait_s)
                 drops = _dropped_frame_counts(dataset)
@@ -1150,6 +1223,35 @@ def serve(
                         file=sys.stderr,
                         flush=True,
                     )
+                else:
+                    if timing_contract == "sim_step_exact_25hz_v1":
+                        if frame_count != source_frame_count:
+                            raise RuntimeError(
+                                "sim-step timing contract requires exactly one output row "
+                                f"per source transition, got source={source_frame_count}, "
+                                f"output={frame_count}"
+                            )
+                        metadata["timing_resample"] = "sim_step_exact_25hz_v1"
+                        metadata["manual_source_frame_count"] = (
+                            manual_source_frame_count
+                        )
+                        metadata["manual_output_frame_count"] = (
+                            manual_source_frame_count
+                        )
+                        metadata["max_manual_source_gap_s"] = (
+                            max_manual_source_gap_s
+                        )
+                        metadata["source_wall_elapsed_s"] = source_wall_elapsed_s
+                        metadata["source_is_manual"] = source_is_manual
+                        print(
+                            "[LEROBOT timing] sim-step exact 25Hz: source="
+                            f"{source_frame_count} output={frame_count} "
+                            f"manual={manual_source_frame_count} max-manual-wall-gap="
+                            f"{max_manual_source_gap_s * 1000.0:.0f}ms; "
+                            "no timing-fill rows",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                 commit_snapshot = _CommitSnapshot.capture(
                     config.dataset_root,
                     transient_roots=_encoder_transient_roots(dataset, config.dataset_root),

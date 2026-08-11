@@ -46,7 +46,10 @@ def _as_numeric_array(value: Any, *, label: str, dtype=None) -> np.ndarray:
         raise TypeError(f"{label} must be numeric, got dtype {array.dtype}")
     if array.dtype.kind == "f" and not np.isfinite(array).all():
         raise ValueError(f"{label} contains non-finite values")
-    return np.ascontiguousarray(array)
+    # Torch CPU tensors expose NumPy views backed by the live simulator buffer.
+    # A snapshot must own its bytes or later physics steps silently overwrite
+    # the supposedly captured takeover state.
+    return np.array(array, copy=True, order="C")
 
 
 def _float32(value: Any, *, label: str) -> np.ndarray:
@@ -59,7 +62,7 @@ def _first_env(value: Any, *, label: str) -> np.ndarray:
         return array
     if array.shape[0] < 1:
         raise ValueError(f"{label} has no environment row")
-    return np.ascontiguousarray(array[0])
+    return np.array(array[0], copy=True, order="C")
 
 
 def _json_safe(value: Any) -> Any:

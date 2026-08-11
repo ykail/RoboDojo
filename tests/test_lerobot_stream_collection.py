@@ -385,6 +385,97 @@ class LeRobotStreamWriterTest(unittest.TestCase):
             )
             self.assertEqual(manual_rows, 8)
 
+    def test_sim_step_timing_writes_exactly_one_row_per_transition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp) / "test"
+            (dataset_root / "meta").mkdir(parents=True)
+            (dataset_root / "meta" / "info.json").write_text(
+                json.dumps({"total_episodes": 0, "total_frames": 0}),
+                encoding="utf-8",
+            )
+            dataset = _FakeDataset()
+            config = writer.WriterConfig(
+                repo_id="test", root=Path(tmp), fps=25, resume=False,
+                vcodec="h264", encoder_threads=1,
+            )
+            messages = [
+                {"command": "begin", "metadata": {
+                    "task_name": "fill_pen_holder",
+                    "control_mode": "x5_policy_joint_intervention",
+                    "timing_contract": "sim_step_exact_25hz_v1",
+                }},
+                _frame_message(source="policy", timestamp=10.0),
+                _frame_message(source="human", policy=False, timestamp=10.30),
+                _frame_message(source="human", policy=False, timestamp=10.61),
+                _frame_message(source="policy", timestamp=14.0),
+                {"command": "finish", "accepted": True, "success": False,
+                 "reason": "right", "timestamp": 20.0},
+            ]
+            output = io.BytesIO()
+            status = writer.serve(
+                config, _packet_stream(messages), output,
+                dataset_opener=lambda _config: (dataset, True),
+            )
+            self.assertEqual(status, 0)
+            self.assertEqual(len(dataset.saved_frames), 4)
+            metadata_path = (
+                dataset_root / writer._ROBODOJO_EPISODE_METADATA_DIR
+                / "episode_0000000.json"
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                metadata["robodojo_timing_resample"],
+                "sim_step_exact_25hz_v1",
+            )
+            self.assertEqual(metadata["robodojo_source_frame_count"], 4)
+            self.assertEqual(metadata["robodojo_manual_source_frame_count"], 2)
+            self.assertEqual(metadata["robodojo_manual_output_frame_count"], 2)
+            self.assertAlmostEqual(
+                metadata["robodojo_max_manual_source_gap_s"], 0.31,
+            )
+            np.testing.assert_allclose(
+                metadata["robodojo_source_wall_elapsed_s"],
+                [0.0, 0.3, 0.61, 4.0],
+            )
+            self.assertEqual(
+                metadata["robodojo_source_is_manual"],
+                [False, True, True, False],
+            )
+
+    def test_sim_step_resume_refuses_old_wall_time_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp) / "test"
+            sidecar_dir = dataset_root / writer._ROBODOJO_EPISODE_METADATA_DIR
+            sidecar_dir.mkdir(parents=True)
+            (dataset_root / "meta" / "info.json").write_text(
+                json.dumps({"total_episodes": 1, "total_frames": 10}),
+                encoding="utf-8",
+            )
+            (sidecar_dir / "episode_0000000.json").write_text(
+                json.dumps({
+                    "episode_index": 0,
+                    "robodojo_timing_resample": "manual_wall_time_zoh_25hz_v1",
+                }),
+                encoding="utf-8",
+            )
+            dataset = _FakeDataset(total_episodes=1)
+            config = writer.WriterConfig(
+                repo_id="test", root=Path(tmp), fps=25, resume=True,
+                vcodec="h264", encoder_threads=1,
+            )
+            output = io.BytesIO()
+            status = writer.serve(
+                config,
+                _packet_stream([{"command": "begin", "metadata": {
+                    "control_mode": "x5_policy_joint_intervention",
+                    "timing_contract": "sim_step_exact_25hz_v1",
+                }}]),
+                output,
+                dataset_opener=lambda _config: (dataset, False),
+            )
+            self.assertEqual(status, 1)
+            self.assertIn("Use a new --dataset-id", _all_packets(output)[-1]["error"])
+
     def test_nonfinite_policy_and_pixels_are_rejected(self):
         message = _frame_message()
         message["policy_action"]["left_arm_joint_state"][0] = np.nan

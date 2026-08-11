@@ -9,5 +9,5 @@ exec "${SCRIPT_DIR}/run_acone_x5_isaac.sh" \
     --task fill_pen_holder \
     --checkpoint-id fill_pen_holder/9999_my \
     --port "${ROBODOJO_POLICY_PORT:-18081}" \
-    --dataset-id robodojo_fill_pen_holder_x5_online_dagger_9999_my_timing25_v2 \
+    --dataset-id robodojo_fill_pen_holder_x5_online_dagger_9999_my_simstep25_v3 \
     "$@"
