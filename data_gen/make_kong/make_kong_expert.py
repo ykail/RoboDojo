@@ -115,28 +115,36 @@ def _unit_quaternion(quaternion: FloatArray) -> FloatArray:
     return _as_numpy(quaternion / norm)
 
 
-def forced_target_group_execution_order(env: MakeKongEnvironment, target_group: int):
-    """Build one deterministic execution order without changing the task module."""
+def forced_target_group_execution_order(env: MakeKongEnvironment, selected_groups: list[int]):
+    """Build a deterministic target group for each environment in a batch."""
 
     push_labels = ("mahjong5_0", "mahjong6_0", "mahjong7_0", "mahjong8_0")
-    target_groups = (
+    target_tile_groups = (
         ("mahjong0_0", "mahjong0_1", "mahjong0_2"),
         ("mahjong1_0", "mahjong1_1", "mahjong1_2"),
         ("mahjong2_0", "mahjong2_1", "mahjong2_2"),
         ("mahjong3_0", "mahjong3_1", "mahjong3_2"),
     )
-    if env.num_envs != 1:
-        raise ValueError("Forced target groups require exactly one environment.")
-    if target_group not in range(len(push_labels)):
-        raise ValueError(f"target_group must be in [0, 3], got {target_group}.")
+    if len(selected_groups) != env.num_envs:
+        raise ValueError(f"Expected {env.num_envs} target groups, got {len(selected_groups)}.")
+    if any(target_group not in range(len(push_labels)) for target_group in selected_groups):
+        raise ValueError(f"target groups must be in [0, 3], got {selected_groups}.")
 
-    positions = {}
-    for label in [*push_labels, *[label for group in target_groups for label in group]]:
-        position, _ = env.reward_manager.func_parser.get_label_pose(label)
-        positions[label] = _as_numpy(position)[0]
-    ordered_group = sorted(target_groups[target_group], key=lambda label: float(positions[label][0]))
-    push_order = sorted(range(len(push_labels)), key=lambda index: float(positions[push_labels[index]][0]))
-    return [push_labels[target_group]], [[label] for label in ordered_group], [push_order.index(target_group)]
+    positions = {
+        label: _as_numpy(env.reward_manager.func_parser.get_label_pose(label)[0])
+        for label in [*push_labels, *[label for group in target_tile_groups for label in group]]
+    }
+    push = []
+    kong = [[], [], []]
+    push_idx = []
+    for env_idx, target_group in enumerate(selected_groups):
+        ordered_group = sorted(target_tile_groups[target_group], key=lambda label: float(positions[label][env_idx][0]))
+        push_order = sorted(range(len(push_labels)), key=lambda index: float(positions[push_labels[index]][env_idx][0]))
+        push.append(push_labels[target_group])
+        for index, label in enumerate(ordered_group):
+            kong[index].append(label)
+        push_idx.append(push_order.index(target_group))
+    return push, kong, push_idx
 
 
 def _pose_from_config(data: dict[str, Any]) -> FloatArray:
@@ -257,8 +265,8 @@ class MakeKongExpertGenerator:
         max_control_steps: int = 6000,
         reference_config_path: Path | None = None,
     ):
-        if env.num_envs != 1 or env_id != 0:
-            raise ValueError("The initial Make Kong expert supports exactly env_id=0 in a single environment.")
+        if env_id >= env.num_envs:
+            raise ValueError(f"env_id={env_id} is out of range for num_envs={env.num_envs}.")
         self.env = env
         self.seed = seed
         self.env_id = env_id
@@ -273,6 +281,9 @@ class MakeKongExpertGenerator:
         self.default_scene_models = {
             robot.robot_name: deepcopy(env.robot_manager.planner[robot.robot_name].scene_model)
             for robot in (self.left, self.right)
+        }
+        self.planner_scene_models = {
+            robot.arm_name: deepcopy(self.default_scene_models[robot.robot_name]) for robot in (self.left, self.right)
         }
         self.free_space_control_repeat = 1
         self.initial_target_poses = {
@@ -335,9 +346,8 @@ class MakeKongExpertGenerator:
         return result
 
     def reset(self) -> None:
-        """Register checks without changing the reset pose established by TaskEnv."""
+        """Read the per-environment targets after the batch registered its reward checks."""
 
-        self.env.run_reward()
         self.metadata = self.get_task_targets()
         self.closed_target_grippers.clear()
         self._log(
@@ -378,7 +388,9 @@ class MakeKongExpertGenerator:
     def _reference(self) -> GroupReference:
         """Load the static group calibration and arm schedule."""
 
-        reference, schedule, replacement_config = _load_group_reference(self.reference_config_path, self._target_group())
+        reference, schedule, replacement_config = _load_group_reference(
+            self.reference_config_path, self._target_group()
+        )
         self.arm_schedule = schedule
         self.replacement_config = replacement_config
         self.metadata["official_reference"] = {
@@ -430,6 +442,7 @@ class MakeKongExpertGenerator:
         return rotated_offsets, rotated_grasp
 
     def _control_for_ik(self, robot: ArmProtocol, target_pose: FloatArray, opening: float) -> ControlInfo:
+        self._activate_planner_scene(robot)
         result = self.env.robot_manager.solve_ik(target_pose.tolist(), self.env_id, robot)
         if result.get("status") != "Success":
             raise RuntimeError(f"IK failed for {robot.arm_name} at {target_pose.tolist()}.")
@@ -488,14 +501,20 @@ class MakeKongExpertGenerator:
         planner.scene_model = deepcopy(scene_model)
 
     def _restore_tile_collision_scene(self, robot: ArmProtocol) -> None:
-        planner = self.env.robot_manager.planner[robot.robot_name]
-        self._update_planner_world(planner, self.default_scene_models[robot.robot_name])
+        self.planner_scene_models[robot.arm_name] = deepcopy(self.default_scene_models[robot.robot_name])
+
+    def _planner(self, robot: ArmProtocol):
+        return self.env.robot_manager.planner[robot.robot_name]
+
+    def _activate_planner_scene(self, robot: ArmProtocol) -> None:
+        """Load this environment's private collision model immediately before planning."""
+
+        self._update_planner_world(self._planner(robot), self.planner_scene_models[robot.arm_name])
 
     def _set_tile_collision_scene(self, robot: ArmProtocol, excluded_labels: set[str] | None = None) -> None:
         """Add live Mahjong cuboids to the planner while moving in free space."""
 
         excluded_labels = set() if excluded_labels is None else excluded_labels
-        planner = self.env.robot_manager.planner[robot.robot_name]
         scene_model = deepcopy(self.default_scene_models[robot.robot_name])
         scene_model["cuboid"] = dict(scene_model.get("cuboid", {}))
         labels = set(self.metadata["protected"]) | set(self.metadata["kong"])
@@ -505,7 +524,7 @@ class MakeKongExpertGenerator:
                 "dims": list(self.tile_dimensions),
                 "pose": [*position.tolist(), *quaternion.tolist()],
             }
-        self._update_planner_world(planner, scene_model)
+        self.planner_scene_models[robot.arm_name] = scene_model
 
     def _move_pose_avoiding_tiles(
         self,
@@ -517,13 +536,13 @@ class MakeKongExpertGenerator:
         excluded_labels: set[str] | None = None,
         keep_scene: bool = False,
         closing_opening: float | None = None,
-    ) -> None:
+    ):
         """Use live tile obstacles for one free-space move, then allow contact IK."""
 
         excluded_labels = set() if excluded_labels is None else excluded_labels
         self._set_tile_collision_scene(robot, excluded_labels=excluded_labels)
         try:
-            self._move_pose(
+            yield from self._move_pose(
                 robot,
                 target_pose,
                 opening,
@@ -536,7 +555,7 @@ class MakeKongExpertGenerator:
 
     def _fill_gripper_controls(
         self, robot: ArmProtocol, controls: list[ControlInfo], opening: float, closing_opening: float | None = None
-    ) -> None:
+    ):
         """Command each control's gripper, optionally ramping toward a target opening."""
         gripper_key = self.env.robot_manager.process_name(robot.gripper_name)
         count = len(controls)
@@ -561,7 +580,8 @@ class MakeKongExpertGenerator:
         """Plan a new free-space path from the current live joint state."""
 
         current_joint = self.env.robot_manager.get_joint(robot, env_idx_list=[self.env_id])[self.env_id]
-        planner = self.env.robot_manager.planner[robot.robot_name]
+        self._activate_planner_scene(robot)
+        planner = self._planner(robot)
         result = planner.plan_path(current_joint, target_pose.tolist(), robot.entity_origin_pose)
         if result.get("status") != "Success":
             ik_result = self.env.robot_manager.solve_ik(target_pose.tolist(), self.env_id, robot)
@@ -571,7 +591,7 @@ class MakeKongExpertGenerator:
         if result.get("status") != "Success":
             if allow_direct_ik and ik_result.get("status") == "Success":
                 control = self._control_for_ik(robot, target_pose, opening)
-                self._execute(
+                yield from self._execute(
                     [control.copy() for _ in range(60)],
                     stage=stage,
                     repeat=self.free_space_control_repeat,
@@ -587,20 +607,17 @@ class MakeKongExpertGenerator:
         if not arm_controls:
             raise RuntimeError(f"{stage}: cuRobo returned an empty trajectory for {robot.arm_name}.")
         self._fill_gripper_controls(robot, arm_controls, opening, closing_opening)
-        self._execute(arm_controls, stage=stage, repeat=self.free_space_control_repeat)
+        yield from self._execute(arm_controls, stage=stage, repeat=self.free_space_control_repeat)
 
     def _replacement(self) -> ReplacementConfig:
         if self.replacement_config is None:
             raise RuntimeError("Replacement calibration has not been loaded.")
         return self.replacement_config
 
-    def _set_replacement_collision_scene(
-        self, robot: ArmProtocol, excluded_labels: set[str] | None = None
-    ) -> None:
+    def _set_replacement_collision_scene(self, robot: ArmProtocol, excluded_labels: set[str] | None = None):
         """Build a temporary scene that protects the pile during replacement moves."""
 
         excluded_labels = set() if excluded_labels is None else excluded_labels
-        planner = self.env.robot_manager.planner[robot.robot_name]
         scene_model = deepcopy(self.default_scene_models[robot.robot_name])
         scene_model["cuboid"] = dict(scene_model.get("cuboid", {}))
         labels = set(self.metadata["protected"]) | set(self.metadata["kong"])
@@ -611,11 +628,9 @@ class MakeKongExpertGenerator:
                 "dims": list(self.tile_dimensions),
                 "pose": [*position.tolist(), *quaternion.tolist()],
             }
-        self._update_planner_world(planner, scene_model)
+        self.planner_scene_models[robot.arm_name] = scene_model
 
-    def _set_scene(
-        self, robot: ArmProtocol, scene: str | None, excluded_labels: set[str] | None
-    ) -> None:
+    def _set_scene(self, robot: ArmProtocol, scene: str | None, excluded_labels: set[str] | None) -> None:
         if scene is None:
             return
         if scene == "tile":
@@ -638,7 +653,8 @@ class MakeKongExpertGenerator:
         """Plan one arm without executing it so another arm can be held explicitly."""
 
         current_joint = self.env.robot_manager.get_joint(robot, env_idx_list=[self.env_id])[self.env_id]
-        planner = self.env.robot_manager.planner[robot.robot_name]
+        self._activate_planner_scene(robot)
+        planner = self._planner(robot)
         ik_result = None
         result = planner.plan_path(current_joint, target_pose.tolist(), robot.entity_origin_pose)
         if result.get("status") != "Success":
@@ -695,7 +711,7 @@ class MakeKongExpertGenerator:
                 allow_direct_ik=allow_direct_ik,
                 closing_opening=closing_opening,
             )
-            self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
+            yield from self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
         finally:
             self._restore_tile_collision_scene(robot)
 
@@ -710,7 +726,7 @@ class MakeKongExpertGenerator:
         hold_opening: float,
         stage: str,
         excluded_labels: set[str] | None = None,
-    ) -> None:
+    ):
         """Move one arm while explicitly commanding the other arm's hold pose."""
 
         self._set_replacement_collision_scene(moving_robot, excluded_labels=excluded_labels)
@@ -723,7 +739,7 @@ class MakeKongExpertGenerator:
             )
             hold_control = self._control_for_ik(hold_robot, hold_pose, hold_opening)
             controls = [self._merge_control_infos(hold_control, control) for control in moving_controls]
-            self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
+            yield from self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
         finally:
             self._restore_tile_collision_scene(moving_robot)
 
@@ -741,7 +757,7 @@ class MakeKongExpertGenerator:
         right_excluded_labels: set[str] | None = None,
         left_closing_opening: float | None = None,
         right_closing_opening: float | None = None,
-    ) -> None:
+    ):
         """Execute two independently planned paths on a shared time index."""
 
         self._set_scene(self.left, left_scene, left_excluded_labels)
@@ -769,7 +785,7 @@ class MakeKongExpertGenerator:
                 self._merge_control_infos(left_control, right_control)
                 for left_control, right_control in zip(left_controls, right_controls)
             ]
-            self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
+            yield from self._execute(controls, stage=stage, repeat=self.free_space_control_repeat)
         finally:
             self._restore_tile_collision_scene(self.left)
             if right_scene is not None:
@@ -798,10 +814,10 @@ class MakeKongExpertGenerator:
         stage: str,
         duration: float,
         excluded_labels: set[str] | None = None,
-    ) -> None:
+    ):
         self._set_replacement_collision_scene(robot, excluded_labels=excluded_labels)
         try:
-            self._cartesian_segment(
+            yield from self._cartesian_segment(
                 robot,
                 start_pose,
                 end_pose,
@@ -812,39 +828,44 @@ class MakeKongExpertGenerator:
         finally:
             self._restore_tile_collision_scene(robot)
 
-    def _move_gripper(self, robot: ArmProtocol, opening: float, *, stage: str, steps: int = 20) -> None:
+    def _move_gripper(self, robot: ArmProtocol, opening: float, *, stage: str, steps: int = 20):
         """Generate a short bounded gripper segment at the current arm pose."""
 
         control = {self.env.robot_manager.process_name(robot.gripper_name): self._gripper_control(robot, opening)}
-        self._execute(
+        yield from self._execute(
             [control.copy() for _ in range(steps)],
             stage=stage,
         )
 
-    def _open_gripper_at_home(self, robot: ArmProtocol) -> None:
+    def _open_gripper_at_home(self, robot: ArmProtocol):
         """Open a target gripper kept closed during rotations once the arm is home."""
         if robot.arm_name in self.closed_target_grippers:
-            self._move_gripper(robot, 1.0, stage=f"{robot.arm_name}:open_home", steps=self._duration_steps(0.20))
+            yield from self._move_gripper(
+                robot,
+                1.0,
+                stage=f"{robot.arm_name}:open_home",
+                steps=self._duration_steps(0.20),
+            )
             self.closed_target_grippers.remove(robot.arm_name)
 
-    def _return_target_robot_home(self, robot: ArmProtocol) -> None:
+    def _return_target_robot_home(self, robot: ArmProtocol):
         """Return a target arm before releasing its persistent closed command."""
 
         self._log("RETURN_TARGET_HOME", arm=robot.arm_name)
-        self._move_pose_avoiding_tiles(
+        yield from self._move_pose_avoiding_tiles(
             robot,
             self.initial_target_poses[robot.arm_name],
             0.0,
             stage=f"{robot.arm_name}:return_home",
         )
-        self._open_gripper_at_home(robot)
+        yield from self._open_gripper_at_home(robot)
 
-    def _overlap_tile_switch(self, previous_robot: ArmProtocol, next_label: str, reference: GroupReference) -> None:
+    def _overlap_tile_switch(self, previous_robot: ArmProtocol, next_label: str, reference: GroupReference):
         """Group 2: return the left arm home while the right arm approaches its tile."""
 
         self._log("OVERLAP_TILE_SWITCH", previous=previous_robot.arm_name, next_label=next_label)
         next_robot = self._robot_for_label(next_label)
-        self._move_dual_pose_paths(
+        yield from self._move_dual_pose_paths(
             self.initial_target_poses[previous_robot.arm_name],
             0.0,
             self._tile_pregrasp_pose(next_label, reference, next_robot),
@@ -855,16 +876,16 @@ class MakeKongExpertGenerator:
             right_excluded_labels={next_label},
             right_closing_opening=0.0,
         )
-        self._open_gripper_at_home(previous_robot)
+        yield from self._open_gripper_at_home(previous_robot)
         self.closed_target_grippers.add(next_robot.arm_name)
 
-    def _overlap_replacement_start(self, previous_robot: ArmProtocol) -> None:
+    def _overlap_replacement_start(self, previous_robot: ArmProtocol):
         """Groups 2 and 3: return the right arm home while the left arm approaches the replacement tile."""
 
         self._log("OVERLAP_REPLACEMENT_START", previous=previous_robot.arm_name)
         config = self._replacement()
         pregrasp_pose, _, _, _ = self._replacement_waypoints()
-        self._move_dual_pose_paths(
+        yield from self._move_dual_pose_paths(
             pregrasp_pose,
             config.pickup_opening,
             self.initial_target_poses[previous_robot.arm_name],
@@ -874,7 +895,7 @@ class MakeKongExpertGenerator:
             right_scene="tile",
             left_excluded_labels={"mahjong9_0"},
         )
-        self._open_gripper_at_home(previous_robot)
+        yield from self._open_gripper_at_home(previous_robot)
 
     def _cartesian_segment(
         self,
@@ -886,7 +907,7 @@ class MakeKongExpertGenerator:
         stage: str,
         steps: int = 12,
         duration: float | None = None,
-    ) -> None:
+    ):
         """Generate a low-speed, short contact motion using fresh IK targets."""
 
         if duration is not None:
@@ -896,7 +917,7 @@ class MakeKongExpertGenerator:
             pose = start_pose * (1.0 - alpha) + end_pose * alpha
             pose[3:] = _unit_quaternion(pose[3:])
             controls.append(self._control_for_ik(robot, pose, opening))
-        self._execute(controls, stage=stage)
+        yield from self._execute(controls, stage=stage)
 
     def _assert_protected_tiles(self, *, stage: str) -> None:
         disturbed = []
@@ -945,7 +966,9 @@ class MakeKongExpertGenerator:
         return np.concatenate((position, _unit_quaternion(quaternion)))
 
     def _gripper_opening(self, robot: ArmProtocol) -> float:
-        value = _as_numpy(self.env.robot_manager.get_end_effector_real_val(robot, env_idx_list=[self.env_id])[self.env_id])
+        value = _as_numpy(
+            self.env.robot_manager.get_end_effector_real_val(robot, env_idx_list=[self.env_id])[self.env_id]
+        )
         value = float(np.mean(value))
         scale = robot.gripper_scale
         if robot.gripper_move["sign"] == 1:
@@ -1055,7 +1078,7 @@ class MakeKongExpertGenerator:
         }
         return checks
 
-    def _run_replacement_pipeline(self, reference: GroupReference, *, start_left_at_pregrasp: bool = False) -> None:
+    def _run_replacement_pipeline(self, reference: GroupReference, *, start_left_at_pregrasp: bool = False):
         config = self._replacement()
         pile_labels = ("other0", "other1", "other2")
         self.metadata["replacement_initial_pose"] = {
@@ -1072,7 +1095,7 @@ class MakeKongExpertGenerator:
         pregrasp_pose, pickup_pose, lift_pose, initial_object_z = self._replacement_waypoints()
         self._log("TRANSITION_TO_REPLACEMENT", target_group=self._target_group())
         if not start_left_at_pregrasp:
-            self._move_pose_replacement(
+            yield from self._move_pose_replacement(
                 self.left,
                 pregrasp_pose,
                 config.pickup_opening,
@@ -1080,7 +1103,7 @@ class MakeKongExpertGenerator:
                 excluded_labels={"mahjong9_0"},
             )
         self._log("PICKUP_PREGRASP", pose=np.round(pregrasp_pose, 4).tolist())
-        self._move_pose_replacement(
+        yield from self._move_pose_replacement(
             self.left,
             pickup_pose,
             config.pickup_opening,
@@ -1089,15 +1112,17 @@ class MakeKongExpertGenerator:
             closing_opening=config.carry_opening,
         )
         self._log("PICKUP_CONTACT", pose=np.round(pickup_pose, 4).tolist())
-        self._move_gripper(
+        yield from self._move_gripper(
             self.left,
             config.carry_opening,
             stage="replacement:close_pickup",
             steps=self._duration_steps(config.pickup_close_duration),
         )
-        self._settle(5)
-        pickup_relative_pose = self._relative_pose(self._current_robot_pose(self.left), self._current_object_pose("mahjong9_0"))
-        self._cartesian_segment_replacement(
+        yield from self._settle(5)
+        pickup_relative_pose = self._relative_pose(
+            self._current_robot_pose(self.left), self._current_object_pose("mahjong9_0")
+        )
+        yield from self._cartesian_segment_replacement(
             self.left,
             pickup_pose,
             lift_pose,
@@ -1106,7 +1131,7 @@ class MakeKongExpertGenerator:
             duration=config.pickup_lift_duration,
             excluded_labels={"mahjong9_0"},
         )
-        self._settle(10)
+        yield from self._settle(10)
         self._assert_object_attached(
             self.left,
             pickup_relative_pose,
@@ -1115,18 +1140,18 @@ class MakeKongExpertGenerator:
         )
         self._log("PICKUP_LIFT_VERIFY")
         self._record_replacement_checkpoint("PICKUP_LIFT_VERIFY")
-        self._move_pose_replacement(
+        yield from self._move_pose_replacement(
             self.left,
             reference.handoff_left_pose,
             config.carry_opening,
             stage="replacement:to_handoff",
             excluded_labels={"mahjong9_0"},
         )
-        self._settle(5)
+        yield from self._settle(5)
         self._assert_object_attached(self.left, pickup_relative_pose, stage="HANDOFF_LEFT_HOLD")
         self._log("HANDOFF_LEFT_HOLD", pose=np.round(reference.handoff_left_pose, 4).tolist())
         self._record_replacement_checkpoint("HANDOFF_LEFT_HOLD")
-        self._move_pose_with_hold(
+        yield from self._move_pose_with_hold(
             self.right,
             reference.right_center_grasp_pose,
             config.pickup_opening,
@@ -1136,7 +1161,7 @@ class MakeKongExpertGenerator:
             stage="replacement:right_to_center",
             excluded_labels={"mahjong9_0"},
         )
-        self._execute(
+        yield from self._execute(
             self._dual_hold_controls(
                 reference.handoff_left_pose,
                 config.carry_opening,
@@ -1146,7 +1171,7 @@ class MakeKongExpertGenerator:
             ),
             stage="replacement:right_grasp",
         )
-        self._settle(5)
+        yield from self._settle(5)
         handoff_relative_pose = self._relative_pose(
             self._current_robot_pose(self.right), self._current_object_pose("mahjong9_0")
         )
@@ -1154,7 +1179,7 @@ class MakeKongExpertGenerator:
             raise RuntimeError("HANDOFF_RIGHT_GRASP: right gripper did not close enough.")
         self._log("HANDOFF_RIGHT_GRASP", pose=np.round(reference.right_center_grasp_pose, 4).tolist())
         self._record_replacement_checkpoint("HANDOFF_RIGHT_GRASP")
-        self._execute(
+        yield from self._execute(
             self._dual_hold_controls(
                 reference.handoff_left_pose,
                 config.release_opening,
@@ -1166,7 +1191,7 @@ class MakeKongExpertGenerator:
         )
         left_clearance_pose = reference.handoff_left_pose.copy()
         left_clearance_pose[0] -= config.left_retract_clearance
-        self._move_pose_with_hold(
+        yield from self._move_pose_with_hold(
             self.left,
             left_clearance_pose,
             config.release_opening,
@@ -1184,7 +1209,7 @@ class MakeKongExpertGenerator:
         release_transit_pose[2] += config.release_lateral_height_offset
         release_approach_pose = reference.release_approach_pose.copy()
         release_approach_pose[2] += config.release_lateral_height_offset
-        self._move_dual_pose_paths(
+        yield from self._move_dual_pose_paths(
             self.initial_target_poses["left_arm"],
             config.release_opening,
             release_transit_pose,
@@ -1194,7 +1219,7 @@ class MakeKongExpertGenerator:
         )
         self._assert_object_attached(self.right, handoff_relative_pose, stage="RELEASE_TRANSIT")
         self._record_replacement_checkpoint("RELEASE_TRANSIT")
-        self._move_pose_with_hold(
+        yield from self._move_pose_with_hold(
             self.right,
             release_approach_pose,
             config.right_grasp_opening,
@@ -1206,7 +1231,7 @@ class MakeKongExpertGenerator:
         )
         release_pose = reference.right_release_pose.copy()
         release_pose[2] -= config.release_drop_offset
-        self._move_pose_with_hold(
+        yield from self._move_pose_with_hold(
             self.right,
             release_pose,
             config.right_grasp_opening,
@@ -1216,23 +1241,24 @@ class MakeKongExpertGenerator:
             stage="replacement:right_to_release",
             excluded_labels={"mahjong9_0"},
         )
-        self._settle(5)
+        yield from self._settle(5)
         self._assert_object_attached(self.right, handoff_relative_pose, stage="MOVE_TO_RELEASE")
         self._record_replacement_checkpoint("MOVE_TO_RELEASE")
-        self._move_gripper(
+        yield from self._move_gripper(
             self.right,
             config.release_opening,
             stage="replacement:release",
             steps=self._duration_steps(config.release_open_duration),
         )
-        self._settle(config.settle_steps)
+        yield from self._settle(config.settle_steps)
         final_replacement_pose = self._current_object_pose("mahjong9_0")
         self._record_replacement_checkpoint("RELEASE_AFTER_OPEN")
         self.metadata["release_pose"] = {
             "position": final_replacement_pose[:3].tolist(),
             "quaternion": final_replacement_pose[3:].tolist(),
             "target_quaternion_error_degrees": self._quaternion_distance_degrees(
-                final_replacement_pose[3:], np.array([0.0, 0.707, 0.707, 0.0])),
+                final_replacement_pose[3:], np.array([0.0, 0.707, 0.707, 0.0])
+            ),
         }
         self._log("RELEASE_VERIFY", pose=np.round(final_replacement_pose, 4).tolist())
         self._assert_replacement_pile(stage="RELEASE_VERIFY")
@@ -1270,7 +1296,7 @@ class MakeKongExpertGenerator:
         offsets, grasp_quaternion = self._rotate_contact_frame(offsets, grasp_quaternion, object_quaternion)
         return np.concatenate((object_position + offsets[0], grasp_quaternion))
 
-    def _rotate_tile(self, label: str, reference: GroupReference, *, start_at_pregrasp: bool = False) -> None:
+    def _rotate_tile(self, label: str, reference: GroupReference, *, start_at_pregrasp: bool = False):
         """Use the source-like top contact and retract primitive for one tile."""
 
         robot = self._robot_for_label(label)
@@ -1292,7 +1318,7 @@ class MakeKongExpertGenerator:
         )
         try:
             if not start_at_pregrasp:
-                self._move_pose_avoiding_tiles(
+                yield from self._move_pose_avoiding_tiles(
                     robot,
                     pregrasp_pose,
                     0.0 if gripper_closed else 1.0,
@@ -1315,7 +1341,7 @@ class MakeKongExpertGenerator:
             press_pose = np.concatenate((object_position + offsets[1], press_quaternion))
             retract_pose = np.concatenate((object_position + offsets[2], press_quaternion))
             retreat_pose = np.concatenate((object_position + offsets[3], retreat_quaternion))
-            self._cartesian_segment(
+            yield from self._cartesian_segment(
                 robot,
                 pregrasp_pose,
                 press_pose,
@@ -1333,7 +1359,7 @@ class MakeKongExpertGenerator:
                 ).tolist(),
             )
             self._assert_protected_tiles(stage=f"{label}:press")
-            self._cartesian_segment(
+            yield from self._cartesian_segment(
                 robot,
                 press_pose,
                 retract_pose,
@@ -1342,7 +1368,7 @@ class MakeKongExpertGenerator:
                 duration=contact_durations[1],
             )
             self._assert_protected_tiles(stage=retract_stage)
-            self._cartesian_segment(
+            yield from self._cartesian_segment(
                 robot,
                 retract_pose,
                 retreat_pose,
@@ -1350,7 +1376,7 @@ class MakeKongExpertGenerator:
                 stage=f"{label}:retreat",
                 duration=contact_durations[2],
             )
-            self._settle(10)
+            yield from self._settle(10)
             if not self._axis_up(label, np.array([0.0, 0.0, 1.0]), threshold=30):
                 _, quaternion = self._label_pose(label)
                 quaternion_text = np.round(quaternion, 4).tolist()
@@ -1361,8 +1387,8 @@ class MakeKongExpertGenerator:
         finally:
             self._restore_tile_collision_scene(robot)
 
-    def _execute(self, control_info: list[ControlInfo], *, stage: str, repeat: int = 1) -> None:
-        """Execute controls through the same TaskEnv step path as eval."""
+    def _execute(self, control_info: list[ControlInfo], *, stage: str, repeat: int = 1):
+        """Yield one environment-local control for each simulator tick."""
 
         if not control_info:
             raise RuntimeError(f"{stage}: empty control sequence.")
@@ -1372,36 +1398,30 @@ class MakeKongExpertGenerator:
         if len(control_info) + self.control_steps > self.max_control_steps:
             raise RuntimeError(f"{stage}: control-step budget exceeded.")
 
-        control_manager = self.env.robot_manager.control_manager
-        control_manager.push([self.env_id], [control_info])
-        while not control_manager.get_empty([self.env_id]):
-            meta_control = control_manager.pop([self.env_id])
-            self.env.step(meta_control_list=meta_control)
-            self.env.sim_step(render=False)
-            self.env.reward_manager.step([self.env_id])
+        for control in control_info:
+            yield control
             self.control_steps += 1
 
-    def _settle(self, steps: int | None = None) -> None:
+    def _settle(self, steps: int | None = None):
         for _ in range(self.settle_steps if steps is None else steps):
-            self.env.sim_step(render=False)
-            self.env.reward_manager.step([self.env_id])
+            yield None
 
     def verify_task_success(self) -> tuple[bool, float]:
         reward = float(self.env.reward_manager.get_reward()[self.env_id])
         checks = self._formal_task_checks()
         return reward >= 1.0 and all(checks.values()), reward
 
-    def run_episode(self, *, reset: bool = True) -> ExpertEpisodeResult:
+    def run_episode_steps(self, *, reset: bool = True):
         try:
             if reset:
                 self.reset()
             self._log("WAIT_SUPPORT_DISCARD")
             self.env.query_support_arm_traj(self.env_id)
-            self._execute(self.env.support_arm_action[self.env_id], stage="support_discard")
+            yield from self._execute(self.env.support_arm_action[self.env_id], stage="support_discard")
             self.env.support_arm_action[self.env_id] = []
-            self._settle(20)
+            yield from self._settle(20)
             self.env.check_support_arm_stable(self.env_id)
-            if getattr(self.env, "unstable_envs", set()):
+            if self.env_id in getattr(self.env, "unstable_envs", set()):
                 raise RuntimeError("support discard did not produce a stable scene.")
             self._assert_protected_tiles(stage="support_discard")
             reference = self._reference()
@@ -1412,21 +1432,21 @@ class MakeKongExpertGenerator:
                 robot = self._robot_for_label(label)
                 if previous_robot is not None and robot.arm_name != previous_robot.arm_name:
                     if previous_robot.arm_name == "left_arm" and robot.arm_name == "right_arm":
-                        self._overlap_tile_switch(previous_robot, label, reference)
+                        yield from self._overlap_tile_switch(previous_robot, label, reference)
                     else:
-                        self._return_target_robot_home(previous_robot)
-                    self._settle(40)
-                    self._rotate_tile(label, reference, start_at_pregrasp=True)
+                        yield from self._return_target_robot_home(previous_robot)
+                    yield from self._settle(40)
+                    yield from self._rotate_tile(label, reference, start_at_pregrasp=True)
                     previous_robot = robot
                     continue
-                self._rotate_tile(label, reference)
+                yield from self._rotate_tile(label, reference)
                 previous_robot = robot
             target_group = self._target_group()
             if previous_robot is not None and target_group in {2, 3}:
-                self._overlap_replacement_start(previous_robot)
-            self._settle(20)
-            self._run_replacement_pipeline(reference, start_left_at_pregrasp=target_group in {2, 3})
-            self._settle()
+                yield from self._overlap_replacement_start(previous_robot)
+            yield from self._settle(20)
+            yield from self._run_replacement_pipeline(reference, start_left_at_pregrasp=target_group in {2, 3})
+            yield from self._settle()
             success, reward = self.verify_task_success()
             self._log("SUCCESS" if success else "FAILED", reward=reward)
             return ExpertEpisodeResult(
