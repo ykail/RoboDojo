@@ -210,6 +210,7 @@ from src.eval_client.piperx_joint_j1 import (
     PiperXJointJ1Error,
     PiperXJointJ1Exit,
 )
+from src.eval_client.piperx_dual_joint_mirror import DualJointMirrorError
 from src.eval_client.policy_runtime import PolicyClientError, ResetReason
 from src.eval_client.replay_bundle import load_replay_frame
 from src.eval_client.restore_recovery_queue import (
@@ -1078,6 +1079,19 @@ def main():
             operator_stop_requested = True
         except PiperXJointJ1Error as e:
             print(f"[J1 checkpoint][FATAL] {e}", flush=True)
+            env.close()
+            operator_fatal_error = e
+            operator_stop_requested = True
+        except DualJointMirrorError as e:
+            # A live X5 transition/transport failure is not a simulator retry.
+            # The source process keeps retrying an active measured-pose hold;
+            # resetting Isaac here would hide the fault and can start another
+            # layout while the physical arms are not ready.
+            print(
+                f"[X5 DAgger][FATAL] {e}; refusing automatic environment reset. "
+                "The hardware source remains responsible for active hold.",
+                flush=True,
+            )
             env.close()
             operator_fatal_error = e
             operator_stop_requested = True

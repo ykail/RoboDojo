@@ -770,6 +770,53 @@ def _send(conn: socket.socket, payload: dict[str, Any]) -> None:
     conn.sendall((json.dumps(payload, allow_nan=False, separators=(",", ":")) + "\n").encode())
 
 
+def _recover_active_hold(
+    hardware: DualX5Hardware,
+    *,
+    attempts: int | None = None,
+    retry_delay_s: float = 0.10,
+) -> None:
+    """Keep retrying a measured-pose active hold without closing the SDK.
+
+    Closing the ARX controller switches it to damping.  During a live
+    collection that turns a recoverable socket/transition error into a falling
+    arm, so connection recovery must stay inside the owner process until an
+    active hold has actually been confirmed.  ``attempts=None`` is used by the
+    real server; finite attempts keep this helper directly testable.
+    """
+
+    if attempts is not None and attempts <= 0:
+        raise ValueError("hold recovery attempts must be positive or None")
+    if retry_delay_s < 0:
+        raise ValueError("hold recovery delay must be non-negative")
+    attempt = 0
+    last_error: BaseException | None = None
+    while attempts is None or attempt < attempts:
+        attempt += 1
+        try:
+            hardware.enter_hold()
+            hardware.hold()
+            if attempt > 1:
+                print(
+                    f"[Dual X5] active hold recovered after {attempt} attempts.",
+                    flush=True,
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == 1 or attempt % 10 == 0:
+                print(
+                    f"[Dual X5][WARN] active hold recovery attempt {attempt} failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            if attempts is None or attempt < attempts:
+                time.sleep(retry_delay_s)
+    raise X5SourceError(
+        f"active hold recovery failed after {attempt} attempts: {last_error}"
+    ) from last_error
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve two real ARX X5 arms to RoboDojo.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -988,7 +1035,15 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
                 try:
                     conn, _ = server.accept()
                 except socket.timeout:
-                    hardware.hold()
+                    try:
+                        hardware.hold()
+                    except Exception as exc:
+                        print(
+                            f"[Dual X5][WARN] idle hold refresh failed: "
+                            f"{type(exc).__name__}: {exc}; recovering active hold.",
+                            flush=True,
+                        )
+                        _recover_active_hold(hardware, attempts=None)
                     continue
                 print("[Dual X5] Isaac connected; follow anchor is the current hold pose.", flush=True)
                 with conn:
@@ -1001,9 +1056,13 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
                             liveness_timeout_s=args.liveness_timeout_s,
                             raw_root=args.raw_root,
                         )
-                    except (OSError, X5SourceError, X5HardwareError) as exc:
-                        hardware.enter_hold()
-                        print(f"[Dual X5][WARN] connection ended: {exc}", flush=True)
+                    except Exception as exc:
+                        print(
+                            f"[Dual X5][WARN] connection ended: {exc}; "
+                            "keeping the controller alive until active hold is restored.",
+                            flush=True,
+                        )
+                        _recover_active_hold(hardware, attempts=None)
                         clean_end = False
                         terminal_request = None
                 if terminal_request is not None and not quit_requested:
@@ -1013,13 +1072,23 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
                         f"to HOME over {args.home_duration_s:.1f}s.",
                         flush=True,
                     )
-                    hardware.move_home(
-                        tuple(args.home_rad),
-                        args.home_gripper_fraction,
-                        duration_s=args.home_duration_s,
-                        frequency_hz=args.frequency_hz,
-                    )
-                    print("[Dual X5] HOME reached; ready for the next episode.", flush=True)
+                    try:
+                        hardware.move_home(
+                            tuple(args.home_rad),
+                            args.home_gripper_fraction,
+                            duration_s=args.home_duration_s,
+                            frequency_hz=args.frequency_hz,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[Dual X5][WARN] HOME failed: {type(exc).__name__}: {exc}; "
+                            "recovering an active hold instead of exiting to damping.",
+                            flush=True,
+                        )
+                        _recover_active_hold(hardware, attempts=None)
+                        clean_end = False
+                    else:
+                        print("[Dual X5] HOME reached; ready for the next episode.", flush=True)
                 if not quit_requested:
                     print(
                         "[Dual X5] episode ended; arms remain held and the source is ready for the next Isaac connection."

@@ -1022,7 +1022,11 @@ def run_piperx_policy_leader_mirror_episode(
             print(f"\n[{checkpoint_label} Isaac] operator requested {action}.", flush=True)
             return True
 
-        while not task_env.is_episode_end():
+        # Raw collection is operator-terminated.  A reward/layout subsystem may
+        # still set end_flag while a correction is in progress, but that must
+        # never turn a second ``i`` into an implicit reset.  Only a delivered
+        # Left/Right terminal request is allowed to leave this loop in raw mode.
+        while raw_capture_enabled or not task_env.is_episode_end():
             if mode == "manual":
                 source_started = time.monotonic()
                 current = _measured_sim_state(task_env, robots)
@@ -1054,7 +1058,12 @@ def run_piperx_policy_leader_mirror_episode(
                     pending_release_edge = -1
                     print(
                         f"\n[{checkpoint_label} Isaac] manual OFF; "
-                        "stale chunk discarded; fresh inference.",
+                        "stale chunk discarded; fresh inference."
+                        + (
+                            " Only Left/Right can end or reset this raw attempt."
+                            if raw_capture_enabled
+                            else ""
+                        ),
                         flush=True,
                     )
                     continue
@@ -1233,7 +1242,10 @@ def run_piperx_policy_leader_mirror_episode(
                     pacer=pacer_s,
                     vision=vision_s,
                 )
-                if task_env.is_episode_end() or action_index + 1 == len(actions):
+                if (
+                    (not raw_capture_enabled and task_env.is_episode_end())
+                    or action_index + 1 == len(actions)
+                ):
                     break
                 model_client.call(func_name="update_obs", obs=obs)
             if terminal_request is not None:

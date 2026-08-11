@@ -57,6 +57,10 @@ class FakeHardware:
         self._target = DualX5TargetFromState(self.state)
         return self.state
 
+    def hold(self):
+        self.calls.append("hold")
+        return self._target
+
 
 def DualX5TargetFromState(state):
     return DualTarget(
@@ -142,6 +146,7 @@ class JointMirrorSessionTest(unittest.TestCase):
         exited = self.session.handle(request(3))
 
         self.assertEqual((exited["mode"], exited["edge"]), ("follow", "exit"))
+        self.assertIsNone(exited["terminal"])
         self.assertEqual(exited["boundary_monotonic_ns"], 2200)
         self.assertEqual(self.hardware.latched_target.left.q_rad, release_q)
         with self.assertRaises(source.X5SourceError):
@@ -149,6 +154,23 @@ class JointMirrorSessionTest(unittest.TestCase):
         zero = self.session.handle(request(5))
         self.assertEqual((zero["mode"], zero["edge"]), ("follow", None))
         self.assertIsNone(zero["boundary_monotonic_ns"])
+
+    def test_active_hold_recovery_retries_without_closing_hardware(self) -> None:
+        hardware = FakeHardware()
+        original = hardware.enter_hold
+        failures = iter((RuntimeError("first"), RuntimeError("second")))
+
+        def flaky_hold():
+            try:
+                raise next(failures)
+            except StopIteration:
+                return original()
+
+        hardware.enter_hold = flaky_hold
+
+        source._recover_active_hold(hardware, attempts=3, retry_delay_s=0.0)
+
+        self.assertEqual(hardware.calls[-2:], ["enter_hold", "hold"])
 
     def test_heartbeat_and_end_match_existing_client_envelope(self) -> None:
         heartbeat = self.session.handle({"type": "heartbeat", "seq": 1})

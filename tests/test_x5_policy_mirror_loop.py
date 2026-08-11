@@ -223,7 +223,10 @@ class X5PolicyMirrorLoopTest(unittest.TestCase):
             events,
         )
         task = _TaskEnv(events)
-        task.is_episode_end = lambda: False
+        # Even if another task subsystem marks the episode ended immediately
+        # after the manual action, raw mode must keep the same layout alive
+        # until an explicit Right/Left terminal event arrives.
+        task.is_episode_end = lambda: bool(task.actions)
         task.take_action_cnt = [7]
         task.task_name = "fill_pen_holder"
         task.eval_seed = 3
