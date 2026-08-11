@@ -203,30 +203,45 @@ class TiledCaptureManager:
     def reset(
         self,
     ):
+        """Reuse the live Replicator graph across an ordinary episode reset.
+
+        ``TaskEnv.reset`` is a soft reset: camera prim paths are preserved while
+        their poses and the task scene are updated.  Detaching and recreating an
+        annotator here leaves Isaac Sim's process-wide ``AnnotatorRegistry``
+        holding the already-invalid ``rgb`` node, so the second Left/Right
+        boundary fails before the next policy RESET can be sent.
+
+        The first environment reset still has to build the graph.  A real hard
+        reset goes through ``destroy``/``TaskEnv.close`` and therefore also
+        arrives here with no live tiled cameras.
         """
-        Soft Reset do not need to reset the replicator writer and camera.
-        Only Hard Reset need which means if we reset simulation backend we need to initialize camera again
-        Since Render product change, we also need to attch a new writer maybe
-        """
-        try:
-            for tiled_camera in list(self.tiled_cameras):
-                try:
-                    tiled_camera.destroy()
-                except Exception as exc:
-                    print(
-                        "[camera cleanup] reset teardown warning: "
-                        f"{type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-        finally:
-            self.tiled_cameras.clear()
-            self.tiled_render_products.clear()
-            self.annotator.clear()
-            self.annotator_type.clear()
-            self.annotator_device.clear()
-            self._output_buffers.clear()
+        self.cameras = self.camera_manager.cameras
+        self.camera_names = self.camera_manager.camera_names
+
+        if not self.tiled_cameras:
             self._updates_enabled = True
-        self.init_cameras()
+            self.init_cameras()
+            return
+
+        current_prim_paths = [
+            [camera.prim_path for camera in env_cameras]
+            for env_cameras in self.cameras
+        ]
+        graph_is_complete = (
+            len(self.tiled_cameras) == len(self.camera_names[0])
+            and all(
+                getattr(tiled_camera, "_render_product", None) is not None
+                for tiled_camera in self.tiled_cameras
+            )
+        )
+        if not graph_is_complete or current_prim_paths != self.camera_prim_paths:
+            raise RuntimeError(
+                "camera topology changed during a soft reset; refusing an unsafe "
+                "in-process Replicator rebuild"
+            )
+
+        if not self._updates_enabled:
+            self.set_updates_enabled(True)
 
     def destroy(self):
         """

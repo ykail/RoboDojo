@@ -54,6 +54,25 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     raise AssertionError(f"function {name!r} was not found")
 
 
+def _class_method(tree: ast.Module, class_name: str, method_name: str) -> ast.FunctionDef:
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name == method_name:
+                return item
+    raise AssertionError(f"method {class_name}.{method_name} was not found")
+
+
+def _load_capture_reset_contract():
+    tree = _tree("env/camera_manager/capture/tiled_capture_manager.py")
+    reset = _class_method(tree, "TiledCaptureManager", "reset")
+    module = ast.fix_missing_locations(ast.Module(body=[reset], type_ignores=[]))
+    namespace: dict[str, object] = {}
+    exec(compile(module, "<tiled-capture-reset-contract>", "exec"), namespace)
+    return namespace["reset"]
+
+
 class _Vector(list[float]):
     """Tiny element-wise vector used to execute mapping code without NumPy."""
 
@@ -203,6 +222,55 @@ def _load_episode_metadata_contract():
 
 
 class X5DaggerIntegrationTest(unittest.TestCase):
+    def test_episode_soft_reset_reuses_live_replicator_graph(self):
+        reset = _load_capture_reset_contract()
+
+        class Camera:
+            def __init__(self, prim_path: str):
+                self.prim_path = prim_path
+
+        class TiledCamera:
+            _render_product = object()
+
+            def destroy(self):
+                raise AssertionError("soft reset must not destroy a live camera graph")
+
+        init_calls: list[str] = []
+        update_calls: list[bool] = []
+        cameras = [[Camera("/World/envs/env_0/cam_high")]]
+        manager = SimpleNamespace(cameras=cameras, camera_names=[["cam_high"]])
+        capture = SimpleNamespace(
+            camera_manager=manager,
+            cameras=[],
+            camera_names=[],
+            tiled_cameras=[],
+            camera_prim_paths=[],
+            _updates_enabled=False,
+            init_cameras=lambda: init_calls.append("init"),
+            set_updates_enabled=update_calls.append,
+        )
+
+        # First reset builds the graph once.
+        reset(capture)
+        self.assertEqual(init_calls, ["init"])
+        self.assertTrue(capture._updates_enabled)
+
+        # Left/Right episode boundaries keep the existing graph and only make
+        # sure a previously paused intervention camera is resumed.
+        capture.tiled_cameras = [TiledCamera()]
+        capture.camera_prim_paths = [["/World/envs/env_0/cam_high"]]
+        capture._updates_enabled = False
+        reset(capture)
+        self.assertEqual(init_calls, ["init"])
+        self.assertEqual(update_calls, [True])
+
+        # A changed topology is a hard-reset condition.  Rebuilding it in the
+        # same process is the exact AnnotatorRegistry failure this guards.
+        capture.cameras = [[Camera("/World/envs/env_0/other_camera")]]
+        capture.camera_manager.cameras = capture.cameras
+        with self.assertRaisesRegex(RuntimeError, "camera topology changed"):
+            reset(capture)
+
     def test_x5_control_mode_is_accepted_and_dispatched_to_intervention_loop(self):
         main_tree = _tree("src/eval_client/main.py")
         mode_sets = []

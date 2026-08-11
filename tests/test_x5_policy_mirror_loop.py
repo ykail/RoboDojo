@@ -640,6 +640,50 @@ class X5PolicyMirrorLoopTest(unittest.TestCase):
         self.assertEqual(task.actions, [])
         self.assertEqual((task.success, task.end_flag), ([False], [True]))
 
+    def test_left_rolls_back_online_candidate_without_committing_episode(self) -> None:
+        events: list[str] = []
+        client = _Client([_response(), _response(terminal="retry")], events)
+        task = _TaskEnv(events)
+        task.is_episode_end = lambda: False
+        recorder = _Recorder(events)
+        recorder_module = ModuleType("src.eval_client.lerobot_stream_recorder")
+        recorder_module.recorder_for_env = lambda _task_env: recorder
+
+        with mock.patch.object(
+            mirror, "DualJointMirrorClient", return_value=client
+        ), mock.patch.object(
+            mirror, "_SinglePendingRecorder", _SynchronousPendingRecorder
+        ), mock.patch.dict(
+            sys.modules,
+            {"src.eval_client.lerobot_stream_recorder": recorder_module},
+        ), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "1",
+                "ROBODOJO_X5_RAW_CAPTURE": "0",
+                "ROBODOJO_REALTIME": "0",
+            },
+        ):
+            from src.eval_client.intervention_loop import InterventionRejected
+
+            with self.assertRaises(InterventionRejected):
+                mirror.run_piperx_policy_leader_mirror_episode(
+                    task,
+                    _Model(),
+                    allow_intervention=True,
+                )
+
+        self.assertEqual(len(recorder.finishes), 1)
+        self.assertEqual(
+            recorder.finishes[0],
+            {
+                "accepted": False,
+                "success": False,
+                "reason": "operator_discard_retry",
+            },
+        )
+
     def test_right_finishes_without_waiting_for_task_step_limit(self) -> None:
         events: list[str] = []
         client = _Client([_response(), _response(terminal="save")], events)
