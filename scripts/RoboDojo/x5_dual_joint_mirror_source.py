@@ -81,18 +81,18 @@ class _RawManualFragmentRecorder:
             )
         return left
 
-    def start_segment(self, boundary_monotonic_ns: int, anchor: DualState) -> None:
+    def start_segment(self, boundary_monotonic_ns: int, anchor: DualState) -> int:
         if self._finalized:
             raise X5SourceError("cannot append to a finalized X5 raw fragment")
         if self._active_segment is not None:
             raise X5SourceError("an X5 manual raw segment is already active")
-        if self._segments:
-            raise X5SourceError(
-                "raw collection accepts exactly one manual segment per episode"
-            )
         boundary = int(boundary_monotonic_ns)
         if boundary < 0:
             raise X5SourceError("manual segment boundary must be non-negative")
+        # Validate the anchor before mutating recorder state.  If this fails
+        # after the hardware entered teach, JointMirrorSession restores an
+        # active hold and the recorder remains ready to discard cleanly.
+        self._sample_timestamp_ns(anchor)
         index = len(self._segments)
         self._segments.append(
             {
@@ -105,7 +105,13 @@ class _RawManualFragmentRecorder:
         # enter_teach() returns the first feedback acquired after changing the
         # control mode.  Preserve it as the exact manual anchor as well as the
         # first trajectory sample; later deadline reads extend the segment.
-        self.observe(anchor)
+        try:
+            self.observe(anchor)
+        except BaseException:
+            self._segments.pop()
+            self._active_segment = None
+            raise
+        return index
 
     def observe(self, state: DualState) -> None:
         if self._active_segment is None or self._finalized:
@@ -120,9 +126,9 @@ class _RawManualFragmentRecorder:
             return
         self._samples.append((timestamp_ns, self._active_segment, state))
 
-    def end_segment(self, boundary_monotonic_ns: int) -> None:
+    def end_segment(self, boundary_monotonic_ns: int) -> int | None:
         if self._active_segment is None:
-            return
+            return None
         boundary = int(boundary_monotonic_ns)
         segment_index = self._active_segment
         segment = self._segments[segment_index]
@@ -138,6 +144,7 @@ class _RawManualFragmentRecorder:
             if item[1] != segment_index or item[0] <= boundary
         ]
         self._active_segment = None
+        return segment_index
 
     @staticmethod
     def _arm_q(states: list[DualState], side: str) -> np.ndarray:
@@ -383,6 +390,7 @@ class JointMirrorSession:
         boundary_monotonic_ns: int | None = None,
         measured: DualState | None = None,
         raw_fragment: dict[str, Any] | None = None,
+        raw_segment_index: int | None = None,
     ) -> dict[str, Any]:
         if measured is None:
             measured = self.hardware.read()
@@ -423,6 +431,9 @@ class JointMirrorSession:
             "boundary_monotonic_ns": (
                 None if boundary_monotonic_ns is None else int(boundary_monotonic_ns)
             ),
+            "raw_segment_index": (
+                None if raw_segment_index is None else int(raw_segment_index)
+            ),
             "sides": sides,
         }
         if request_type == "end":
@@ -437,9 +448,14 @@ class JointMirrorSession:
     ) -> dict[str, Any]:
         if self.ended:
             raise X5SourceError("joint-mirror session has ended")
-        request_type, seq, parsed = parse_request(payload, require_zero=self.require_zero)
+        required_zero_for_request = self.require_zero
+        request_type, seq, parsed = parse_request(
+            payload,
+            require_zero=required_zero_for_request,
+        )
         edge: str | None = None
         boundary_monotonic_ns: int | None = None
+        raw_segment_index: int | None = None
 
         if request_type == "end":
             self.hardware.enter_hold()
@@ -492,19 +508,62 @@ class JointMirrorSession:
                     boundary_monotonic_ns,
                     measured=measured,
                 )
+            if (
+                self.pending_transition == "enter"
+                and required_zero_for_request
+            ):
+                # After startup or an intervention exit, Isaac sends one zero
+                # synchronization request and requires a stable follow reply.
+                # A very fast next ``i`` may already be queued at this point;
+                # keep that edge pending for the following request instead of
+                # turning the mandatory zero acknowledgement into manual mode.
+                if self.mode != "follow":
+                    raise X5SourceError(
+                        "zero synchronization before manual entry requires follow mode"
+                    )
+                requested = {
+                    side: _target_for_side(self.follow_anchor.side(side), parsed[side])
+                    for side in SIDES
+                }
+                self.hardware.follow(DualTarget(requested["left"], requested["right"]))
+                self.require_zero = False
+                return self._response(
+                    request_type,
+                    seq,
+                    None,
+                    measured=measured,
+                )
             if self.pending_transition == "enter":
                 boundary_monotonic_ns = self.pending_transition_monotonic_ns
-                self.manual_anchor = self.hardware.enter_teach()
-                # The socket loop may have supplied its previous 100 Hz read.
-                # The transition response must instead expose the fresh state
-                # returned by enter_teach(), because that is the source anchor
-                # stored in the raw fragment and used by live relative mapping.
-                measured = self.manual_anchor
-                if self.raw_recorder is not None and boundary_monotonic_ns is not None:
-                    self.raw_recorder.start_segment(
-                        boundary_monotonic_ns,
-                        self.manual_anchor,
-                    )
+                try:
+                    self.manual_anchor = self.hardware.enter_teach()
+                    # The socket loop may have supplied its previous 100 Hz read.
+                    # The transition response must instead expose the fresh state
+                    # returned by enter_teach(), because that is the source anchor
+                    # stored in the raw fragment and used by live relative mapping.
+                    measured = self.manual_anchor
+                    if self.raw_recorder is not None and boundary_monotonic_ns is not None:
+                        raw_segment_index = self.raw_recorder.start_segment(
+                            boundary_monotonic_ns,
+                            self.manual_anchor,
+                        )
+                except Exception:
+                    # enter_teach() changes the real controller mode before raw
+                    # bookkeeping runs.  A recorder error must never escape
+                    # while leaving the arms in teach/damping-like behavior.
+                    self.mode = "follow"
+                    self.require_zero = True
+                    self.manual_anchor = None
+                    self.pending_transition = None
+                    self.pending_transition_monotonic_ns = None
+                    try:
+                        _recover_active_hold(self.hardware, attempts=None)
+                    except Exception as hold_exc:
+                        raise X5SourceError(
+                            "manual entry failed and active hold could not be restored"
+                        ) from hold_exc
+                    self.follow_anchor = self.hardware.latched_target
+                    raise
                 self.mode = "manual"
                 self.pending_transition = None
                 self.pending_transition_monotonic_ns = None
@@ -513,7 +572,11 @@ class JointMirrorSession:
                 boundary_monotonic_ns = self.pending_transition_monotonic_ns
                 self.hardware.enter_hold()
                 if self.raw_recorder is not None and boundary_monotonic_ns is not None:
-                    self.raw_recorder.end_segment(boundary_monotonic_ns)
+                    raw_segment_index = self.raw_recorder.end_segment(
+                        boundary_monotonic_ns
+                    )
+                    if raw_segment_index is None:
+                        raise X5SourceError("manual exit has no active X5 raw segment")
                 self.follow_anchor = self.hardware.latched_target
                 self.manual_anchor = None
                 self.mode = "follow"
@@ -539,6 +602,7 @@ class JointMirrorSession:
                 boundary_monotonic_ns if request_type == "joint_mirror" else None
             ),
             measured=measured,
+            raw_segment_index=raw_segment_index,
         )
 
     def disconnect(self) -> None:

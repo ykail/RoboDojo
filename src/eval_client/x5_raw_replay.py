@@ -49,6 +49,27 @@ def raw_bundle_id(bundle: RawBundle) -> str:
     return f"{digest}:{bundle.episode_index:07d}"
 
 
+def raw_segment_id(bundle: RawBundle, segment_index: int) -> str:
+    """Return the stable exactly-once identity of one LeRobot output unit.
+
+    Version-1 bundles already shipped with the parent bundle ID in episode
+    sidecars, so their sole segment deliberately keeps that identity.  Version
+    2 bundles append an explicit segment suffix; changing either spelling would
+    make a resumed collection duplicate previously committed episodes.
+    """
+
+    if isinstance(segment_index, bool) or not isinstance(segment_index, int):
+        raise TypeError("segment_index must be an integer")
+    if not 0 <= segment_index < bundle.segment_count:
+        raise IndexError(f"segment index out of range: {segment_index}")
+    parent = raw_bundle_id(bundle)
+    if int(bundle.manifest.get("format_version", 1)) == 1:
+        if bundle.segment_count != 1 or segment_index != 0:
+            raise X5RawReplayError("a version-1 raw bundle must contain one segment")
+        return parent
+    return f"{parent}:segment_{segment_index:04d}"
+
+
 def _anchor(manifest: dict[str, Any], name: str, side: str) -> tuple[np.ndarray, float]:
     table = manifest.get(name)
     if not isinstance(table, dict) or not isinstance(table.get(side), dict):
@@ -61,12 +82,21 @@ def _anchor(manifest: dict[str, Any], name: str, side: str) -> tuple[np.ndarray,
     return q, float(np.clip(grip, 0.0, 1.0))
 
 
-def actions_from_bundle(bundle: RawBundle, *, fps: int = 25) -> list[dict[str, np.ndarray]]:
-    """Map one source segment onto its simulator takeover anchor at true 25 Hz."""
+def actions_from_segment(
+    bundle: RawBundle,
+    segment_index: int,
+    *,
+    fps: int = 25,
+) -> list[dict[str, np.ndarray]]:
+    """Map one source segment onto its own simulator takeover anchor at 25 Hz."""
 
     if fps != 25:
         raise X5RawReplayError("canonical X5 replay is fixed at 25 Hz")
-    source = bundle.source
+    try:
+        segment = bundle.segments[segment_index]
+        source = bundle.source_for_segment(segment_index)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise X5RawReplayError(f"invalid raw segment {segment_index}: {exc}") from exc
     required = {
         "sample_monotonic_ns",
         "segment_start_ns",
@@ -87,29 +117,45 @@ def actions_from_bundle(bundle: RawBundle, *, fps: int = 25) -> list[dict[str, n
         raise X5RawReplayError(f"raw source is missing {missing}")
     starts = np.asarray(source["segment_start_ns"], dtype=np.int64).reshape(-1)
     ends = np.asarray(source["segment_end_ns"], dtype=np.int64).reshape(-1)
-    segment_index = np.asarray(source["segment_index"], dtype=np.int64).reshape(-1)
+    sample_segment_index = np.asarray(
+        source["segment_index"], dtype=np.int64
+    ).reshape(-1)
     timestamps = np.asarray(source["sample_monotonic_ns"], dtype=np.int64).reshape(-1)
-    if starts.shape != (1,) or ends.shape != (1,) or set(segment_index.tolist()) != {0}:
-        raise X5RawReplayError("a raw bundle must contain exactly one intervention segment")
+    if (
+        starts.shape != (1,)
+        or ends.shape != (1,)
+        or sample_segment_index.shape != timestamps.shape
+        or set(sample_segment_index.tolist()) != {segment.index}
+    ):
+        raise X5RawReplayError("raw source slice does not match its intervention segment")
     start_ns, end_ns = int(starts[0]), int(ends[0])
     anchor_timestamps = np.asarray(
         source["segment_anchor_timestamp_ns"], dtype=np.int64
     ).reshape(-1)
-    if end_ns <= start_ns or timestamps.size < 2:
-        raise X5RawReplayError("raw intervention segment is empty or too short")
+    if end_ns <= start_ns or timestamps.size < 1:
+        raise X5RawReplayError("raw intervention segment is empty or has invalid bounds")
     if (
         anchor_timestamps.shape != (1,)
         or int(anchor_timestamps[0]) < start_ns
         or int(anchor_timestamps[0]) > end_ns
     ):
         raise X5RawReplayError("invalid X5 takeover anchor timestamp")
-    if np.any(np.diff(timestamps) <= 0):
+    timestamp_deltas = np.diff(timestamps)
+    if np.any(timestamp_deltas <= 0):
         raise X5RawReplayError("raw source timestamps are not strictly increasing")
-    if float(np.max(np.diff(timestamps))) * 1e-9 > 0.1:
+    if timestamps.size == 1 and (end_ns - start_ns) * 1e-9 > 0.1:
+        raise X5RawReplayError(
+            "single-sample X5 segment exceeds 100 ms; refusing to invent a trajectory"
+        )
+    if timestamp_deltas.size and float(np.max(timestamp_deltas)) * 1e-9 > 0.1:
         raise X5RawReplayError(
             "raw X5 sampling gap exceeds 100 ms; refusing to invent a trajectory"
         )
-    mask = (timestamps >= start_ns) & (timestamps <= end_ns) & (segment_index == 0)
+    mask = (
+        (timestamps >= start_ns)
+        & (timestamps <= end_ns)
+        & (sample_segment_index == segment.index)
+    )
     sample_t = timestamps[mask]
     if sample_t.size < 1:
         raise X5RawReplayError("raw segment has no sample inside its key boundaries")
@@ -132,9 +178,9 @@ def actions_from_bundle(bundle: RawBundle, *, fps: int = 25) -> list[dict[str, n
         for _ in range(grid_ns.size)
     ]
     for side in SIDES:
-        sim_q, _ = _anchor(bundle.manifest, "sim_anchor", side)
+        sim_q, _ = _anchor(segment.manifest, "sim_anchor", side)
         source_q_anchor, source_grip_anchor = _anchor(
-            bundle.manifest, "source_anchor", side
+            segment.manifest, "source_anchor", side
         )
         recorded_anchor_q = np.asarray(
             source[f"{side}_segment_anchor_q_rad"], dtype=np.float64
@@ -197,6 +243,16 @@ def actions_from_bundle(bundle: RawBundle, *, fps: int = 25) -> list[dict[str, n
     return actions
 
 
+def actions_from_bundle(bundle: RawBundle, *, fps: int = 25) -> list[dict[str, np.ndarray]]:
+    """Compatibility entry point for a legacy or otherwise single segment bundle."""
+
+    if bundle.segment_count != 1:
+        raise X5RawReplayError(
+            "bundle has multiple intervention segments; use actions_from_segment"
+        )
+    return actions_from_segment(bundle, 0, fps=fps)
+
+
 def _dataset_path(dataset_root: str | os.PathLike[str], dataset_id: str) -> Path:
     root = Path(dataset_root).expanduser().resolve()
     result = (root / dataset_id).resolve()
@@ -240,12 +296,29 @@ def _committed_sidecars(dataset_path: Path) -> dict[str, Path]:
     return result
 
 
-def _marker_path(bundle: RawBundle) -> Path:
+def _is_legacy_bundle(bundle: RawBundle) -> bool:
+    return int(bundle.manifest.get("format_version", 1)) == 1
+
+
+def _parent_marker_path(bundle: RawBundle) -> Path:
     return bundle.path / "REPLAYED.json"
 
 
-def _read_marker(bundle: RawBundle) -> dict[str, Any] | None:
-    path = _marker_path(bundle)
+def _segment_marker_path(bundle: RawBundle, segment_index: int) -> Path:
+    if _is_legacy_bundle(bundle):
+        if segment_index != 0 or bundle.segment_count != 1:
+            raise X5RawReplayError("a version-1 bundle must contain one segment")
+        return _parent_marker_path(bundle)
+    return bundle.path / f"REPLAYED.segment_{segment_index:04d}.json"
+
+
+def _failure_marker_path(bundle: RawBundle, segment_index: int) -> Path:
+    if _is_legacy_bundle(bundle):
+        return bundle.path / "REPLAY_FAILED.json"
+    return bundle.path / f"REPLAY_FAILED.segment_{segment_index:04d}.json"
+
+
+def _read_marker(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
@@ -261,6 +334,7 @@ def _validate_marker(
     bundle: RawBundle,
     marker: dict[str, Any],
     *,
+    segment_index: int,
     identifier: str,
     dataset_path: Path,
     sidecar: Path | None,
@@ -271,6 +345,12 @@ def _validate_marker(
         raise X5RawReplayError(
             f"raw bundle was already replayed to another dataset: {bundle.path}"
         )
+    if not _is_legacy_bundle(bundle) and (
+        marker.get("raw_parent_bundle_id") != raw_bundle_id(bundle)
+        or marker.get("raw_segment_index") != segment_index
+        or marker.get("raw_segment_count") != bundle.segment_count
+    ):
+        raise X5RawReplayError(f"replay marker segment identity mismatch: {bundle.path}")
     if sidecar is not None and marker.get("episode_sidecar") != str(sidecar):
         raise X5RawReplayError(f"replay marker sidecar mismatch: {bundle.path}")
 
@@ -295,26 +375,37 @@ def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
 def _write_replayed_marker(
     bundle: RawBundle,
     *,
+    segment_index: int,
     identifier: str,
     dataset_path: Path,
     sidecar: Path,
 ) -> None:
     marker = {
-        "format_version": 1,
+        "format_version": 1 if _is_legacy_bundle(bundle) else 2,
         "raw_bundle_id": identifier,
+        "raw_parent_bundle_id": raw_bundle_id(bundle),
+        "raw_segment_index": int(segment_index),
+        "raw_segment_count": bundle.segment_count,
         "dataset_path": str(dataset_path),
         "episode_sidecar": str(sidecar),
         "committed_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
     }
-    _write_json_atomically(_marker_path(bundle), marker)
+    _write_json_atomically(_segment_marker_path(bundle, segment_index), marker)
 
 
-def _write_failure(bundle: RawBundle, identifier: str, exc: BaseException) -> None:
+def _write_failure(
+    bundle: RawBundle,
+    segment_index: int,
+    identifier: str,
+    exc: BaseException,
+) -> None:
     _write_json_atomically(
-        bundle.path / "REPLAY_FAILED.json",
+        _failure_marker_path(bundle, segment_index),
         {
-            "format_version": 1,
+            "format_version": 1 if _is_legacy_bundle(bundle) else 2,
             "raw_bundle_id": identifier,
+            "raw_parent_bundle_id": raw_bundle_id(bundle),
+            "raw_segment_index": int(segment_index),
             "failed_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
             "error_type": type(exc).__name__,
             "error": str(exc),
@@ -322,18 +413,76 @@ def _write_failure(bundle: RawBundle, identifier: str, exc: BaseException) -> No
     )
 
 
-def _replay_one_bundle(
+def _validate_parent_marker(
+    bundle: RawBundle,
+    marker: dict[str, Any],
+    *,
+    dataset_path: Path,
+    sidecars: list[Path],
+) -> None:
+    if _is_legacy_bundle(bundle):
+        raise X5RawReplayError("legacy replay marker is not a v2 parent marker")
+    expected_ids = [raw_segment_id(bundle, index) for index in range(bundle.segment_count)]
+    if (
+        marker.get("raw_parent_bundle_id") != raw_bundle_id(bundle)
+        or marker.get("raw_segment_count") != bundle.segment_count
+        or marker.get("raw_segment_ids") != expected_ids
+        or marker.get("dataset_path") != str(dataset_path)
+        or marker.get("episode_sidecars") != [str(path) for path in sidecars]
+    ):
+        raise X5RawReplayError(f"invalid parent replay marker: {bundle.path}")
+
+
+def _write_parent_marker(
+    bundle: RawBundle,
+    *,
+    dataset_path: Path,
+    sidecars: list[Path],
+) -> None:
+    if _is_legacy_bundle(bundle):
+        return
+    _write_json_atomically(
+        _parent_marker_path(bundle),
+        {
+            "format_version": 2,
+            "raw_parent_bundle_id": raw_bundle_id(bundle),
+            "raw_segment_count": bundle.segment_count,
+            "raw_segment_ids": [
+                raw_segment_id(bundle, index) for index in range(bundle.segment_count)
+            ],
+            "dataset_path": str(dataset_path),
+            "episode_sidecars": [str(path) for path in sidecars],
+            "committed_at": datetime.now(timezone.utc).isoformat(
+                timespec="microseconds"
+            ),
+        },
+    )
+
+
+def _replay_one_segment(
     task_env: Any,
     bundle: RawBundle,
+    segment_index: int,
     dataset_path: Path,
     *,
     fps: int,
     recorder_factory: Callable[[Any], Any],
     restore_fn: Callable[..., Any],
 ) -> None:
-    identifier = raw_bundle_id(bundle)
+    del dataset_path  # The writer path is pinned and checked by the collection entry.
+    segment = bundle.segments[segment_index]
+    identifier = raw_segment_id(bundle, segment_index)
     metadata = bundle.manifest.get("metadata", {})
-    snapshot = bundle.manifest.get("snapshot", {})
+    if not isinstance(metadata, dict):
+        raise X5RawReplayError(f"bundle metadata is not an object: {bundle.path}")
+    metadata = deepcopy(metadata)
+    segment_metadata = segment.manifest.get("metadata", {})
+    if not isinstance(segment_metadata, dict):
+        raise X5RawReplayError(
+            f"segment {segment_index} metadata is not an object: {bundle.path}"
+        )
+    metadata.update(deepcopy(segment_metadata))
+    snapshot = segment.snapshot
     provenance = metadata.get("policy_provenance")
     saved_layout = snapshot.get("replay_saved_layout")
     replay_manifest = snapshot.get("replay_manifest")
@@ -344,7 +493,7 @@ def _replay_one_bundle(
     layout_id = int(metadata.get("layout_id", -1))
     if layout_id < 0:
         raise X5RawReplayError(f"bundle has no valid layout id: {bundle.path}")
-    actions = actions_from_bundle(bundle, fps=fps)
+    actions = actions_from_segment(bundle, segment_index, fps=fps)
 
     task_env.control_mode = "x5_raw_replay_25hz"
     task_env.restore_saved_layout = deepcopy(saved_layout)
@@ -353,15 +502,18 @@ def _replay_one_bundle(
     task_env.reset(seed=[layout_id])
     restore_fn(
         task_env,
-        _ReplayState(manifest=deepcopy(replay_manifest), state=bundle.takeover_state),
+        _ReplayState(manifest=deepcopy(replay_manifest), state=segment.takeover_state),
         _reset_episode=False,
     )
     task_env.policy_provenance = deepcopy(provenance)
     task_env.policy_runtime = "robodojo_policy_v1"
     task_env.restore_lineage = {
         "raw_bundle_id": identifier,
+        "raw_parent_bundle_id": raw_bundle_id(bundle),
         "raw_bundle_path": str(bundle.path),
         "raw_episode_index": bundle.episode_index,
+        "raw_segment_index": segment_index,
+        "raw_segment_count": bundle.segment_count,
         "source_checkpoint": provenance.get("checkpoint_id", ""),
         "source_policy_provenance": deepcopy(provenance),
         "operator_accepted": bool(metadata.get("operator_accepted", True)),
@@ -399,7 +551,7 @@ def _replay_one_bundle(
         saved = recorder.finalize(
             accepted=True,
             success=replay_success,
-            reason="x5_raw_replay_operator_accepted",
+            reason=f"x5_raw_replay_segment_{segment_index:04d}_operator_accepted",
             timestamp_s=len(actions) / float(fps),
         )
         finalized = True
@@ -471,84 +623,133 @@ def run_x5_raw_replay_collection(
     skipped = 0
     newly_committed = 0
     failures: list[str] = []
-    attempted = 0
+    attempted_bundles = 0
     for bundle in bundles:
-        identifier = raw_bundle_id(bundle)
-        marker = _read_marker(bundle)
-        if identifier in committed:
-            sidecar = committed[identifier]
-            if marker is None:
-                # Covers a crash after LeRobot's atomic commit and before the
-                # raw status marker.  The durable output is the source of truth.
-                _write_replayed_marker(
-                    bundle,
-                    identifier=identifier,
-                    dataset_path=dataset_path,
-                    sidecar=sidecar,
+        identifiers = [
+            raw_segment_id(bundle, index) for index in range(bundle.segment_count)
+        ]
+        parent_marker = (
+            None
+            if _is_legacy_bundle(bundle)
+            else _read_marker(_parent_marker_path(bundle))
+        )
+        known_sidecars = [committed.get(identifier) for identifier in identifiers]
+        if parent_marker is not None:
+            if any(sidecar is None for sidecar in known_sidecars):
+                raise X5RawReplayError(
+                    f"parent replay marker exists but a segment sidecar is missing: {bundle.path}"
                 )
-            else:
+            _validate_parent_marker(
+                bundle,
+                parent_marker,
+                dataset_path=dataset_path,
+                sidecars=[sidecar for sidecar in known_sidecars if sidecar is not None],
+            )
+
+        needs_replay = any(identifier not in committed for identifier in identifiers)
+        if needs_replay and max_bundles and attempted_bundles >= max_bundles:
+            break
+        if needs_replay:
+            attempted_bundles += 1
+        print(
+            f"[X5 raw replay] {bundle.episode_index + 1}/{len(bundles)} "
+            f"parent={raw_bundle_id(bundle)} segments={bundle.segment_count}",
+            flush=True,
+        )
+        for segment_index, identifier in enumerate(identifiers):
+            marker_path = _segment_marker_path(bundle, segment_index)
+            marker = _read_marker(marker_path)
+            sidecar = committed.get(identifier)
+            if sidecar is not None:
+                if marker is None:
+                    # Covers a crash after LeRobot's atomic commit and before
+                    # the per-segment raw marker.
+                    _write_replayed_marker(
+                        bundle,
+                        segment_index=segment_index,
+                        identifier=identifier,
+                        dataset_path=dataset_path,
+                        sidecar=sidecar,
+                    )
+                else:
+                    _validate_marker(
+                        bundle,
+                        marker,
+                        segment_index=segment_index,
+                        identifier=identifier,
+                        dataset_path=dataset_path,
+                        sidecar=sidecar,
+                    )
+                skipped += 1
+                continue
+            if marker is not None:
                 _validate_marker(
                     bundle,
                     marker,
+                    segment_index=segment_index,
+                    identifier=identifier,
+                    dataset_path=dataset_path,
+                    sidecar=None,
+                )
+                raise X5RawReplayError(
+                    "segment marker exists but its LeRobot sidecar is missing: "
+                    f"{marker_path}"
+                )
+            try:
+                _replay_one_segment(
+                    task_env,
+                    bundle,
+                    segment_index,
+                    dataset_path,
+                    fps=fps,
+                    recorder_factory=_recorder_factory,
+                    restore_fn=_restore_fn,
+                )
+                committed = _committed_sidecars(dataset_path)
+                sidecar = committed.get(identifier)
+                if sidecar is None:
+                    raise X5RawReplayError(
+                        "LeRobot finalize returned but no provenance sidecar was committed"
+                    )
+                _write_replayed_marker(
+                    bundle,
+                    segment_index=segment_index,
                     identifier=identifier,
                     dataset_path=dataset_path,
                     sidecar=sidecar,
                 )
-            skipped += 1
-            continue
-        if marker is not None:
-            _validate_marker(
-                bundle,
-                marker,
-                identifier=identifier,
-                dataset_path=dataset_path,
-                sidecar=None,
-            )
-            raise X5RawReplayError(
-                f"bundle marker exists but its LeRobot sidecar is missing: {bundle.path}"
-            )
-        if max_bundles and attempted >= max_bundles:
-            break
-        attempted += 1
-        print(
-            f"[X5 raw replay] {bundle.episode_index + 1}/{len(bundles)} "
-            f"id={identifier}",
-            flush=True,
-        )
-        try:
-            _replay_one_bundle(
-                task_env,
-                bundle,
-                dataset_path,
-                fps=fps,
-                recorder_factory=_recorder_factory,
-                restore_fn=_restore_fn,
-            )
-            committed = _committed_sidecars(dataset_path)
-            sidecar = committed.get(identifier)
-            if sidecar is None:
-                raise X5RawReplayError(
-                    "LeRobot finalize returned but no provenance sidecar was committed"
+                _failure_marker_path(bundle, segment_index).unlink(missing_ok=True)
+                newly_committed += 1
+                print(
+                    f"[X5 raw replay] COMMITTED {identifier} -> {sidecar}",
+                    flush=True,
                 )
-            _write_replayed_marker(
-                bundle,
-                identifier=identifier,
-                dataset_path=dataset_path,
-                sidecar=sidecar,
-            )
-            (bundle.path / "REPLAY_FAILED.json").unlink(missing_ok=True)
-            newly_committed += 1
-            print(
-                f"[X5 raw replay] COMMITTED {identifier} -> {sidecar}",
-                flush=True,
-            )
-        except Exception as exc:
-            _write_failure(bundle, identifier, exc)
-            failures.append(f"{identifier}: {type(exc).__name__}: {exc}")
-            print(f"[X5 raw replay][ERROR] {failures[-1]}", flush=True)
+            except Exception as exc:
+                _write_failure(bundle, segment_index, identifier, exc)
+                failures.append(f"{identifier}: {type(exc).__name__}: {exc}")
+                print(f"[X5 raw replay][ERROR] {failures[-1]}", flush=True)
+
+        completed_sidecars = [committed.get(identifier) for identifier in identifiers]
+        if all(sidecar is not None for sidecar in completed_sidecars):
+            ordered_sidecars = [
+                sidecar for sidecar in completed_sidecars if sidecar is not None
+            ]
+            if parent_marker is None:
+                _write_parent_marker(
+                    bundle,
+                    dataset_path=dataset_path,
+                    sidecars=ordered_sidecars,
+                )
+            elif not _is_legacy_bundle(bundle):
+                _validate_parent_marker(
+                    bundle,
+                    parent_marker,
+                    dataset_path=dataset_path,
+                    sidecars=ordered_sidecars,
+                )
 
     summary = RawReplaySummary(
-        total=len(bundles),
+        total=sum(bundle.segment_count for bundle in bundles),
         already_committed=skipped,
         newly_committed=newly_committed,
         failed=tuple(failures),
@@ -561,7 +762,7 @@ def run_x5_raw_replay_collection(
     )
     if failures:
         raise X5RawReplayError(
-            f"{len(failures)} raw bundle(s) failed; successful outputs remain committed"
+            f"{len(failures)} raw segment(s) failed; successful outputs remain committed"
         )
     return summary
 
@@ -570,6 +771,8 @@ __all__ = [
     "RawReplaySummary",
     "X5RawReplayError",
     "actions_from_bundle",
+    "actions_from_segment",
     "raw_bundle_id",
+    "raw_segment_id",
     "run_x5_raw_replay_collection",
 ]

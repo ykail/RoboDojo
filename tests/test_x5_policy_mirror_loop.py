@@ -179,6 +179,7 @@ def _response(
     delta=0.0,
     sample_s=None,
     boundary_s=None,
+    raw_segment_index=None,
 ) -> dict:
     return {
         "mode": mode,
@@ -186,6 +187,7 @@ def _response(
         "terminal": terminal,
         "sample_monotonic_s": sample_s,
         "boundary_monotonic_s": boundary_s,
+        "raw_segment_index": raw_segment_index,
         "sides": {
             side: {
                 "measured_q_rad": np.full(6, delta),
@@ -198,7 +200,7 @@ def _response(
 
 
 class X5PolicyMirrorLoopTest(unittest.TestCase):
-    def test_raw_mode_atomically_commits_one_takeover_segment(self) -> None:
+    def test_raw_mode_atomically_commits_two_takeover_segments(self) -> None:
         events: list[str] = []
 
         class RawClient(_Client):
@@ -206,17 +208,21 @@ class X5PolicyMirrorLoopTest(unittest.TestCase):
                 return {
                     "path": "/tmp/source.npz",
                     "sha256": "sha256:" + "1" * 64,
-                    "sample_count": 20,
-                    "segment_count": 1,
+                    "sample_count": 40,
+                    "segment_count": 2,
                     "frequency_hz": 100.0,
                 }
 
         client = RawClient(
             [
                 _response(),
-                _response(mode="manual", edge="enter"),
+                _response(mode="manual", edge="enter", raw_segment_index=0),
                 _response(mode="manual", delta=0.1),
-                _response(mode="follow", edge="exit"),
+                _response(mode="follow", edge="exit", raw_segment_index=0),
+                _response(),
+                _response(mode="manual", edge="enter", raw_segment_index=1),
+                _response(mode="manual", delta=0.2),
+                _response(mode="follow", edge="exit", raw_segment_index=1),
                 _response(),
                 _response(terminal="save", boundary_s=12.0),
             ],
@@ -264,7 +270,7 @@ class X5PolicyMirrorLoopTest(unittest.TestCase):
             def target_reached(self):
                 return self.completed_count >= self.target_episodes
 
-            def commit(self, *args):
+            def commit_segments(self, *args):
                 self.commits.append(args)
                 self.completed_count += 1
                 return self.root / "pending/episode_0000000"
@@ -303,15 +309,25 @@ class X5PolicyMirrorLoopTest(unittest.TestCase):
         self.assertTrue(task.raw_collection_complete)
         self.assertEqual(Store.instance.completed_count, 1)
         self.assertEqual(len(Store.instance.commits), 1)
-        fragment, _, takeover, terminal, sim_anchor, source_anchor, metadata = (
-            Store.instance.commits[0]
+        fragment, segments, metadata = Store.instance.commits[0]
+        self.assertEqual(fragment["segment_count"], 2)
+        self.assertEqual(len(segments), 2)
+        self.assertIsNot(segments[0]["snapshotter"], segments[1]["snapshotter"])
+        self.assertEqual(int(segments[0]["takeover_state"]["frame.index"]), 7)
+        self.assertEqual(int(segments[0]["terminal_state"]["frame.index"]), 7)
+        self.assertEqual(int(segments[1]["takeover_state"]["frame.index"]), 7)
+        self.assertEqual(int(segments[1]["terminal_state"]["frame.index"]), 7)
+        self.assertEqual(segments[0]["sim_anchor"]["left"]["q_rad"].shape, (6,))
+        self.assertEqual(
+            segments[1]["source_anchor"]["right"]["q_rad"].shape,
+            (6,),
         )
-        self.assertEqual(fragment["segment_count"], 1)
-        self.assertEqual(int(takeover["frame.index"]), 7)
-        self.assertEqual(int(terminal["frame.index"]), 7)
-        self.assertEqual(sim_anchor["left"]["q_rad"].shape, (6,))
-        self.assertEqual(source_anchor["right"]["q_rad"].shape, (6,))
+        self.assertEqual(
+            [segment["metadata"]["source_segment_index"] for segment in segments],
+            [0, 1],
+        )
         self.assertEqual(metadata["layout_id"], 11)
+        self.assertEqual(metadata["intervention_segment_count"], 2)
 
     def test_recording_manual_frame_is_online_obs_t_action_t_before_next_obs(self) -> None:
         events: list[str] = []
