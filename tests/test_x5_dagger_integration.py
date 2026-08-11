@@ -73,6 +73,15 @@ def _load_capture_reset_contract():
     return namespace["reset"]
 
 
+def _load_camera_manager_reset_contract():
+    tree = _tree("env/camera_manager/camera_manager.py")
+    reset = _class_method(tree, "CameraManager", "reset")
+    module = ast.fix_missing_locations(ast.Module(body=[reset], type_ignores=[]))
+    namespace: dict[str, object] = {}
+    exec(compile(module, "<camera-manager-reset-contract>", "exec"), namespace)
+    return namespace["reset"]
+
+
 class _Vector(list[float]):
     """Tiny element-wise vector used to execute mapping code without NumPy."""
 
@@ -222,6 +231,26 @@ def _load_episode_metadata_contract():
 
 
 class X5DaggerIntegrationTest(unittest.TestCase):
+    def test_episode_soft_reset_never_replaces_camera_prims(self):
+        reset = _load_camera_manager_reset_contract()
+        events: list[object] = []
+        manager = SimpleNamespace(
+            num_envs=1,
+            _camera_handles_valid=lambda: True,
+            _rebuild_cameras=lambda: events.append("rebuild"),
+            post_init=lambda: events.append("post_init"),
+            init_camera_pose=lambda *, env_ids: events.append(("pose", env_ids)),
+            sim=SimpleNamespace(sim_step=lambda: events.append("sim_step")),
+        )
+
+        reset(manager)
+        self.assertEqual(events, ["post_init", ("pose", [0]), "sim_step"])
+
+        manager._camera_handles_valid = lambda: False
+        with self.assertRaisesRegex(RuntimeError, "camera handles became invalid"):
+            reset(manager)
+        self.assertNotIn("rebuild", events)
+
     def test_episode_soft_reset_reuses_live_replicator_graph(self):
         reset = _load_capture_reset_contract()
 

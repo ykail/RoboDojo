@@ -441,9 +441,14 @@ class CameraManager:
         Reset the camera manager for specific environments.
         This method should only be called when resetting the environment.
         """
-        # If the scene was hard-reset, previous prim handles may be invalid
+        # TaskEnv.reset is a soft reset and the live Replicator graph still
+        # targets these prims.  Replacing camera prims here would silently
+        # invalidate that graph before TiledCaptureManager can reuse it.
         if not self._camera_handles_valid():
-            self._rebuild_cameras()
+            raise RuntimeError(
+                "camera handles became invalid during a soft reset; refusing an "
+                "unsafe in-process camera rebuild"
+            )
 
         # Implementation for resetting camera configurations
         self.post_init()
