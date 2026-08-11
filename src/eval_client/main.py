@@ -1291,7 +1291,13 @@ def main():
     close_piperx_bridge_session()
     _close_model_client(env)
     env._robodojo_final_shutdown = True
-    env.close()
+    # In the X5 GUI collector the active viewport may still reference one of
+    # the task cameras.  Explicit env.close() deletes that camera before Kit
+    # has disconnected the viewport callback, producing a harmless but noisy
+    # None/GetCamera traceback during final shutdown.  SimulationApp owns the
+    # complete final teardown and releases these resources in dependency order.
+    if control_mode != "x5_policy_joint_intervention":
+        env.close()
     simulation_app.close()
     if operator_fatal_error is not None:
         raise operator_fatal_error

@@ -139,8 +139,8 @@ def audit(dataset: Path, episode_index: int | None) -> None:
             f"parquet={human_rows}, source={manual_source}, output={manual_output}"
         )
     human_indices = np.flatnonzero(mask >= 0.5)
-    if human_indices[0] == 0 or human_indices[-1] == rows - 1:
-        _fail("pilot must contain policy both before and after intervention")
+    starts_with_policy = bool(human_indices[0] > 0)
+    resumes_policy = bool(human_indices[-1] < rows - 1)
 
     wall_elapsed = sidecar.get("robodojo_source_wall_elapsed_s", [])
     source_is_manual = sidecar.get("robodojo_source_is_manual", [])
@@ -178,13 +178,38 @@ def audit(dataset: Path, episode_index: int | None) -> None:
         f"policy={policy_rows} human={human_rows}"
     )
     print(
+        f"[AUDIT] sequence starts_with_policy={starts_with_policy} "
+        f"resumes_policy_after_human={resumes_policy}"
+    )
+    print(
         "[AUDIT] arm target max-joint delta: "
         f"policy p95/max={delta_stats['policy'][0]:.2f}/{delta_stats['policy'][1]:.2f} deg; "
         f"human p95/max={delta_stats['human'][0]:.2f}/{delta_stats['human'][1]:.2f} deg"
     )
     print(f"[AUDIT] max consecutive manual wall gap={max_manual_gap_ms:.0f} ms")
+    if not starts_with_policy:
+        print("[AUDIT][WARN] episode begins in human mode; no policy prefix was recorded")
+    if not resumes_policy:
+        print(
+            "[AUDIT][WARN] episode ends in human mode; valid as a correction trajectory, "
+            "but it does not validate second-i policy resume"
+        )
+    if max_manual_gap_ms > 120.0:
+        print(
+            "[AUDIT][WARN] manual source is slower than wall-time 25 Hz; "
+            "judge the action-delta tail before batch collection"
+        )
+    policy_p95, policy_max = delta_stats["policy"]
+    human_p95, human_max = delta_stats["human"]
+    if human_p95 > max(5.0, 1.5 * policy_p95) or human_max > max(
+        10.0, 1.5 * policy_max
+    ):
+        print(
+            "[AUDIT][WARN] human target has a larger fast-motion tail than policy; "
+            "move the X5 more slowly/smoothly or review these frames before training"
+        )
     print(
-        "[AUDIT] PASS: complete policy→human→policy episode, one row per simulator "
+        "[AUDIT] PASS: complete mixed policy/human episode, one row per simulator "
         "transition, uniform 25 Hz sim-time, and matching videos"
     )
 
