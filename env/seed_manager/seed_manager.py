@@ -119,5 +119,40 @@ class SeedManager:
         self.cycle_index += 1
         return self.get_seeds(max_count=max_count)
 
+    def resume_cyclic_after(self, layout_id: int, cycle_index: int) -> tuple[int, int]:
+        """Place the operator cursor immediately after one durable layout.
+
+        Raw DAgger bundles store both the layout id and cycle at commit time.
+        Restoring from that durable boundary avoids repeating layout zero after
+        a process restart and remains correct when an unstable layout was
+        skipped without producing a bundle.
+        """
+
+        if isinstance(layout_id, bool) or not isinstance(layout_id, int):
+            raise ValueError("resume layout_id must be an integer")
+        if (
+            isinstance(cycle_index, bool)
+            or not isinstance(cycle_index, int)
+            or cycle_index < 0
+        ):
+            raise ValueError("resume cycle_index must be a non-negative integer")
+        if self.ed_idx <= 0 or not self.seed_list:
+            raise ValueError("cannot resume an empty cyclic layout list")
+        try:
+            position = self.seed_list.index(layout_id)
+        except ValueError as exc:
+            raise ValueError(
+                f"resume layout {layout_id} is absent from the current seed list"
+            ) from exc
+        next_position = position + 1
+        if next_position >= self.ed_idx:
+            self.idx = 0
+            self.cycle_index = cycle_index + 1
+        else:
+            self.idx = next_position
+            self.cycle_index = cycle_index
+        self._current_batch_seeds = None
+        return self.seed_list[self.idx], self.cycle_index
+
     def eval_step(self):
         self._current_batch_seeds = None

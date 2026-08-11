@@ -37,6 +37,29 @@ class SeedManagerOperatorCycleTest(unittest.TestCase):
         self.assertIsNone(manager.get_seeds(max_count=1))
         self.assertEqual(manager.cycle_index, 0)
 
+    def test_resume_cyclic_after_continues_in_same_cycle(self):
+        manager = self.make_manager([0, 1, 2])
+
+        self.assertEqual(manager.resume_cyclic_after(1, 4), (2, 4))
+        self.assertEqual(manager.get_cyclic_seeds(max_count=1), [2])
+        self.assertEqual(manager.get_cyclic_seeds(max_count=1), [0])
+        self.assertEqual(manager.cycle_index, 5)
+
+    def test_resume_cyclic_after_last_layout_wraps_once(self):
+        manager = self.make_manager([0, 1, 2])
+
+        self.assertEqual(manager.resume_cyclic_after(2, 4), (0, 5))
+        self.assertEqual(manager.get_cyclic_seeds(max_count=1), [0])
+        self.assertEqual(manager.cycle_index, 5)
+
+    def test_resume_cyclic_after_rejects_invalid_cursor(self):
+        manager = self.make_manager([0, 1, 2])
+
+        with self.assertRaisesRegex(ValueError, "absent"):
+            manager.resume_cyclic_after(9, 0)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            manager.resume_cyclic_after(1, -1)
+
 
 if __name__ == "__main__":
     unittest.main()

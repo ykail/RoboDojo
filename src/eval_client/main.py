@@ -975,6 +975,30 @@ def main():
             simulation_app.close()
         return
     eval_time = env.success_nums + env.fail_nums
+    if (
+        control_mode == "x5_policy_joint_intervention"
+        and os.environ.get("ROBODOJO_X5_RAW_CAPTURE", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        from pathlib import Path
+
+        from src.eval_client.x5_raw_bundle import load_pending_bundles
+
+        raw_root = os.environ.get("ROBODOJO_X5_RAW_ROOT", "").strip()
+        if raw_root and (Path(raw_root) / "collection.json").is_file():
+            bundles = load_pending_bundles(raw_root, verify=True)
+            if bundles:
+                metadata = bundles[-1].manifest.get("metadata", {})
+                next_layout, next_cycle = env.seed_manager.resume_cyclic_after(
+                    metadata.get("layout_id"),
+                    metadata.get("layout_cycle"),
+                )
+                print(
+                    "[X5 raw] resumed layout cursor after "
+                    f"{len(bundles)} commit(s): next cycle={next_cycle} "
+                    f"layout={next_layout}.",
+                    flush=True,
+                )
     if operator_driven:
         env.env_seeds = env.seed_manager.get_cyclic_seeds(max_count=1)
     elif eval_time >= eval_num:
