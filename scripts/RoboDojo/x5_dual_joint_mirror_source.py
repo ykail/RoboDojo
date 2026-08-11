@@ -9,6 +9,7 @@ robots are both ARX X5, so follow targets use identity relative joint deltas.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -22,8 +23,11 @@ import termios
 import threading
 import time
 import tty
+import uuid
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,9 +49,195 @@ PROFILE = "arx_x5_identity_joint_v1"
 CONTROL_MODE = "x5_policy_joint_intervention"
 PROTOCOL = "robodojo_dual_joint_mirror_v1"
 JOINT_DOF = 6
+RAW_FRAGMENT_FORMAT = "robodojo_x5_manual_fragment_v1"
 
 class X5SourceError(RuntimeError):
     pass
+
+
+class _RawManualFragmentRecorder:
+    """Accumulate manual X5 feedback and atomically publish one compact NPZ.
+
+    Hardware access deliberately does not live here.  ``observe`` receives
+    states read by the socket server's single serial loop, so the ARX SDK is
+    never entered concurrently by a sampling worker and a control request.
+    """
+
+    def __init__(self, root: Path, *, frequency_hz: float) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.frequency_hz = float(frequency_hz)
+        self._samples: list[tuple[int, int, DualState]] = []
+        self._segments: list[dict[str, Any]] = []
+        self._active_segment: int | None = None
+        self._finalized = False
+
+    @staticmethod
+    def _sample_timestamp_ns(state: DualState) -> int:
+        left = int(state.left.sample_monotonic_ns)
+        right = int(state.right.sample_monotonic_ns)
+        if left != right or left < 0:
+            raise X5SourceError(
+                "left/right X5 raw samples must share one non-negative monotonic timestamp"
+            )
+        return left
+
+    def start_segment(self, boundary_monotonic_ns: int, anchor: DualState) -> None:
+        if self._finalized:
+            raise X5SourceError("cannot append to a finalized X5 raw fragment")
+        if self._active_segment is not None:
+            raise X5SourceError("an X5 manual raw segment is already active")
+        if self._segments:
+            raise X5SourceError(
+                "raw collection accepts exactly one manual segment per episode"
+            )
+        boundary = int(boundary_monotonic_ns)
+        if boundary < 0:
+            raise X5SourceError("manual segment boundary must be non-negative")
+        index = len(self._segments)
+        self._segments.append(
+            {
+                "start_ns": boundary,
+                "end_ns": None,
+                "anchor": anchor,
+            }
+        )
+        self._active_segment = index
+        # enter_teach() returns the first feedback acquired after changing the
+        # control mode.  Preserve it as the exact manual anchor as well as the
+        # first trajectory sample; later deadline reads extend the segment.
+        self.observe(anchor)
+
+    def observe(self, state: DualState) -> None:
+        if self._active_segment is None or self._finalized:
+            return
+        timestamp_ns = self._sample_timestamp_ns(state)
+        segment = self._segments[self._active_segment]
+        if timestamp_ns < int(segment["start_ns"]):
+            return
+        if self._samples and timestamp_ns <= self._samples[-1][0]:
+            # SDK feedback occasionally exposes the same cached timestamp on
+            # two adjacent polls.  It is not a new physical sample.
+            return
+        self._samples.append((timestamp_ns, self._active_segment, state))
+
+    def end_segment(self, boundary_monotonic_ns: int) -> None:
+        if self._active_segment is None:
+            return
+        boundary = int(boundary_monotonic_ns)
+        segment_index = self._active_segment
+        segment = self._segments[segment_index]
+        if boundary < int(segment["start_ns"]):
+            raise X5SourceError("manual end boundary precedes its start boundary")
+        segment["end_ns"] = boundary
+        # Key events are timestamped before the next socket boundary.  A
+        # deadline read can therefore land after Right/exit but before Isaac
+        # acknowledges it.  Exclude those future samples exactly at commit.
+        self._samples = [
+            item
+            for item in self._samples
+            if item[1] != segment_index or item[0] <= boundary
+        ]
+        self._active_segment = None
+
+    @staticmethod
+    def _arm_q(states: list[DualState], side: str) -> np.ndarray:
+        if not states:
+            return np.empty((0, JOINT_DOF), dtype=np.float64)
+        result = np.asarray([state.side(side).q_rad for state in states], dtype=np.float64)
+        if result.shape != (len(states), JOINT_DOF) or not np.isfinite(result).all():
+            raise X5SourceError(f"invalid {side} X5 raw joint samples")
+        return result
+
+    @staticmethod
+    def _arm_gripper(states: list[DualState], side: str) -> np.ndarray:
+        result = np.asarray(
+            [state.side(side).gripper_open_fraction for state in states],
+            dtype=np.float64,
+        )
+        if result.shape != (len(states),) or not np.isfinite(result).all():
+            raise X5SourceError(f"invalid {side} X5 raw gripper samples")
+        return result
+
+    def _arrays(self) -> dict[str, np.ndarray]:
+        if self._active_segment is not None:
+            raise X5SourceError("cannot finalize while an X5 manual segment is active")
+        states = [item[2] for item in self._samples]
+        anchors = [item["anchor"] for item in self._segments]
+        ends = [item["end_ns"] for item in self._segments]
+        if any(value is None for value in ends):
+            raise X5SourceError("cannot finalize an X5 fragment with an open segment")
+        return {
+            "sample_monotonic_ns": np.asarray(
+                [item[0] for item in self._samples], dtype=np.int64
+            ),
+            "segment_index": np.asarray([item[1] for item in self._samples], dtype=np.int32),
+            "left_q_rad": self._arm_q(states, "left"),
+            "right_q_rad": self._arm_q(states, "right"),
+            "left_gripper_open_fraction": self._arm_gripper(states, "left"),
+            "right_gripper_open_fraction": self._arm_gripper(states, "right"),
+            "segment_start_ns": np.asarray(
+                [item["start_ns"] for item in self._segments], dtype=np.int64
+            ),
+            "segment_end_ns": np.asarray(ends, dtype=np.int64),
+            "segment_anchor_timestamp_ns": np.asarray(
+                [self._sample_timestamp_ns(item) for item in anchors], dtype=np.int64
+            ),
+            "left_segment_anchor_q_rad": self._arm_q(anchors, "left"),
+            "right_segment_anchor_q_rad": self._arm_q(anchors, "right"),
+            "left_segment_anchor_gripper_open_fraction": self._arm_gripper(
+                anchors, "left"
+            ),
+            "right_segment_anchor_gripper_open_fraction": self._arm_gripper(
+                anchors, "right"
+            ),
+            "format_version": np.asarray(1, dtype=np.int32),
+            "sampling_frequency_hz": np.asarray(self.frequency_hz, dtype=np.float64),
+        }
+
+    def finalize(self) -> dict[str, Any]:
+        if self._finalized:
+            raise X5SourceError("X5 raw fragment was already finalized")
+        arrays = self._arrays()
+        self.root.mkdir(parents=True, exist_ok=True)
+        stem = f"x5_manual_{time.monotonic_ns()}_{os.getpid()}_{uuid.uuid4().hex}"
+        partial = self.root / f".{stem}.npz.partial"
+        final = self.root / f"{stem}.npz"
+        try:
+            with partial.open("xb") as stream:
+                # Uncompressed NPZ is intentionally used here: Right should
+                # return quickly, while the bundle store will copy it once.
+                np.savez(stream, **arrays)
+                stream.flush()
+                os.fsync(stream.fileno())
+            digest = hashlib.sha256()
+            with partial.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            os.replace(partial, final)
+            directory_fd = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except BaseException:
+            if partial.exists():
+                partial.unlink()
+            raise
+        self._finalized = True
+        return {
+            "format": RAW_FRAGMENT_FORMAT,
+            "path": str(final),
+            "sha256": "sha256:" + digest.hexdigest(),
+            "sample_count": int(arrays["sample_monotonic_ns"].shape[0]),
+            "segment_count": int(arrays["segment_start_ns"].shape[0]),
+            "frequency_hz": self.frequency_hz,
+        }
+
+    def discard(self) -> None:
+        self._samples.clear()
+        self._segments.clear()
+        self._active_segment = None
+        self._finalized = True
 
 
 def _finite_vector(value: Any, *, name: str) -> tuple[float, ...]:
@@ -123,7 +313,13 @@ def _target_for_side(
 class JointMirrorSession:
     """Pure request/session state machine around a serial dual-X5 backend."""
 
-    def __init__(self, hardware: DualX5Hardware) -> None:
+    def __init__(
+        self,
+        hardware: DualX5Hardware,
+        *,
+        raw_root: Path | None = None,
+        raw_frequency_hz: float = 100.0,
+    ) -> None:
         self.hardware = hardware
         self.mode = "follow"
         self.require_zero = True
@@ -135,6 +331,17 @@ class JointMirrorSession:
         self.manual_anchor: DualState | None = None
         self.follow_anchor = hardware.latched_target
         self.ended = False
+        self.raw_recorder = (
+            None
+            if raw_root is None
+            else _RawManualFragmentRecorder(raw_root, frequency_hz=raw_frequency_hz)
+        )
+
+    def observe_hardware(self, measured: DualState) -> None:
+        """Accept one deadline-driven read from the serial server loop."""
+
+        if self.raw_recorder is not None:
+            self.raw_recorder.observe(measured)
 
     def toggle_intervention(self, event_monotonic_ns: int | None = None) -> bool:
         if (
@@ -174,8 +381,11 @@ class JointMirrorSession:
         edge: str | None,
         terminal: str | None = None,
         boundary_monotonic_ns: int | None = None,
+        measured: DualState | None = None,
+        raw_fragment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        measured = self.hardware.read()
+        if measured is None:
+            measured = self.hardware.read()
         sample_monotonic_ns = int(measured.left.sample_monotonic_ns)
         if int(measured.right.sample_monotonic_ns) != sample_monotonic_ns:
             raise X5SourceError("left/right X5 samples do not share one monotonic timestamp")
@@ -202,7 +412,7 @@ class JointMirrorSession:
                     state.gripper_open_fraction - anchor.gripper_open_fraction
                 )
             sides[side] = item
-        return {
+        response = {
             "ok": True,
             "type": request_type,
             "seq": seq,
@@ -215,8 +425,16 @@ class JointMirrorSession:
             ),
             "sides": sides,
         }
+        if request_type == "end":
+            response["raw_fragment"] = raw_fragment
+        return response
 
-    def handle(self, payload: Any) -> dict[str, Any]:
+    def handle(
+        self,
+        payload: Any,
+        *,
+        measured: DualState | None = None,
+    ) -> dict[str, Any]:
         if self.ended:
             raise X5SourceError("joint-mirror session has ended")
         request_type, seq, parsed = parse_request(payload, require_zero=self.require_zero)
@@ -231,7 +449,19 @@ class JointMirrorSession:
             self.pending_terminal = None
             self.pending_terminal_monotonic_ns = None
             self.manual_anchor = None
-            response = self._response(request_type, seq, None)
+            raw_fragment = None
+            if self.raw_recorder is not None:
+                if self.terminal_delivered == "save":
+                    raw_fragment = self.raw_recorder.finalize()
+                else:
+                    self.raw_recorder.discard()
+            response = self._response(
+                request_type,
+                seq,
+                None,
+                measured=measured,
+                raw_fragment=raw_fragment,
+            )
             self.ended = True
             return response
 
@@ -249,6 +479,8 @@ class JointMirrorSession:
                 self.require_zero = True
                 terminal = self.pending_terminal
                 boundary_monotonic_ns = self.pending_terminal_monotonic_ns
+                if self.raw_recorder is not None and boundary_monotonic_ns is not None:
+                    self.raw_recorder.end_segment(boundary_monotonic_ns)
                 self.pending_terminal = None
                 self.pending_terminal_monotonic_ns = None
                 self.terminal_delivered = terminal
@@ -258,10 +490,21 @@ class JointMirrorSession:
                     None,
                     terminal,
                     boundary_monotonic_ns,
+                    measured=measured,
                 )
             if self.pending_transition == "enter":
                 boundary_monotonic_ns = self.pending_transition_monotonic_ns
                 self.manual_anchor = self.hardware.enter_teach()
+                # The socket loop may have supplied its previous 100 Hz read.
+                # The transition response must instead expose the fresh state
+                # returned by enter_teach(), because that is the source anchor
+                # stored in the raw fragment and used by live relative mapping.
+                measured = self.manual_anchor
+                if self.raw_recorder is not None and boundary_monotonic_ns is not None:
+                    self.raw_recorder.start_segment(
+                        boundary_monotonic_ns,
+                        self.manual_anchor,
+                    )
                 self.mode = "manual"
                 self.pending_transition = None
                 self.pending_transition_monotonic_ns = None
@@ -269,6 +512,8 @@ class JointMirrorSession:
             elif self.pending_transition == "exit":
                 boundary_monotonic_ns = self.pending_transition_monotonic_ns
                 self.hardware.enter_hold()
+                if self.raw_recorder is not None and boundary_monotonic_ns is not None:
+                    self.raw_recorder.end_segment(boundary_monotonic_ns)
                 self.follow_anchor = self.hardware.latched_target
                 self.manual_anchor = None
                 self.mode = "follow"
@@ -293,6 +538,7 @@ class JointMirrorSession:
             boundary_monotonic_ns=(
                 boundary_monotonic_ns if request_type == "joint_mirror" else None
             ),
+            measured=measured,
         )
 
     def disconnect(self) -> None:
@@ -304,6 +550,8 @@ class JointMirrorSession:
         self.pending_terminal = None
         self.pending_terminal_monotonic_ns = None
         self.manual_anchor = None
+        if self.raw_recorder is not None and not self.ended:
+            self.raw_recorder.discard()
 
 
 class _KeyReader:
@@ -531,6 +779,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--left-model", default="X5")
     parser.add_argument("--right-model", default="X5")
     parser.add_argument("--frequency-hz", type=float, default=100.0)
+    parser.add_argument(
+        "--raw-root",
+        type=Path,
+        help="Write accepted manual X5 NPZ fragments below this directory.",
+    )
     parser.add_argument("--follow-preview-s", type=float, default=0.04)
     parser.add_argument("--liveness-timeout-s", type=float, default=1.5)
     parser.add_argument("--home-rad", type=float, nargs=6, default=(0.0,) * 6)
@@ -595,13 +848,20 @@ def _serve_connection(
     *,
     period_s: float,
     liveness_timeout_s: float,
+    raw_root: Path | None = None,
 ) -> tuple[bool, bool, str | None]:
     """Return ``(quit_requested, clean_end, terminal)`` for one connection."""
 
-    session = JointMirrorSession(hardware)
-    conn.settimeout(min(0.1, max(0.005, period_s)))
+    session = JointMirrorSession(
+        hardware,
+        raw_root=raw_root,
+        raw_frequency_hz=1.0 / period_s,
+    )
     buffer = b""
     last_liveness = time.monotonic()
+    raw_sampling_enabled = raw_root is not None
+    next_sample_deadline = time.monotonic()
+    latest_measured: DualState | None = None
     while True:
         key_event = keys.poll()
         key = None if key_event is None else key_event[0]
@@ -623,6 +883,19 @@ def _serve_connection(
                     f"\n[Dual X5] {label} requested; holding at the next Isaac boundary.",
                     flush=True,
                 )
+        now = time.monotonic()
+        if raw_sampling_enabled and now >= next_sample_deadline:
+            latest_measured = hardware.read()
+            session.observe_hardware(latest_measured)
+            now = time.monotonic()
+            skipped = max(1, math.floor((now - next_sample_deadline) / period_s) + 1)
+            next_sample_deadline += skipped * period_s
+        until_sample = (
+            max(0.0005, next_sample_deadline - time.monotonic())
+            if raw_sampling_enabled
+            else max(0.005, period_s)
+        )
+        conn.settimeout(min(0.1, until_sample))
         try:
             chunk = conn.recv(65536)
         except socket.timeout:
@@ -653,7 +926,7 @@ def _serve_connection(
                 session.disconnect()
                 raise X5SourceError(f"invalid JSON request: {raw!r}") from exc
             last_liveness = time.monotonic()
-            response = session.handle(payload)
+            response = session.handle(payload, measured=latest_measured)
             _send(conn, response)
             edge = response["edge"]
             if edge == "enter":
@@ -726,6 +999,7 @@ def run_server(args: argparse.Namespace, *, hardware: DualX5Hardware | None = No
                             keys,
                             period_s=1.0 / args.frequency_hz,
                             liveness_timeout_s=args.liveness_timeout_s,
+                            raw_root=args.raw_root,
                         )
                     except (OSError, X5SourceError, X5HardwareError) as exc:
                         hardware.enter_hold()

@@ -77,6 +77,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 "piperx_sim_follow_j1",
                 "piperx_dual_joint_test",
                 "piperx_restore_recovery",
+                "x5_raw_replay_25hz",
             }
             self.restore_saved_layout = self.eval_cfg.get("restore_saved_layout", None)
             self.observation_mode = self.control_mode == "keyboard_observe"
@@ -92,6 +93,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         "piperx_dual_joint_test",
                         "x5_policy_joint_intervention",
                         "piperx_restore_recovery",
+                        "x5_raw_replay_25hz",
                     },
                 )
             )
@@ -99,7 +101,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 "ROBODOJO_DUAL_MIRROR_RECORD",
                 "0",
             ).strip().lower()
-            self.stream_eval_videos = not (
+            self.stream_eval_videos = self.control_mode != "x5_raw_replay_25hz" and not (
                 self.control_mode == "x5_policy_joint_intervention"
                 and dual_record_value in {"1", "true", "yes", "on"}
             )
@@ -343,7 +345,8 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             for idx in range(self.num_envs):
                 saved_layout = (
                     deepcopy(self.restore_saved_layout)
-                    if self.control_mode == "piperx_restore_recovery"
+                    if self.control_mode
+                    in {"piperx_restore_recovery", "x5_raw_replay_25hz"}
                     and self.restore_saved_layout is not None
                     else self.seed_manager.get_seed_scene_info(self.env_seeds[idx])
                 )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from types import ModuleType
 from types import SimpleNamespace
+from pathlib import Path
 import unittest
 from unittest import mock
 
@@ -187,6 +188,7 @@ def _response(
         "boundary_monotonic_s": boundary_s,
         "sides": {
             side: {
+                "measured_q_rad": np.full(6, delta),
                 "leader_delta_q_rad": np.full(6, delta),
                 "leader_gripper_open_fraction": 0.5,
             }
@@ -196,6 +198,118 @@ def _response(
 
 
 class X5PolicyMirrorLoopTest(unittest.TestCase):
+    def test_raw_mode_atomically_commits_one_takeover_segment(self) -> None:
+        events: list[str] = []
+
+        class RawClient(_Client):
+            def end(self):
+                return {
+                    "path": "/tmp/source.npz",
+                    "sha256": "sha256:" + "1" * 64,
+                    "sample_count": 20,
+                    "segment_count": 1,
+                    "frequency_hz": 100.0,
+                }
+
+        client = RawClient(
+            [
+                _response(),
+                _response(mode="manual", edge="enter"),
+                _response(mode="manual", delta=0.1),
+                _response(mode="follow", edge="exit"),
+                _response(),
+                _response(terminal="save", boundary_s=12.0),
+            ],
+            events,
+        )
+        task = _TaskEnv(events)
+        task.is_episode_end = lambda: False
+        task.take_action_cnt = [7]
+        task.task_name = "fill_pen_holder"
+        task.eval_seed = 3
+        task.env_seeds = [11]
+        task.layout_cycle = 2
+        task.policy_provenance = {
+            "checkpoint_id": "RoboDojo-sim-arx_x5-joint-0/59999",
+            "checkpoint_digest": "sha256:" + "7" * 64,
+            "code_revision": "e" * 40,
+            "dirty": False,
+        }
+
+        class Snapshotter:
+            def __init__(self, task_env):
+                self.task_env = task_env
+
+            def capture(self, frame_index):
+                return {"frame.index": np.asarray(frame_index)}
+
+            def metadata(self):
+                return {"replay_saved_layout": {"id": 11}}
+
+        class Store:
+            instance = None
+
+            def __init__(self, root, target_episodes, identity):
+                self.root = Path(root)
+                self.target_episodes = target_episodes
+                self.identity = identity
+                self.completed_count = 0
+                self.commits = []
+                Store.instance = self
+
+            @property
+            def target_reached(self):
+                return self.completed_count >= self.target_episodes
+
+            def commit(self, *args):
+                self.commits.append(args)
+                self.completed_count += 1
+                return self.root / "pending/episode_0000000"
+
+        bundle_module = ModuleType("src.eval_client.x5_raw_bundle")
+        bundle_module.RawBundleStore = Store
+        snapshot_module = ModuleType("src.eval_client.sim_state_snapshot")
+        snapshot_module.SimulatorStateSnapshotter = Snapshotter
+
+        with mock.patch.object(
+            mirror, "DualJointMirrorClient", return_value=client
+        ), mock.patch.dict(
+            sys.modules,
+            {
+                "src.eval_client.x5_raw_bundle": bundle_module,
+                "src.eval_client.sim_state_snapshot": snapshot_module,
+            },
+        ), mock.patch.dict(
+            mirror.os.environ,
+            {
+                "ROBODOJO_DUAL_MIRROR_PROFILE": "arx_x5_identity_joint_v1",
+                "ROBODOJO_DUAL_MIRROR_RECORD": "0",
+                "ROBODOJO_X5_RAW_CAPTURE": "1",
+                "ROBODOJO_X5_RAW_ROOT": "/tmp/x5-raw-test",
+                "ROBODOJO_X5_TARGET_EPISODES": "1",
+                "ROBODOJO_REALTIME": "0",
+            },
+            clear=False,
+        ):
+            mirror.run_piperx_policy_leader_mirror_episode(
+                task,
+                _Model(),
+                allow_intervention=True,
+            )
+
+        self.assertTrue(task.raw_collection_complete)
+        self.assertEqual(Store.instance.completed_count, 1)
+        self.assertEqual(len(Store.instance.commits), 1)
+        fragment, _, takeover, terminal, sim_anchor, source_anchor, metadata = (
+            Store.instance.commits[0]
+        )
+        self.assertEqual(fragment["segment_count"], 1)
+        self.assertEqual(int(takeover["frame.index"]), 7)
+        self.assertEqual(int(terminal["frame.index"]), 7)
+        self.assertEqual(sim_anchor["left"]["q_rad"].shape, (6,))
+        self.assertEqual(source_anchor["right"]["q_rad"].shape, (6,))
+        self.assertEqual(metadata["layout_id"], 11)
+
     def test_recording_manual_frame_is_online_obs_t_action_t_before_next_obs(self) -> None:
         events: list[str] = []
         client = _Client(

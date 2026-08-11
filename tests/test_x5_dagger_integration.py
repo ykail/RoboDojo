@@ -584,10 +584,12 @@ class X5DaggerIntegrationTest(unittest.TestCase):
 
         mirror_source = _source("src/eval_client/piperx_dual_joint_mirror.py")
         self.assertIn("set_updates_enabled", mirror_source)
-        self.assertNotIn(
+        self.assertIn(
             "from src.eval_client.sim_state_snapshot import SimulatorStateSnapshotter",
             mirror_source,
         )
+        self.assertIn("RawBundleStore", mirror_source)
+        self.assertIn("ROBODOJO_X5_RAW_CAPTURE", mirror_source)
         self.assertIn("capture=online original-quality RGB", mirror_source)
         self.assertIn("restore_replay_frame", mirror_source)
         self.assertIn("resumed data cameras cannot be warmed up", mirror_source)

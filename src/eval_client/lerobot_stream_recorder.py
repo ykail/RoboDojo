@@ -603,15 +603,18 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
                 metadata["base_checkpoint"] = str(source_checkpoint)
             if isinstance(source_policy_provenance, dict):
                 metadata["policy_provenance"] = dict(source_policy_provenance)
-    if control_mode == "x5_policy_joint_intervention":
+    if control_mode in {"x5_policy_joint_intervention", "x5_raw_replay_25hz"}:
         metadata["hardware_embodiment"] = "arx_x5"
         metadata["hardware_profile"] = "arx_x5_identity_joint_v1"
         metadata["hardware_bridge_protocol"] = "robodojo_dual_joint_mirror_v1"
         metadata["hardware_bridge_commit"] = _git_revision(x5_code_root)
         metadata["hardware_bridge_dirty"] = _git_dirty(x5_code_root)
         metadata["hardware_control_topology"] = (
-            "policy_sim_to_two_x5_manual_two_x5_to_sim"
+            "raw_x5_takeover_snapshot_fixed_25hz_isaac_replay"
+            if control_mode == "x5_raw_replay_25hz"
+            else "policy_sim_to_two_x5_manual_two_x5_to_sim"
         )
+        metadata["x5_raw_replay"] = control_mode == "x5_raw_replay_25hz"
     elif control_mode == "piperx_sim_dagger":
         metadata["piperx_embodiment_profile"] = "arx_x5_piperx_relative_joint_v1"
         metadata["piperx_bridge_protocol"] = "robodojo_piperx_v4"

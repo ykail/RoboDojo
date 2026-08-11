@@ -32,6 +32,13 @@ class DualJointMirrorError(RuntimeError):
     pass
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = os.environ.get(name, default).strip().lower()
+    if value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        raise DualJointMirrorError(f"{name} must be a boolean")
+    return value in {"1", "true", "yes", "on"}
+
+
 def _mark_dual_operator_end(task_env: Any, *, rejected: bool) -> None:
     if rejected:
         task_env.success[0] = False
@@ -240,6 +247,33 @@ class DualJointMirrorClient:
                     "follow_target_q_rad": follow_target_q,
                     "leader_delta_gripper_open_fraction": leader_delta_gripper,
                 }
+            raw_fragment = payload.get("raw_fragment")
+            if raw_fragment is not None:
+                if request_type != "end" or not isinstance(raw_fragment, dict):
+                    raise DualJointMirrorError(
+                        f"unexpected raw fragment in dual PiPER response: {payload!r}"
+                    )
+                path = raw_fragment.get("path")
+                digest = raw_fragment.get("sha256")
+                sample_count = raw_fragment.get("sample_count")
+                frequency_hz = raw_fragment.get("frequency_hz")
+                if (
+                    not isinstance(path, str)
+                    or not path
+                    or not isinstance(digest, str)
+                    or not digest.startswith("sha256:")
+                    or not isinstance(sample_count, int)
+                    or isinstance(sample_count, bool)
+                    or sample_count < 2
+                    or not isinstance(frequency_hz, (int, float))
+                    or isinstance(frequency_hz, bool)
+                    or not math.isfinite(float(frequency_hz))
+                    or float(frequency_hz) <= 0.0
+                ):
+                    raise DualJointMirrorError(
+                        f"invalid raw fragment descriptor: {raw_fragment!r}"
+                    )
+                raw_fragment = dict(raw_fragment)
             return {
                 "mode": mode,
                 "edge": edge,
@@ -255,6 +289,7 @@ class DualJointMirrorClient:
                     else float(boundary_monotonic_ns) * 1e-9
                 ),
                 "sides": parsed,
+                "raw_fragment": raw_fragment,
             }
 
     def exchange(
@@ -275,9 +310,9 @@ class DualJointMirrorClient:
             },
         )
 
-    def end(self) -> None:
+    def end(self) -> dict[str, Any] | None:
         if self._ended:
-            return
+            return None
         self._heartbeat_stop.set()
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=2.0)
@@ -286,6 +321,7 @@ class DualJointMirrorClient:
         if response["mode"] != "follow" or response["edge"] is not None:
             raise DualJointMirrorError("dual PiPER source did not acknowledge final hold")
         self._ended = True
+        return response.get("raw_fragment")
 
 
 def _target_robots(task_env: Any) -> dict[str, Any]:
@@ -772,8 +808,13 @@ def run_piperx_policy_leader_mirror_episode(
     if record_value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
         raise DualJointMirrorError("ROBODOJO_DUAL_MIRROR_RECORD must be a boolean")
     record_enabled = record_value in {"1", "true", "yes", "on"}
+    raw_capture_enabled = _env_flag("ROBODOJO_X5_RAW_CAPTURE", "0")
     if record_enabled and not allow_intervention:
         raise DualJointMirrorError("dual-leader recording requires intervention mode")
+    if raw_capture_enabled and (record_enabled or not allow_intervention):
+        raise DualJointMirrorError(
+            "raw X5 capture requires intervention mode with the online writer disabled"
+        )
     profile = os.environ.get(
         "ROBODOJO_DUAL_MIRROR_PROFILE",
         "arx_x5_piperx_relative_joint_v1",
@@ -788,6 +829,12 @@ def run_piperx_policy_leader_mirror_episode(
     terminal_request: str | None = None
     terminal_wall_timestamp: float | None = None
     recorder_blocked_s = 0.0
+    raw_store: Any | None = None
+    raw_snapshotter: Any | None = None
+    raw_takeover_state: dict[str, np.ndarray] | None = None
+    raw_terminal_state: dict[str, np.ndarray] | None = None
+    raw_sim_anchor: dict[str, Any] | None = None
+    raw_source_anchor: dict[str, Any] | None = None
     robots = _target_robots(task_env)
     pacer = RealtimePacer(
         frequency=float(task_env.obs_manager.collect_freq),
@@ -795,6 +842,55 @@ def run_piperx_policy_leader_mirror_episode(
     )
     try:
         client.connect()
+        if raw_capture_enabled:
+            from src.eval_client.x5_raw_bundle import RawBundleStore
+
+            raw_root = os.environ.get("ROBODOJO_X5_RAW_ROOT", "").strip()
+            target_text = os.environ.get("ROBODOJO_X5_TARGET_EPISODES", "50").strip()
+            if not raw_root or not target_text.isdigit() or int(target_text) <= 0:
+                raise DualJointMirrorError(
+                    "raw X5 capture requires ROBODOJO_X5_RAW_ROOT and a positive target"
+                )
+            provenance = getattr(task_env, "policy_provenance", None)
+            if not isinstance(provenance, dict):
+                raise DualJointMirrorError("raw X5 capture requires policy-v1 provenance")
+            policy_identity = {
+                key: provenance.get(key)
+                for key in (
+                    "checkpoint_id",
+                    "checkpoint_digest",
+                    "code_revision",
+                    "dirty",
+                )
+            }
+            if any(value is None for value in policy_identity.values()):
+                raise DualJointMirrorError(
+                    f"incomplete policy-v1 provenance for raw capture: {policy_identity!r}"
+                )
+            raw_store = RawBundleStore(
+                raw_root,
+                int(target_text),
+                {
+                    "schema": "robodojo_x5_takeover_correction_v1",
+                    "task_name": str(getattr(task_env, "task_name", "")),
+                    "env_config": "arx_x5",
+                    "mirror_profile": profile,
+                    "joint_signs": _joint_signs_for_profile(profile).tolist(),
+                    "replay_fps": 25,
+                    "policy": policy_identity,
+                },
+            )
+            print(
+                f"[X5 raw] durable progress={raw_store.completed_count}/"
+                f"{raw_store.target_episodes} root={raw_store.root}",
+                flush=True,
+            )
+            if raw_store.target_reached:
+                task_env.raw_collection_complete = True
+                _mark_dual_operator_end(task_env, rejected=False)
+                print("[X5 raw] target already complete; no new attempt started.", flush=True)
+                client.end()
+                return
         obs = task_env.get_obs()
         follow_anchor = _measured_sim_state(task_env, robots)
         follow_command = follow_anchor
@@ -805,7 +901,9 @@ def run_piperx_policy_leader_mirror_episode(
             from src.eval_client.lerobot_stream_recorder import recorder_for_env
 
             recorder = _SinglePendingRecorder(recorder_for_env(task_env))
-        checkpoint_label = "CP13" if recorder is not None else "CP12"
+        checkpoint_label = (
+            "X5 raw" if raw_capture_enabled else ("CP13" if recorder is not None else "CP12")
+        )
         print(
             (
                 f"[CP13 Isaac] two leaders + i intervention + LeRobot recording -> "
@@ -821,6 +919,12 @@ def run_piperx_policy_leader_mirror_episode(
             print(
                 "[CP13 Isaac] capture=online original-quality RGB; "
                 "Right only drains the encoder and commits",
+                flush=True,
+            )
+        if raw_capture_enabled:
+            print(
+                "[X5 raw] i starts one correction; second i ends it; "
+                "Right atomically saves, Left discards.",
                 flush=True,
             )
         mode = "follow"
@@ -854,6 +958,54 @@ def run_piperx_policy_leader_mirror_episode(
                 else float(timestamp) - recorder_blocked_s
             )
 
+        def begin_raw_capture(
+            sim_state: dict[str, tuple[np.ndarray, float]],
+            source_response: dict[str, Any],
+        ) -> None:
+            nonlocal raw_snapshotter, raw_takeover_state
+            nonlocal raw_terminal_state, raw_sim_anchor, raw_source_anchor
+            if not raw_capture_enabled:
+                return
+            if raw_snapshotter is not None:
+                raise DualJointMirrorError(
+                    "raw capture supports exactly one intervention segment per bundle"
+                )
+            from src.eval_client.sim_state_snapshot import SimulatorStateSnapshotter
+
+            raw_snapshotter = SimulatorStateSnapshotter(task_env)
+            frame_index = int(getattr(task_env, "take_action_cnt", [0])[0])
+            raw_takeover_state = raw_snapshotter.capture(frame_index)
+            raw_terminal_state = None
+            raw_sim_anchor = {
+                side: {
+                    "q_rad": sim_state[side][0].copy(),
+                    "gripper_open_fraction": float(sim_state[side][1]),
+                }
+                for side in SIDES
+            }
+            raw_source_anchor = {
+                side: {
+                    "q_rad": source_response["sides"][side]["measured_q_rad"].copy(),
+                    "gripper_open_fraction": float(
+                        source_response["sides"][side]["leader_gripper_open_fraction"]
+                    ),
+                }
+                for side in SIDES
+            }
+            print(
+                f"\n[X5 raw] takeover snapshot captured at simulator action "
+                f"{frame_index}; hardware is sampling independently.",
+                flush=True,
+            )
+
+        def finish_raw_capture() -> None:
+            nonlocal raw_terminal_state
+            if not raw_capture_enabled or raw_snapshotter is None:
+                return
+            if raw_terminal_state is None:
+                frame_index = int(getattr(task_env, "take_action_cnt", [0])[0])
+                raw_terminal_state = raw_snapshotter.capture(frame_index)
+
         def consume_terminal(source_response: dict[str, Any]) -> bool:
             nonlocal mode, terminal_request, terminal_wall_timestamp
             requested = source_response.get("terminal")
@@ -863,6 +1015,7 @@ def run_piperx_policy_leader_mirror_episode(
                 raise DualJointMirrorError(f"unknown X5 terminal request {requested!r}")
             terminal_request = requested
             terminal_wall_timestamp = boundary_timestamp(source_response)
+            finish_raw_capture()
             mode = "follow"
             _mark_dual_operator_end(task_env, rejected=requested == "retry")
             action = "SAVE/NEXT" if requested == "save" else "DISCARD/RETRY"
@@ -878,6 +1031,7 @@ def run_piperx_policy_leader_mirror_episode(
                 if consume_terminal(response):
                     break
                 if response["edge"] == "exit":
+                    finish_raw_capture()
                     pending_manual_end_timestamp = boundary_timestamp(response)
                     follow_anchor = current
                     follow_command = current
@@ -968,6 +1122,7 @@ def run_piperx_policy_leader_mirror_episode(
                 if not allow_intervention or response["mode"] != "manual":
                     raise DualJointMirrorError("unexpected intervention entry")
                 task_env.piperx_intervention_occurred = True
+                begin_raw_capture(current, response)
                 manual_anchor = current
                 mode = "manual"
                 pending_takeover_edge = 1
@@ -1015,6 +1170,7 @@ def run_piperx_policy_leader_mirror_episode(
                     if not allow_intervention or pre["mode"] != "manual":
                         raise DualJointMirrorError("unexpected intervention entry")
                     task_env.piperx_intervention_occurred = True
+                    begin_raw_capture(pre_state, pre)
                     manual_anchor = pre_state
                     mode = "manual"
                     pending_takeover_edge = 1
@@ -1102,7 +1258,7 @@ def run_piperx_policy_leader_mirror_episode(
             # Let the physical arms finish the final simulator move before END
             # converts that in-flight target into a hold at the measured pose.
             time.sleep(1.0)
-        client.end()
+        raw_fragment = client.end()
         if camera_paused:
             _set_data_camera_updates(
                 task_env,
@@ -1126,6 +1282,52 @@ def run_piperx_policy_leader_mirror_episode(
             from src.eval_client.intervention_loop import InterventionRejected
 
             raise InterventionRejected()
+        if raw_capture_enabled and terminal_request == "save":
+            if (
+                raw_store is None
+                or raw_snapshotter is None
+                or raw_takeover_state is None
+                or raw_terminal_state is None
+                or raw_sim_anchor is None
+                or raw_source_anchor is None
+                or raw_fragment is None
+            ):
+                raise DualJointMirrorError(
+                    "raw save is incomplete: one manual enter/exit segment is required"
+                )
+            if int(raw_fragment.get("segment_count", 1)) != 1:
+                raise DualJointMirrorError(
+                    "raw save must contain exactly one intervention segment"
+                )
+            layout_id = int(getattr(task_env, "env_seeds", [0])[0])
+            committed = raw_store.commit(
+                raw_fragment,
+                raw_snapshotter,
+                raw_takeover_state,
+                raw_terminal_state,
+                raw_sim_anchor,
+                raw_source_anchor,
+                {
+                    "task_name": str(getattr(task_env, "task_name", "")),
+                    "env_config": "arx_x5",
+                    "layout_id": layout_id,
+                    "eval_seed": int(getattr(task_env, "eval_seed", 0)),
+                    "layout_cycle": int(getattr(task_env, "layout_cycle", 0)),
+                    "operator_accepted": True,
+                    "online_task_success": bool(task_env.success[0]),
+                    "policy_provenance": dict(task_env.policy_provenance),
+                    "terminal_request": terminal_request,
+                },
+            )
+            completed = raw_store.completed_count
+            task_env.raw_collection_complete = raw_store.target_reached
+            print(
+                f"[X5 raw] COMMITTED {committed} "
+                f"({completed}/{raw_store.target_episodes}); "
+                "this bundle survives process or machine failure.",
+                flush=True,
+            )
+            return
         if recorder is not None:
             success = bool(task_env.success[0])
             saved_path = recorder.finalize(

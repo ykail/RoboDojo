@@ -395,6 +395,7 @@ def main():
         "piperx_policy_joint_intervention",
         "x5_policy_joint_intervention",
         "piperx_restore_recovery",
+        "x5_raw_replay_25hz",
     }:
         raise ValueError(
             "ROBODOJO_CONTROL_MODE must be 'policy', 'keyboard_intervention', "
@@ -402,7 +403,7 @@ def main():
             "'piperx_joint_j1', 'piperx_sim_follow_j1', "
             "'piperx_dual_joint_test', 'piperx_policy_leader_mirror', or "
             "'piperx_policy_joint_intervention', 'x5_policy_joint_intervention', "
-            "'piperx_restore_recovery', "
+            "'piperx_restore_recovery', 'x5_raw_replay_25hz', "
             f"got {control_mode!r}."
         )
     replay_frame = None
@@ -410,6 +411,7 @@ def main():
     recovery_queue = None
     recovery_items = []
     recovery_completed: set[str] = set()
+    raw_replay_bundles = []
     if control_mode == "piperx_restore_recovery":
         using_queue = bool(args_cli.restore_queue_manifest)
         using_single = bool(args_cli.restore_dataset_root) or args_cli.restore_episode is not None
@@ -500,6 +502,28 @@ def main():
             )
         if replay_frame.layout_id < 0:
             raise ValueError("replay metadata has no valid layout id")
+    if control_mode == "x5_raw_replay_25hz":
+        from src.eval_client.x5_raw_bundle import load_pending_bundles
+
+        raw_root = os.environ.get("ROBODOJO_X5_RAW_ROOT", "").strip()
+        if not raw_root:
+            raise ValueError("x5_raw_replay_25hz requires ROBODOJO_X5_RAW_ROOT")
+        raw_replay_bundles = load_pending_bundles(raw_root, verify=True)
+        if not raw_replay_bundles:
+            print("[X5 raw replay] no committed raw bundles; nothing to do.", flush=True)
+            simulation_app.close()
+            return
+        first_metadata = raw_replay_bundles[0].manifest.get("metadata", {})
+        if first_metadata.get("task_name") != task_name:
+            raise ValueError(
+                "raw collection task does not match launcher task: "
+                f"{first_metadata.get('task_name')!r} != {task_name!r}"
+            )
+        print(
+            f"[X5 raw replay] verified {len(raw_replay_bundles)} committed bundle(s) "
+            f"from {raw_root}",
+            flush=True,
+        )
     operator_driven = control_mode in {
         "keyboard_intervention",
         "piperx_sim_dagger",
@@ -511,6 +535,9 @@ def main():
         "piperx_restore_recovery",
     }
     observation_mode = control_mode == "keyboard_observe"
+    if control_mode == "x5_raw_replay_25hz" and num_envs != 1:
+        print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
+        num_envs = 1
     if control_mode in {"keyboard_intervention", "keyboard_observe"}:
         if policy_runtime == "xpolicy_ws_v0" and args_cli.policy_name != "Pi_05":
             raise ValueError("Interactive keyboard modes are currently validated only for policy_name=Pi_05.")
@@ -572,6 +599,7 @@ def main():
             "piperx_sim_follow_j1",
             "piperx_dual_joint_test",
             "piperx_restore_recovery",
+            "x5_raw_replay_25hz",
         }
         else {}
     )
@@ -585,6 +613,7 @@ def main():
             "piperx_sim_follow_j1",
             "piperx_dual_joint_test",
             "piperx_restore_recovery",
+            "x5_raw_replay_25hz",
         }
         else False
     )
@@ -596,6 +625,12 @@ def main():
         if replay_frame is not None and replay_frame.eval_seed >= 0
         else args_cli.seed
     )
+    if raw_replay_bundles:
+        eval_cfg["seed"] = int(
+            raw_replay_bundles[0].manifest.get("metadata", {}).get(
+                "eval_seed", args_cli.seed
+            )
+        )
     eval_cfg["physx_monitor_enabled"] = enable_monitor
     eval_cfg["control_mode"] = control_mode
     eval_cfg["operator_driven"] = operator_driven
@@ -603,6 +638,9 @@ def main():
     eval_cfg["policy_runtime"] = policy_runtime
     if replay_frame is not None:
         eval_cfg["restore_saved_layout"] = replay_frame.saved_layout
+    if raw_replay_bundles:
+        raw_snapshot = raw_replay_bundles[0].manifest.get("snapshot", {})
+        eval_cfg["restore_saved_layout"] = raw_snapshot.get("replay_saved_layout")
 
     deploy_cfg = {}
     deploy_cfg["policy_name"] = args_cli.policy_name
@@ -691,12 +729,20 @@ def main():
             replay_frame.saved_layout,
             force_add=True,
         )
+    if raw_replay_bundles:
+        OmegaConf.update(
+            env_cfg,
+            "eval_cfg.restore_saved_layout",
+            raw_replay_bundles[0].manifest["snapshot"]["replay_saved_layout"],
+            force_add=True,
+        )
     if policy_runtime == "robodojo_policy_v1" or control_mode in {
         "piperx_manual",
         "piperx_joint_j1",
         "piperx_sim_follow_j1",
         "piperx_dual_joint_test",
         "piperx_restore_recovery",
+        "x5_raw_replay_25hz",
     }:
         collect_freq = float(eval_cfg["observation"].get("collect_freq", 0))
         if collect_freq != 25.0:
@@ -722,6 +768,40 @@ def main():
     run_id = os.environ["ROBODOJO_RUN_ID"]
     resume_state = _load_resume_manifest(eval_cfg, run_id)
     env = create_eval_env(env_cfg, simulation_app, resume_state=resume_state)
+    if raw_replay_bundles:
+        try:
+            from src.eval_client.x5_raw_replay import (
+                run_x5_raw_replay_collection,
+            )
+
+            raw_root = os.environ["ROBODOJO_X5_RAW_ROOT"]
+            dataset_root = os.environ.get("ROBODOJO_LEROBOT_ROOT", "").strip()
+            dataset_id = os.environ.get("ROBODOJO_LEROBOT_REPO_ID", "").strip()
+            fps = int(os.environ.get("ROBODOJO_X5_RAW_REPLAY_FPS", "25"))
+            max_bundles = int(
+                os.environ.get("ROBODOJO_X5_RAW_REPLAY_MAX_BUNDLES", "0")
+            )
+            if not dataset_root or not dataset_id:
+                raise ValueError(
+                    "raw replay requires ROBODOJO_LEROBOT_ROOT and "
+                    "ROBODOJO_LEROBOT_REPO_ID"
+                )
+            run_x5_raw_replay_collection(
+                env,
+                raw_root,
+                dataset_root,
+                dataset_id,
+                fps=fps,
+                max_bundles=max_bundles,
+            )
+        finally:
+            close_lerobot_stream_session()
+            close_piperx_bridge_session()
+            _close_model_client(env)
+            env._robodojo_final_shutdown = True
+            env.close()
+            simulation_app.close()
+        return
     if replay_frame is not None:
         mirror_client = None
         try:
@@ -913,6 +993,13 @@ def main():
             env.reset(seed=env.env_seeds)
             env.run_eval()
             env.seed_manager.eval_step()
+            if bool(getattr(env, "raw_collection_complete", False)):
+                print(
+                    "[X5 raw] requested durable bundle count reached; "
+                    "collection is stopping normally.",
+                    flush=True,
+                )
+                operator_stop_requested = True
             if observation_mode:
                 observed_count += 1
 

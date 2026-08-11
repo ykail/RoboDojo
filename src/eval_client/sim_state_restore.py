@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -182,6 +183,29 @@ def restore_replay_frame(
                 np.zeros_like(np.asarray(state[key])), controls[name]["velocity"]
             )
 
+    # Reward functions keep transition memory outside PhysX.  Restoring only
+    # bodies can therefore produce a visually correct scene with a logically
+    # different score state.  The snapshot manifest carries the exact parser
+    # memory present at takeover; put it back before replay advances physics.
+    initial_task_state = manifest.get("initial_task_state", {})
+    reward_manager = getattr(task_env, "reward_manager", None)
+    func_parser = getattr(reward_manager, "func_parser", None)
+    if func_parser is not None and isinstance(initial_task_state, dict):
+        for stored_name, attribute_name in (
+            ("func_parser_pre_state", "pre_state"),
+            ("func_parser_robot_origin_endpose", "robot_origin_endpose"),
+            (
+                "func_parser_joint_ratio_transition_state",
+                "joint_ratio_transition_state",
+            ),
+        ):
+            if stored_name in initial_task_state:
+                setattr(
+                    func_parser,
+                    attribute_name,
+                    deepcopy(initial_task_state[stored_name]),
+                )
+
     if _reset_episode:
         task_env.take_action_cnt[0] = 0
         task_env.success[0] = True
@@ -196,7 +220,6 @@ def restore_replay_frame(
         task_env.end_flag[0] = bool(
             np.asarray(state.get("task.end_flag", task_env.end_flag[0])).item()
         )
-        reward_manager = getattr(task_env, "reward_manager", None)
         if reward_manager is not None:
             for state_name, attribute_name in (
                 ("reward.score_completed_count", "score_completed_count"),

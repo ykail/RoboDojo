@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,6 +115,22 @@ class JointMirrorSessionTest(unittest.TestCase):
             manual["sides"]["left"]["leader_delta_gripper_open_fraction"], -0.75
         )
 
+    def test_enter_response_uses_fresh_teach_anchor_not_stale_deadline_read(self) -> None:
+        self.session.handle(request(1))
+        stale = self.hardware.state
+        fresh_q = (0.25,) * 6
+        self.hardware.state = DualState(
+            arm_state(fresh_q, 0.3, seq=2, sample_ns=2000),
+            arm_state(fresh_q, 0.7, seq=2, sample_ns=2000),
+        )
+        self.session.toggle_intervention(1500)
+
+        entered = self.session.handle(request(2), measured=stale)
+
+        self.assertEqual(entered["sample_monotonic_ns"], 2000)
+        self.assertEqual(entered["sides"]["left"]["measured_q_rad"], list(fresh_q))
+        self.assertEqual(entered["sides"]["left"]["leader_delta_q_rad"], [0.0] * 6)
+
     def test_exit_holds_release_pose_and_requires_new_zero_frame(self) -> None:
         self.session.handle(request(1))
         self.session.toggle_intervention(1100)
@@ -136,6 +156,7 @@ class JointMirrorSessionTest(unittest.TestCase):
         self.assertEqual(heartbeat["terminal"], None)
         ended = self.session.handle({"type": "end", "seq": 2})
         self.assertEqual((ended["type"], ended["seq"], ended["mode"], ended["edge"]), ("end", 2, "follow", None))
+        self.assertIsNone(ended["raw_fragment"])
         self.assertTrue(self.session.ended)
 
     def test_left_terminal_holds_and_emits_one_retry_boundary(self) -> None:
@@ -171,7 +192,126 @@ class JointMirrorSessionTest(unittest.TestCase):
         self.assertEqual(tuple(args.home_rad), (0.0,) * 6)
         self.assertEqual(args.home_gripper_fraction, 1.0)
         self.assertEqual(args.follow_preview_s, 0.04)
+        self.assertIsNone(args.raw_root)
         self.assertEqual(source.PROTOCOL, "robodojo_dual_joint_mirror_v1")
+
+    def test_save_end_publishes_boundary_truncated_manual_npz(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "fragments"
+            session = source.JointMirrorSession(
+                self.hardware,
+                raw_root=root,
+                raw_frequency_hz=100.0,
+            )
+            session.handle(request(1))
+            self.assertTrue(session.toggle_intervention(1100))
+            anchor_q = (0.1,) * 6
+            self.hardware.state = DualState(
+                arm_state(anchor_q, 0.2, seq=2, sample_ns=1200),
+                arm_state(anchor_q, 0.8, seq=2, sample_ns=1200),
+            )
+            session.handle(request(2))
+
+            kept_q = (0.2,) * 6
+            kept = DualState(
+                arm_state(kept_q, 0.3, seq=3, sample_ns=2000),
+                arm_state(kept_q, 0.7, seq=3, sample_ns=2000),
+            )
+            session.observe_hardware(kept)
+            self.assertTrue(session.request_terminal("save", 2500))
+            late_q = (0.9,) * 6
+            late = DualState(
+                arm_state(late_q, 0.9, seq=4, sample_ns=3000),
+                arm_state(late_q, 0.1, seq=4, sample_ns=3000),
+            )
+            session.observe_hardware(late)
+            terminal = session.handle(request(3), measured=late)
+            self.assertEqual(terminal["terminal"], "save")
+
+            ended = session.handle({"type": "end", "seq": 4}, measured=late)
+            descriptor = ended["raw_fragment"]
+            self.assertEqual(descriptor["format"], source.RAW_FRAGMENT_FORMAT)
+            self.assertEqual(descriptor["sample_count"], 2)
+            self.assertEqual(descriptor["segment_count"], 1)
+            self.assertEqual(descriptor["frequency_hz"], 100.0)
+            path = Path(descriptor["path"])
+            self.assertTrue(path.is_file())
+            self.assertEqual(
+                descriptor["sha256"],
+                "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            with np.load(path, allow_pickle=False) as archive:
+                np.testing.assert_array_equal(
+                    archive["sample_monotonic_ns"], np.asarray([1200, 2000])
+                )
+                np.testing.assert_array_equal(archive["segment_index"], np.asarray([0, 0]))
+                np.testing.assert_allclose(
+                    archive["left_q_rad"], np.asarray([anchor_q, kept_q])
+                )
+                np.testing.assert_allclose(
+                    archive["right_gripper_open_fraction"], np.asarray([0.8, 0.7])
+                )
+                np.testing.assert_array_equal(archive["segment_start_ns"], [1100])
+                np.testing.assert_array_equal(archive["segment_end_ns"], [2500])
+                np.testing.assert_array_equal(
+                    archive["segment_anchor_timestamp_ns"], [1200]
+                )
+                np.testing.assert_allclose(
+                    archive["left_segment_anchor_q_rad"], np.asarray([anchor_q])
+                )
+            self.assertFalse(list(root.glob("*.partial")))
+
+    def test_retry_and_unsaved_end_never_publish_a_fragment(self) -> None:
+        for terminal in ("retry", None):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "fragments"
+                hardware = FakeHardware()
+                session = source.JointMirrorSession(
+                    hardware,
+                    raw_root=root,
+                    raw_frequency_hz=100.0,
+                )
+                session.handle(request(1))
+                session.toggle_intervention(1100)
+                hardware.state = DualState(
+                    arm_state((0.1,) * 6, 0.2, seq=2, sample_ns=1200),
+                    arm_state((0.1,) * 6, 0.8, seq=2, sample_ns=1200),
+                )
+                session.handle(request(2))
+                if terminal is not None:
+                    session.request_terminal(terminal, 1500)
+                    session.handle(request(3))
+                ended = session.handle({"type": "end", "seq": 4})
+                self.assertIsNone(ended["raw_fragment"])
+                self.assertFalse(root.exists())
+
+    def test_raw_root_cli_is_explicit(self) -> None:
+        args = source.build_arg_parser().parse_args(["--raw-root", "/tmp/x5-raw-test"])
+        self.assertEqual(args.raw_root, Path("/tmp/x5-raw-test"))
+
+    def test_second_manual_segment_fails_closed_in_raw_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session = source.JointMirrorSession(
+                self.hardware,
+                raw_root=Path(temporary),
+                raw_frequency_hz=100.0,
+            )
+            session.handle(request(1))
+            session.toggle_intervention(1100)
+            self.hardware.state = DualState(
+                arm_state((0.1,) * 6, 0.5, seq=2, sample_ns=1200),
+                arm_state((0.1,) * 6, 0.5, seq=2, sample_ns=1200),
+            )
+            session.handle(request(2))
+            session.toggle_intervention(1500)
+            session.handle(request(3))
+            session.handle(request(4))
+            session.toggle_intervention(2000)
+
+            with self.assertRaisesRegex(source.X5SourceError, "exactly one manual segment"):
+                session.handle(request(5))
+            session.disconnect()
+            self.assertFalse(list(Path(temporary).glob("*.npz")))
 
 
 if __name__ == "__main__":
