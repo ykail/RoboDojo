@@ -270,6 +270,7 @@ class PiperXOnlineDaggerIntegrationTest(unittest.TestCase):
             SCRIPTS / "run_piperx_dagger_isaac.sh",
             SCRIPTS / "run_hoo_piperx_isaac.sh",
             SCRIPTS / "run_hoo_piperx_policy_tunnel.sh",
+            SCRIPTS / "run_yikai_policy_59999.sh",
         )
         for launcher in launchers:
             with self.subTest(launcher=launcher.name):
@@ -303,6 +304,14 @@ class PiperXOnlineDaggerIntegrationTest(unittest.TestCase):
         tunnel = launchers[2].read_text(encoding="utf-8")
         self.assertIn("ExitOnForwardFailure=yes", tunnel)
         self.assertIn('YIKAI_TARGET="${YIKAI_SSH_TARGET:-yikai}"', tunnel)
+
+        wrapper = launchers[1].read_text(encoding="utf-8")
+        self.assertIn("--expected-code-revision", wrapper)
+        self.assertIn("--expected-checkpoint-digest", wrapper)
+
+        yikai = launchers[3].read_text(encoding="utf-8")
+        self.assertIn("ecc1a7451c3156b1e5f7533851dbb0222896206f", yikai)
+        self.assertIn("assets/arx_x5_sim/norm_stats.json", yikai)
 
     def test_main_gives_piper_the_same_soft_reset_lifecycle_as_x5(self) -> None:
         main_source = (ROOT / "src/eval_client/main.py").read_text(encoding="utf-8")

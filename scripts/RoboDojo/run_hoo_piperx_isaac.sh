@@ -17,6 +17,8 @@ LEROBOT_PYTHON="${ROBODOJO_LEROBOT_PYTHON:-/home/hoo/RoboDojo/third_party/kai0/.
 PREFLIGHT_PYTHON="${ROBODOJO_PREFLIGHT_PYTHON:-/opt/anaconda3/envs/RoboDojo/bin/python}"
 PIPERX_CODE_ROOT="${PIPERX_BRIDGE_ROOT:-/home/hoo/piper_x/lerobot_sealab-piperx-online-dagger-v2}"
 PREFLIGHT_ONLY=0
+REQUIRED_KAI0_COMMIT=""
+REQUIRED_CHECKPOINT_DIGEST=""
 
 usage() {
     cat <<'EOF'
@@ -36,6 +38,10 @@ Optional:
   --dataset-root PATH   Default: /home/hoo/data/lerobot
   --target-episodes N   Right-accepted durable episodes (default: 50)
   --lerobot-python PATH LeRobot writer environment
+  --expected-kai0-commit COMMIT
+                        Optionally require this exact policy-server commit
+  --expected-checkpoint-digest sha256:HEX
+                        Optionally require this exact checkpoint digest
   --preflight-only      Verify policy HELLO without starting Isaac
 EOF
 }
@@ -69,6 +75,10 @@ while [[ $# -gt 0 ]]; do
         --target-episodes=*) TARGET_EPISODES="${1#*=}"; shift ;;
         --lerobot-python) need_value "$1" "${2:-}"; LEROBOT_PYTHON="$2"; shift 2 ;;
         --lerobot-python=*) LEROBOT_PYTHON="${1#*=}"; shift ;;
+        --expected-kai0-commit) need_value "$1" "${2:-}"; REQUIRED_KAI0_COMMIT="$2"; shift 2 ;;
+        --expected-kai0-commit=*) REQUIRED_KAI0_COMMIT="${1#*=}"; shift ;;
+        --expected-checkpoint-digest) need_value "$1" "${2:-}"; REQUIRED_CHECKPOINT_DIGEST="$2"; shift 2 ;;
+        --expected-checkpoint-digest=*) REQUIRED_CHECKPOINT_DIGEST="${1#*=}"; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (use --help)" ;;
@@ -84,6 +94,10 @@ for port in "${POLICY_PORT}" "${SOURCE_PORT}"; do
 done
 [[ "${POLICY_PORT}" != "${SOURCE_PORT}" ]] || die "policy and source ports must differ"
 [[ "${TARGET_EPISODES}" =~ ^[1-9][0-9]*$ ]] || die "--target-episodes must be positive"
+[[ -z "${REQUIRED_KAI0_COMMIT}" || "${REQUIRED_KAI0_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+    || die "--expected-kai0-commit must be a full lowercase commit"
+[[ -z "${REQUIRED_CHECKPOINT_DIGEST}" || "${REQUIRED_CHECKPOINT_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "--expected-checkpoint-digest must be sha256:<64 lowercase hex>"
 [[ -x "${PREFLIGHT_PYTHON}" ]] || die "RoboDojo preflight Python is not executable: ${PREFLIGHT_PYTHON}"
 [[ -x "${LEROBOT_PYTHON}" ]] || die "LeRobot writer Python is not executable: ${LEROBOT_PYTHON}"
 [[ -d "${PIPERX_CODE_ROOT}" ]] || die "PiPER-X code root is missing: ${PIPERX_CODE_ROOT}"
@@ -102,13 +116,23 @@ if ! (exec 3<>"/dev/tcp/127.0.0.1/${POLICY_PORT}") >/dev/null 2>&1; then
     die "yikai policy tunnel is not reachable at 127.0.0.1:${POLICY_PORT}"
 fi
 
+PREFLIGHT_ARGS=(
+    --url "ws://127.0.0.1:${POLICY_PORT}"
+    --expected-checkpoint-id "${CHECKPOINT_ID}"
+    --require-clean
+)
+if [[ -n "${REQUIRED_KAI0_COMMIT}" ]]; then
+    PREFLIGHT_ARGS+=(--expected-code-revision "${REQUIRED_KAI0_COMMIT}")
+fi
+if [[ -n "${REQUIRED_CHECKPOINT_DIGEST}" ]]; then
+    PREFLIGHT_ARGS+=(--expected-checkpoint-digest "${REQUIRED_CHECKPOINT_DIGEST}")
+fi
+
 echo "[Hoo PiPER-X Isaac] discovering policy HELLO at ws://127.0.0.1:${POLICY_PORT}"
 PROVENANCE_JSON="$(
     PYTHONPATH="${ROBODOJO_ROOT}" "${PREFLIGHT_PYTHON}" \
         "${SCRIPT_DIR}/preflight_policy_v1.py" \
-        --url "ws://127.0.0.1:${POLICY_PORT}" \
-        --expected-checkpoint-id "${CHECKPOINT_ID}" \
-        --require-clean
+        "${PREFLIGHT_ARGS[@]}"
 )" || die "policy HELLO discovery failed"
 
 PROVENANCE_FIELDS="$(
