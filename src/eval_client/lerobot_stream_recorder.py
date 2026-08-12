@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Any
 
+from .dual_joint_collection import DUAL_MIRROR_PROTOCOL, PIPERX_CONTROL_MODE
 from .lerobot_stream_protocol import receive_message, send_message
 
 
@@ -639,12 +640,16 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
     elif (
         control_mode == "piperx_restore_recovery"
         or (
-            control_mode == "piperx_policy_joint_intervention"
+            control_mode == PIPERX_CONTROL_MODE
             and _env_bool("ROBODOJO_DUAL_MIRROR_RECORD", False)
         )
     ):
         metadata["piperx_embodiment_profile"] = "arx_x5_piperx_relative_joint_v1"
-        metadata["piperx_bridge_protocol"] = "robodojo_piperx_dual_joint_mirror_v1"
+        metadata["piperx_bridge_protocol"] = (
+            DUAL_MIRROR_PROTOCOL
+            if control_mode == PIPERX_CONTROL_MODE
+            else "robodojo_piperx_dual_joint_mirror_v1"
+        )
         metadata["piperx_bridge_commit"] = _git_revision(piperx_code_root)
         metadata["piperx_bridge_dirty"] = _git_dirty(piperx_code_root)
         metadata["piperx_control_topology"] = (
@@ -655,6 +660,17 @@ def _task_metadata(task_env: Any) -> dict[str, Any]:
         metadata["piperx_restore_direct_control"] = (
             control_mode == "piperx_restore_recovery"
         )
+        if control_mode == PIPERX_CONTROL_MODE:
+            # Generic fields make cross-embodiment audits uniform while the
+            # piperx_* aliases preserve compatibility with existing datasets.
+            metadata["hardware_embodiment"] = "piper_x"
+            metadata["hardware_profile"] = "arx_x5_piperx_relative_joint_v1"
+            metadata["hardware_bridge_protocol"] = DUAL_MIRROR_PROTOCOL
+            metadata["hardware_bridge_commit"] = metadata["piperx_bridge_commit"]
+            metadata["hardware_bridge_dirty"] = metadata["piperx_bridge_dirty"]
+            metadata["hardware_control_topology"] = (
+                "policy_sim_to_two_piperx_leaders_manual_two_piperx_leaders_to_sim"
+            )
     return metadata
 
 

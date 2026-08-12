@@ -201,6 +201,10 @@ from src.eval_client.lerobot_stream_recorder import (
     LeRobotStreamStartupError,
     close_lerobot_stream_session,
 )
+from src.eval_client.dual_joint_collection import (
+    is_live_dual_control_mode,
+    live_dual_mode_spec,
+)
 from src.eval_client.observation_loop import ObservationAdvance, ObservationExit
 from src.eval_client.piperx_bridge_client import (
     PiperXBridgeError,
@@ -532,10 +536,12 @@ def main():
         "piperx_joint_j1",
         "piperx_sim_follow_j1",
         "piperx_dual_joint_test",
+        "piperx_policy_joint_intervention",
         "x5_policy_joint_intervention",
         "x5_raw_replay_25hz",
         "piperx_restore_recovery",
     }
+    live_dual_collection = is_live_dual_control_mode(control_mode)
     observation_mode = control_mode == "keyboard_observe"
     if control_mode == "x5_raw_replay_25hz" and num_envs != 1:
         print(f"[main] {control_mode} forces num_envs {num_envs} -> 1")
@@ -1001,7 +1007,7 @@ def main():
                     flush=True,
                 )
     elif (
-        control_mode == "x5_policy_joint_intervention"
+        live_dual_collection
         and os.environ.get("ROBODOJO_DUAL_MIRROR_RECORD", "0").strip().lower()
         in {"1", "true", "yes", "on"}
     ):
@@ -1043,8 +1049,13 @@ def main():
             if bool(getattr(env, "raw_collection_complete", False)) or bool(
                 getattr(env, "lerobot_collection_complete", False)
             ):
+                hardware_label = (
+                    live_dual_mode_spec(control_mode).hardware_label
+                    if live_dual_collection
+                    else "operator"
+                )
                 print(
-                    "[X5 collection] requested durable episode count reached; "
+                    f"[{hardware_label} collection] requested durable episode count reached; "
                     "collection is stopping normally.",
                     flush=True,
                 )
@@ -1072,7 +1083,7 @@ def main():
         except InterventionRejected:
             print("[Intervention] rejected attempt does not count; retrying the same layout.")
             env.set_next_policy_reset_reason(ResetReason.OPERATOR_RETRY)
-            if control_mode != "x5_policy_joint_intervention":
+            if not live_dual_collection:
                 env.close()
             retry_round = True
         except InterventionSavedForRetry as request:
@@ -1129,12 +1140,17 @@ def main():
             operator_fatal_error = e
             operator_stop_requested = True
         except DualJointMirrorError as e:
-            # A live X5 transition/transport failure is not a simulator retry.
+            # A live hardware transition/transport failure is not a simulator retry.
             # The source process keeps retrying an active measured-pose hold;
             # resetting Isaac here would hide the fault and can start another
             # layout while the physical arms are not ready.
+            hardware_label = (
+                live_dual_mode_spec(control_mode).hardware_label
+                if live_dual_collection
+                else "dual-joint"
+            )
             print(
-                f"[X5 DAgger][FATAL] {e}; refusing automatic environment reset. "
+                f"[{hardware_label} DAgger][FATAL] {e}; refusing automatic environment reset. "
                 "The hardware source remains responsible for active hold.",
                 flush=True,
             )
@@ -1178,14 +1194,15 @@ def main():
                 bad_envs = sorted(bad)
             else:
                 if operator_driven:
-                    if control_mode == "x5_policy_joint_intervention":
+                    if live_dual_collection:
                         # The online writer has already rolled back its current
                         # candidate.  Do not tear down/recreate Replicator in
                         # the same process: that path has produced invalid
                         # annotator weakrefs and SIGABRT.  Close all subsystems
                         # once through the unified final-shutdown path below.
+                        hardware_label = live_dual_mode_spec(control_mode).hardware_label
                         print(
-                            "[X5 DAgger][FATAL] current candidate was discarded; "
+                            f"[{hardware_label} DAgger][FATAL] current candidate was discarded; "
                             "stopping without an in-process camera rebuild.",
                             flush=True,
                         )
@@ -1273,11 +1290,11 @@ def main():
                 f"layout={env.env_seeds[0]} cycle={env.seed_manager.cycle_index}"
             )
 
-        # X5 collection reuses the live simulator and Replicator camera graph.
+        # Live dual-joint collection reuses the simulator and Replicator graph.
         # Hard-closing/recreating it after every Right caused invalid annotator
         # weakrefs and pybind SIGABRTs.  The next env.reset() performs the
         # intended scene/layout soft reset.
-        if control_mode != "x5_policy_joint_intervention":
+        if not live_dual_collection:
             env.close()
 
     if operator_fatal_error is None:
@@ -1291,12 +1308,12 @@ def main():
     close_piperx_bridge_session()
     _close_model_client(env)
     env._robodojo_final_shutdown = True
-    # In the X5 GUI collector the active viewport may still reference one of
+    # In a live dual-joint GUI collector the viewport may still reference one of
     # the task cameras.  Explicit env.close() deletes that camera before Kit
     # has disconnected the viewport callback, producing a harmless but noisy
     # None/GetCamera traceback during final shutdown.  SimulationApp owns the
     # complete final teardown and releases these resources in dependency order.
-    if control_mode != "x5_policy_joint_intervention":
+    if not live_dual_collection:
         env.close()
     simulation_app.close()
     if operator_fatal_error is not None:

@@ -578,12 +578,19 @@ if [[ ( "${control_mode}" == "piperx_policy_joint_intervention" \
 fi
 if [[ "${control_mode}" == "piperx_policy_joint_intervention" \
   || "${control_mode}" == "x5_policy_joint_intervention" ]]; then
-  eval_environment+=("ROBODOJO_DUAL_MIRROR_RECORD=${dual_mirror_record}")
-fi
-if [[ "${control_mode}" == "x5_policy_joint_intervention" ]]; then
   eval_environment+=(
-    "ROBODOJO_DUAL_MIRROR_PROFILE=arx_x5_identity_joint_v1"
+    "ROBODOJO_DUAL_MIRROR_RECORD=${dual_mirror_record}"
+    "ROBODOJO_DUAL_MIRROR_PROTOCOL=robodojo_dual_joint_mirror_v1"
   )
+  if [[ "${control_mode}" == "x5_policy_joint_intervention" ]]; then
+    eval_environment+=(
+      "ROBODOJO_DUAL_MIRROR_PROFILE=arx_x5_identity_joint_v1"
+    )
+  else
+    eval_environment+=(
+      "ROBODOJO_DUAL_MIRROR_PROFILE=arx_x5_piperx_relative_joint_v1"
+    )
+  fi
 fi
 if [[ "${needs_lerobot_dataset}" == "1" ]]; then
   eval_environment+=(

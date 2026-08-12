@@ -14,6 +14,7 @@ from env.global_configs import *
 from env.global_configs import BENCHMARK
 from env.observation_manager.obs_manager import ObsManager
 from env.seed_manager.seed_manager import SeedManager
+from src.eval_client.dual_joint_collection import is_live_dual_control_mode
 from src.eval_client.policy_runtime import (
     PolicyV1EvalBridge,
     ResetPayload,
@@ -91,6 +92,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                         "piperx_joint_j1",
                         "piperx_sim_follow_j1",
                         "piperx_dual_joint_test",
+                        "piperx_policy_joint_intervention",
                         "x5_policy_joint_intervention",
                         "piperx_restore_recovery",
                         "x5_raw_replay_25hz",
@@ -102,7 +104,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 "0",
             ).strip().lower()
             self.stream_eval_videos = self.control_mode != "x5_raw_replay_25hz" and not (
-                self.control_mode == "x5_policy_joint_intervention"
+                is_live_dual_control_mode(self.control_mode)
                 and dual_record_value in {"1", "true", "yes", "on"}
             )
             self.layout_cycle = 0

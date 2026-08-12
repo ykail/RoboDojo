@@ -16,6 +16,13 @@ from typing import Any
 
 import numpy as np
 
+from src.eval_client.dual_joint_collection import (
+    PIPERX_CONTROL_MODE,
+    X5_CONTROL_MODE,
+    is_live_dual_control_mode,
+    live_dual_mode_spec,
+    target_episode_environment_names,
+)
 from src.eval_client.intervention_loop import RealtimePacer
 from src.eval_client.piperx_joint_j1 import _format_degrees, _hold_action
 
@@ -40,20 +47,47 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _online_target_episodes() -> int | None:
-    value = os.environ.get("ROBODOJO_X5_TARGET_EPISODES", "").strip()
+def _live_control_mode(task_env: Any) -> str:
+    """Resolve the live hardware identity before a dataset can be opened.
+
+    Older unit-level callers predate ``task_env.control_mode`` and exercise the
+    X5 path directly, so X5 remains the compatibility default.  Every real
+    EvalEnv supplies the explicit control mode.
+    """
+
+    control_mode = str(getattr(task_env, "control_mode", X5_CONTROL_MODE))
+    if not is_live_dual_control_mode(control_mode):
+        raise DualJointMirrorError(
+            f"online dual-joint collection requires a live control mode, got {control_mode!r}"
+        )
+    return control_mode
+
+
+def _online_target_episodes(control_mode: str = X5_CONTROL_MODE) -> int | None:
+    values = [
+        (name, os.environ.get(name, "").strip())
+        for name in target_episode_environment_names(control_mode)
+    ]
+    configured = [(name, value) for name, value in values if value]
+    if len({value for _, value in configured}) > 1:
+        raise DualJointMirrorError(
+            "conflicting online target episode settings: "
+            + ", ".join(f"{name}={value}" for name, value in configured)
+        )
+    if not configured:
+        return None
+    name, value = configured[0]
     if not value:
         return None
     if not value.isdigit() or int(value) <= 0:
-        raise DualJointMirrorError(
-            "ROBODOJO_X5_TARGET_EPISODES must be a positive integer"
-        )
+        raise DualJointMirrorError(f"{name} must be a positive integer")
     return int(value)
 
 
 def _online_collection_state(task_env: Any) -> tuple[int, dict[str, Any] | None]:
     """Validate the durable online dataset before counting or resuming it."""
 
+    expected_control_mode = _live_control_mode(task_env)
     root_text = os.environ.get("ROBODOJO_LEROBOT_ROOT", "").strip()
     repo_id = os.environ.get("ROBODOJO_LEROBOT_REPO_ID", "").strip()
     if not root_text or not repo_id:
@@ -127,9 +161,10 @@ def _online_collection_state(task_env: Any) -> tuple[int, dict[str, Any] | None]
                 f"online LeRobot task mismatch in {path.name}: "
                 f"{payload.get('robodojo_task')!r} != {expected_task!r}"
             )
-        if payload.get("robodojo_control_mode") != "x5_policy_joint_intervention":
+        if payload.get("robodojo_control_mode") != expected_control_mode:
             raise DualJointMirrorError(
-                f"online LeRobot control-mode mismatch in {path.name}"
+                f"online LeRobot control-mode mismatch in {path.name}: "
+                f"{payload.get('robodojo_control_mode')!r} != {expected_control_mode!r}"
             )
         actual_provenance = payload.get("robodojo_policy_provenance")
         if not isinstance(actual_provenance, dict) or any(
@@ -540,7 +575,7 @@ def _state_deltas(
 def _action_target_state(
     action: dict[str, Any],
 ) -> dict[str, tuple[np.ndarray, float]]:
-    """Extract the exact dual-X5 target that Isaac is about to execute."""
+    """Extract the exact dual-arm target that Isaac is about to execute."""
 
     result: dict[str, tuple[np.ndarray, float]] = {}
     for side in SIDES:
@@ -556,10 +591,12 @@ def _action_target_state(
             gripper = float(gripper_values[0])
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise DualJointMirrorError(
-                f"invalid {side} policy target for X5 mirroring"
+                f"invalid {side} policy target for dual-joint mirroring"
             ) from exc
         if joints.shape != (6,) or not np.isfinite(joints).all() or not math.isfinite(gripper):
-            raise DualJointMirrorError(f"non-finite {side} policy target for X5 mirroring")
+            raise DualJointMirrorError(
+                f"non-finite {side} policy target for dual-joint mirroring"
+            )
         result[side] = (joints.copy(), float(np.clip(gripper, 0.0, 1.0)))
     return result
 
@@ -586,8 +623,9 @@ def _manual_action(
 class _ControlRateReporter:
     _PHASES = ("source", "snapshot", "physics", "record_wait", "pacer", "vision")
 
-    def __init__(self, expected_hz: float) -> None:
+    def __init__(self, expected_hz: float, *, hardware_label: str = "X5") -> None:
         self.expected_hz = float(expected_hz)
+        self.hardware_label = str(hardware_label)
         self.window_start = time.monotonic()
         self.last_frame = self.window_start
         self.frames = 0
@@ -613,7 +651,8 @@ class _ControlRateReporter:
             for name in self._PHASES
         )
         print(
-            f"\n[X5 timing] mode={mode} control={self.frames / elapsed:.1f}Hz "
+            f"\n[{self.hardware_label} timing] mode={mode} "
+            f"control={self.frames / elapsed:.1f}Hz "
             f"target={self.expected_hz:.1f}Hz max_gap={self.max_gap_s * 1000.0:.0f}ms "
             f"avg/max {phase_text}",
             flush=True,
@@ -704,7 +743,7 @@ def _data_camera_manager(task_env: Any) -> Any:
         manager = getattr(getattr(task_env, "obs_manager", None), "capture_manager", None)
     if manager is None or not callable(getattr(manager, "set_updates_enabled", None)):
         raise DualJointMirrorError(
-            "X5 manual camera fast path requires a pausable tiled capture manager"
+            "dual-joint manual camera fast path requires a pausable tiled capture manager"
         )
     return manager
 
@@ -929,9 +968,21 @@ def run_piperx_policy_leader_mirror_episode(
     if record_value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
         raise DualJointMirrorError("ROBODOJO_DUAL_MIRROR_RECORD must be a boolean")
     record_enabled = record_value in {"1", "true", "yes", "on"}
+    requested_control_mode = str(
+        getattr(task_env, "control_mode", X5_CONTROL_MODE)
+    )
+    # CP11 policy-follow-only uses the same PiPER transport/profile but is not
+    # an operator collection lifecycle.  Preserve that established route while
+    # keeping online resume restricted to the explicit intervention modes.
+    control_mode = (
+        PIPERX_CONTROL_MODE
+        if requested_control_mode == "piperx_policy_leader_mirror"
+        else _live_control_mode(task_env)
+    )
+    mode_spec = live_dual_mode_spec(control_mode)
     raw_capture_enabled = _env_flag("ROBODOJO_X5_RAW_CAPTURE", "0")
     online_target_episodes = (
-        _online_target_episodes()
+        _online_target_episodes(control_mode)
         if record_enabled and not raw_capture_enabled
         else None
     )
@@ -946,12 +997,18 @@ def run_piperx_policy_leader_mirror_episode(
         "arx_x5_piperx_relative_joint_v1",
     ).strip()
     _joint_signs_for_profile(profile)  # Validate before either real arm can move.
+    if profile != mode_spec.profile:
+        raise DualJointMirrorError(
+            f"{control_mode} requires profile {mode_spec.profile}, got {profile!r}"
+        )
+    if raw_capture_enabled and control_mode != X5_CONTROL_MODE:
+        raise DualJointMirrorError("raw deferred capture is implemented only for physical ARX X5")
     if raw_capture_enabled and profile != "arx_x5_identity_joint_v1":
         raise DualJointMirrorError(
             "raw X5 capture requires arx_x5_identity_joint_v1; deferred replay "
             "does not retarget PiPER-X joint signs"
         )
-    hardware_label = "ARX X5" if profile == "arx_x5_identity_joint_v1" else "PiPER-X"
+    hardware_label = mode_spec.hardware_label
 
     if online_target_episodes is not None:
         completed = _online_committed_episode_count(task_env)
@@ -1073,7 +1130,10 @@ def run_piperx_policy_leader_mirror_episode(
         pending_release_edge = 0
         pending_manual_end_timestamp: float | None = None
         chunk_id = -1
-        timing = _ControlRateReporter(float(task_env.obs_manager.collect_freq))
+        timing = _ControlRateReporter(
+            float(task_env.obs_manager.collect_freq),
+            hardware_label=hardware_label,
+        )
 
         def recording_timestamp() -> float:
             # A slow encoder must not lengthen the demonstrated motion and then
@@ -1190,7 +1250,9 @@ def run_piperx_policy_leader_mirror_episode(
             if requested is None:
                 return False
             if requested not in {"save", "retry"}:
-                raise DualJointMirrorError(f"unknown X5 terminal request {requested!r}")
+                raise DualJointMirrorError(
+                    f"unknown {hardware_label} terminal request {requested!r}"
+                )
             terminal_request = requested
             terminal_wall_timestamp = boundary_timestamp(source_response)
             finish_raw_capture(source_response)
@@ -1274,7 +1336,7 @@ def run_piperx_policy_leader_mirror_episode(
                     recorder_blocked_s += record_wait_s
                 # Preserve the standard dataset contract: record S_t/A_t,
                 # execute A_t, then acquire S_(t+1).  Manual interpolation stays
-                # disabled so the simulator follows the latest X5 sample once.
+                # disabled so the simulator follows the latest hardware sample once.
                 physics_started = time.monotonic()
                 task_env.take_action(action, interpolate=False)
                 physics_s = time.monotonic() - physics_started
@@ -1333,7 +1395,8 @@ def run_piperx_policy_leader_mirror_episode(
             model_client.call(func_name="update_obs", obs=obs)
             actions = model_client.call(func_name="get_action")
             print(
-                f"\n[X5 timing] policy inference={(time.monotonic() - infer_start) * 1000.0:.0f}ms",
+                f"\n[{hardware_label} timing] "
+                f"policy inference={(time.monotonic() - infer_start) * 1000.0:.0f}ms",
                 flush=True,
             )
             if not actions:
@@ -1342,7 +1405,7 @@ def run_piperx_policy_leader_mirror_episode(
             chunk_stale = False
             for action_index, action in enumerate(actions):
                 # Send the exact policy target before Isaac executes it.  The
-                # physical X5 and simulator now start the same target together;
+                # physical hardware and simulator now start the same target together;
                 # no post-step PhysX measurement (and its PD noise/one-frame
                 # lag) is copied back to the real robot.
                 source_started = time.monotonic()
@@ -1557,15 +1620,19 @@ def run_piperx_policy_leader_mirror_episode(
     finally:
         if camera_paused:
             try:
-                _set_data_camera_updates(task_env, True, label="X5 recovery")
+                _set_data_camera_updates(
+                    task_env,
+                    True,
+                    label=f"{hardware_label} recovery",
+                )
                 camera_paused = False
                 print(
-                    "[X5 recovery] data cameras restored after an exception",
+                    f"[{hardware_label} recovery] data cameras restored after an exception",
                     flush=True,
                 )
             except Exception as camera_exc:
                 print(
-                    f"[X5 recovery] ERROR: could not resume data cameras: "
+                    f"[{hardware_label} recovery] ERROR: could not resume data cameras: "
                     f"{type(camera_exc).__name__}: {camera_exc}",
                     flush=True,
                 )
