@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from pathlib import Path
+from typing import Any, Mapping
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -11,15 +12,18 @@ from data_gen.make_kong.make_kong_expert import (
 )
 from env.global_configs import BENCHMARK, ENV_CONFIG_PATH, ROOT_DIR
 from env.observation_manager.obs_manager import ObsManager
-from env.seed_manager.seed_manager import SeedManager
+from env.seeding import seed_everywhere
 from task.RoboDojo import task_registry
 from utils.load_file import load_yaml
 from utils.pipeline_utils import process_config, process_randomization
 
+FIXED_SEED = 2810
 
-def build_config(*, seed: int, num_envs: int, device_id: int) -> DictConfig:
+
+def build_config(*, num_envs: int, device_id: int) -> DictConfig:
     """Build the data-generation environment without a policy client."""
 
+    seed_everywhere(FIXED_SEED)
     task_name = "make_kong"
     eval_config = load_yaml(Path(ENV_CONFIG_PATH) / "arx_x5.yml")
     eval_config.update(
@@ -29,8 +33,8 @@ def build_config(*, seed: int, num_envs: int, device_id: int) -> DictConfig:
             "device_id": device_id,
             "eval_batch": False,
             "policy_name": "make_kong_expert",
-            "additional_info": "seed0_smoke",
-            "seed": seed,
+            "additional_info": "generated_layout_pool",
+            "seed": FIXED_SEED,
         }
     )
     task_config = load_yaml(task_registry.task_config_path(Path(ROOT_DIR) / "task" / BENCHMARK / "config", task_name))
@@ -46,7 +50,7 @@ def build_config(*, seed: int, num_envs: int, device_id: int) -> DictConfig:
         }
     )
     config.sim.scene.num_envs = num_envs
-    config.sim.seed = [0 for _ in range(num_envs)]
+    config.sim.seed = [FIXED_SEED for _ in range(num_envs)]
     config = process_randomization(config)
     config, _ = process_config(config, task_name=task_name)
     config.camera.default_frequency = config.eval_cfg["observation"].get("collect_freq", 0)
@@ -68,22 +72,24 @@ def build_task_class():
     return ForcedTargetGroupTask
 
 
-def reset_seed_layouts(
+def reset_saved_layouts(
     env: MakeKongEnvironment,
     config: DictConfig,
+    saved_layouts: list[Mapping[str, Any]],
     layout_ids: list[int],
     active_env_indices: list[int],
 ) -> set[int]:
-    """Reset a batch and return the active environments with invalid saved layouts."""
+    """Reset a batch from generated JSON layouts and return invalid active environments."""
 
-    if len(layout_ids) != env.num_envs:
-        raise ValueError(f"Expected {env.num_envs} layouts, got {len(layout_ids)}.")
+    if len(saved_layouts) != env.num_envs or len(layout_ids) != env.num_envs:
+        raise ValueError(
+            f"Expected {env.num_envs} saved layouts and layout IDs, got {len(saved_layouts)} layouts and {len(layout_ids)} IDs."
+        )
     active_env_indices = sorted(set(active_env_indices))
     if not active_env_indices or active_env_indices[0] < 0 or active_env_indices[-1] >= env.num_envs:
         raise ValueError(f"Invalid active environment indices: {active_env_indices}.")
 
-    seed_manager = SeedManager(config.eval_cfg)
-    seed_manager.init_eval()
+    seed_everywhere(FIXED_SEED)
     obs_manager = ObsManager(
         obs_config=deepcopy(config.eval_cfg.get("observation", {})),
         num_envs=env.num_envs,
@@ -100,19 +106,14 @@ def reset_seed_layouts(
     env.episode_nums = len(active_env_indices)
     env.unstable_envs = set()
     env.scene_manager.layout_manager.replay = True
-    for env_idx, layout_idx in enumerate(layout_ids):
-        env.scene_manager.layout_manager.set_saved_layout(env_idx, seed_manager.get_seed_scene_info(layout_idx))
-    env.reset(seed=layout_ids)
+    for env_idx, saved_layout in enumerate(saved_layouts):
+        env.scene_manager.layout_manager.set_saved_layout(env_idx, deepcopy(saved_layout))
+    env.reset(seed=[FIXED_SEED] * env.num_envs)
     obs_manager.reset()
     env.scene_manager.apply_saved_poses(env_idx_list=list(range(env.num_envs)))
     invalid = {idx for idx in active_env_indices if not env.scene_manager.layout_manager.layout_valid[idx]}
     ignored_envs = set(range(env.num_envs)) - set(active_env_indices)
     for env_idx in ignored_envs | invalid:
-        env.success[env_idx] = False
-        env.end_flag[env_idx] = True
-    _, unstable_envs = env.scene_manager.layout_manager.check_layout_stability(env)
-    invalid.update(unstable_envs)
-    for env_idx in invalid:
         env.success[env_idx] = False
         env.end_flag[env_idx] = True
     for _ in range(10):
@@ -126,11 +127,3 @@ def reset_seed_layouts(
     env.robot_manager.set_robot_init_state()
     env.reward_manager.init_state()
     return invalid
-
-
-def layout_pool(config: DictConfig) -> list[int]:
-    """Return the ordered layout indices for the configured eval seed."""
-
-    seed_manager = SeedManager(config.eval_cfg)
-    seed_manager.init_eval()
-    return list(seed_manager.seed_list)

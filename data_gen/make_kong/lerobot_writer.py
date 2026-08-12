@@ -51,6 +51,7 @@ FEATURES = {
 MANIFEST_SCHEMA = pa.schema(
     [
         ("layout", pa.int64()),
+        ("layout_source", pa.string()),
         ("target_group", pa.int64()),
         ("status", pa.string()),
         ("episode_index", pa.int64()),
@@ -101,9 +102,13 @@ class LeRobotWriter:
         return [{field: row[field] for field in EPISODE_FIELDS} for row in self._load_parquet_rows(self.episodes_path)]
 
     def _load_jobs(self) -> list[dict[str, Any]]:
-        latest_jobs: dict[tuple[int, int], dict[str, Any]] = {}
+        latest_jobs: dict[tuple[str, int, int], dict[str, Any]] = {}
         for job in self._load_parquet_rows(self.manifest_path):
-            latest_jobs[(int(job["layout"]), int(job["target_group"]))] = job
+            normalized_job = dict(job)
+            normalized_job["layout_source"] = str(normalized_job.get("layout_source") or "eval_layout")
+            latest_jobs[
+                (normalized_job["layout_source"], int(normalized_job["layout"]), int(normalized_job["target_group"]))
+            ] = normalized_job
         return list(latest_jobs.values())
 
     @staticmethod
@@ -113,16 +118,26 @@ class LeRobotWriter:
         pq.write_table(table, temporary_path, compression="zstd")
         os.replace(temporary_path, path)
 
-    def terminal_jobs(self) -> set[tuple[int, int]]:
-        return {(int(job["layout"]), int(job["target_group"])) for job in self.jobs}
+    def terminal_jobs(self, layout_source: str) -> set[tuple[int, int]]:
+        return {
+            (int(job["layout"]), int(job["target_group"]))
+            for job in self.jobs
+            if job["layout_source"] == layout_source
+        }
 
-    def failed_jobs(self) -> set[tuple[int, int]]:
-        return {(int(job["layout"]), int(job["target_group"])) for job in self.jobs if job["status"] == "failed"}
+    def failed_jobs(self, layout_source: str) -> set[tuple[int, int]]:
+        return {
+            (int(job["layout"]), int(job["target_group"]))
+            for job in self.jobs
+            if job["layout_source"] == layout_source and job["status"] == "failed"
+        }
 
     def _record_terminal_job(self, job: dict[str, Any]) -> None:
-        key = (int(job["layout"]), int(job["target_group"]))
+        key = (str(job["layout_source"]), int(job["layout"]), int(job["target_group"]))
         self.jobs = [
-            existing for existing in self.jobs if (int(existing["layout"]), int(existing["target_group"])) != key
+            existing
+            for existing in self.jobs
+            if (str(existing["layout_source"]), int(existing["layout"]), int(existing["target_group"])) != key
         ]
         self.jobs.append(job)
 
@@ -133,10 +148,11 @@ class LeRobotWriter:
         if self.episodes:
             self._write_parquet_atomic(self.episodes_path, pa.Table.from_pylist(self.episodes))
 
-    def record_failure(self, layout: int, target_group: int, reason: str) -> None:
+    def record_failure(self, layout: int, layout_source: str, target_group: int, reason: str) -> None:
         self._record_terminal_job(
             {
                 "layout": layout,
+                "layout_source": layout_source,
                 "target_group": target_group,
                 "status": "failed",
                 "failure_reason": reason,
@@ -149,6 +165,7 @@ class LeRobotWriter:
         self,
         *,
         layout: int,
+        layout_source: str,
         target_group: int,
         states: np.ndarray,
         videos: dict[str, Path],
@@ -202,6 +219,7 @@ class LeRobotWriter:
         self._record_terminal_job(
             {
                 "layout": layout,
+                "layout_source": layout_source,
                 "target_group": target_group,
                 "status": "success",
                 "episode_index": episode_index,

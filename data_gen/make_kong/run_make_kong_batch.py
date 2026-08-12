@@ -12,11 +12,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(REPO_ROOT), str(REPO_ROOT / "XPolicyLab")]
 
 PARSER = argparse.ArgumentParser(description=__doc__)
-PARSER.add_argument("--seed", type=int, default=0)
 PARSER.add_argument("--num-envs", type=int, default=10)
 PARSER.add_argument("--device-id", type=int, default=0)
 PARSER.add_argument("--target-groups", type=str, default="0,1,2,3")
 PARSER.add_argument("--layout-ids", type=str, default="all")
+PARSER.add_argument(
+    "--layout-root",
+    type=Path,
+    default=REPO_ROOT / "data_gen" / "make_kong" / "layouts",
+    help="Directory containing generated make_kong_<id>.json layouts.",
+)
 PARSER.add_argument("--output-dir", type=Path, default=Path("output") / "make_kong_expert")
 PARSER.add_argument("--retry-failed", action="store_true")
 AppLauncher.add_app_launcher_args(PARSER)
@@ -28,7 +33,8 @@ SIMULATION_APP = APP_LAUNCHER.app
 
 from data_gen.make_kong.batch_control_driver import BatchControlDriver  # noqa: E402
 from data_gen.make_kong.batch_recorder import BatchEpisodeRecorder  # noqa: E402
-from data_gen.make_kong.env_builder import build_config, build_task_class, layout_pool, reset_seed_layouts  # noqa: E402
+from data_gen.make_kong.env_builder import FIXED_SEED, build_config, build_task_class, reset_saved_layouts  # noqa: E402
+from data_gen.make_kong.layout_pool import SavedLayout, load_layout_pool  # noqa: E402
 from data_gen.make_kong.lerobot_writer import LeRobotWriter  # noqa: E402
 from data_gen.make_kong.make_kong_expert import MakeKongExpertGenerator  # noqa: E402
 
@@ -43,14 +49,23 @@ def _parse_ids(value: str, valid: list[int], flag: str) -> list[int]:
     return ids
 
 
-def _run_batch(env, config, jobs, writer: LeRobotWriter) -> None:
-    layout_ids = [layout for layout, _ in jobs]
+def _run_batch(
+    env,
+    config,
+    jobs: list[tuple[SavedLayout, int]],
+    writer: LeRobotWriter,
+    layout_source: str,
+) -> None:
+    layout_ids = [layout.layout_id for layout, _ in jobs]
     target_groups = [group for _, group in jobs]
     padded_layouts = layout_ids + [layout_ids[0]] * (env.num_envs - len(layout_ids))
+    saved_layouts = [layout.scene_layout for layout, _ in jobs]
+    padded_saved_layouts = saved_layouts + [saved_layouts[0]] * (env.num_envs - len(saved_layouts))
     env.forced_target_groups = target_groups + [target_groups[0]] * (env.num_envs - len(target_groups))
-    invalid_envs = reset_seed_layouts(
+    invalid_envs = reset_saved_layouts(
         env,
         config,
+        padded_saved_layouts,
         padded_layouts,
         active_env_indices=list(range(len(jobs))),
     )
@@ -58,11 +73,12 @@ def _run_batch(env, config, jobs, writer: LeRobotWriter) -> None:
     work_root = writer.output_dir / ".partial"
     recorders = {}
     workers = {}
-    for env_idx, (layout, group) in enumerate(jobs):
+    for env_idx, (saved_layout, group) in enumerate(jobs):
+        layout = saved_layout.layout_id
         if env_idx in invalid_envs:
-            writer.record_failure(layout, group, "saved layout did not pass the stability check")
+            writer.record_failure(layout, layout_source, group, "generated layout was rejected while loading")
             continue
-        generator = MakeKongExpertGenerator(env, seed=layout, env_id=env_idx)
+        generator = MakeKongExpertGenerator(env, seed=FIXED_SEED, env_id=env_idx)
         workers[env_idx] = (layout, group, generator, generator.run_episode_steps())
         recorders[env_idx] = BatchEpisodeRecorder(env, env_idx, work_root / f"{layout}_{group}")
     for _ in range(12):
@@ -90,7 +106,8 @@ def _run_batch(env, config, jobs, writer: LeRobotWriter) -> None:
             BatchEpisodeRecorder.sample_batch(sample_recorders)
         for env_idx in finished:
             workers.pop(env_idx)
-    for env_idx, (layout, group) in enumerate(jobs):
+    for env_idx, (saved_layout, group) in enumerate(jobs):
+        layout = saved_layout.layout_id
         if env_idx in invalid_envs:
             continue
         result = results[env_idx]
@@ -99,40 +116,51 @@ def _run_batch(env, config, jobs, writer: LeRobotWriter) -> None:
             videos = recorder.close()
             writer.commit_episode(
                 layout=layout,
+                layout_source=layout_source,
                 target_group=group,
                 states=np.asarray(recorder.states, dtype=np.float32),
                 videos=videos,
             )
         else:
             recorder.abort()
-            writer.record_failure(layout, group, result.failure_reason or "unknown expert failure")
+            writer.record_failure(layout, layout_source, group, result.failure_reason or "unknown expert failure")
 
 
 def main() -> int:
     if ARGS.num_envs < 1:
         raise ValueError("--num-envs must be positive.")
-    config = build_config(seed=ARGS.seed, num_envs=ARGS.num_envs, device_id=ARGS.device_id)
-    layouts = _parse_ids(ARGS.layout_ids, layout_pool(config), "--layout-ids")
+    layout_root = ARGS.layout_root.resolve()
+    layout_pool = load_layout_pool(layout_root)
+    layout_ids = _parse_ids(ARGS.layout_ids, sorted(layout_pool), "--layout-ids")
     groups = _parse_ids(ARGS.target_groups, [0, 1, 2, 3], "--target-groups")
-    jobs = [(layout, group) for group in groups for layout in layouts]
+    jobs = [(layout_pool[layout_id], group) for group in groups for layout_id in layout_ids]
     writer = LeRobotWriter(ARGS.output_dir)
-    terminal = writer.terminal_jobs()
+    layout_source = str(layout_root)
+    terminal = writer.terminal_jobs(layout_source)
     if ARGS.retry_failed:
-        terminal -= writer.failed_jobs()
-    jobs = [job for job in jobs if job not in terminal]
+        terminal -= writer.failed_jobs(layout_source)
+    jobs = [job for job in jobs if (job[0].layout_id, job[1]) not in terminal]
     task_class = build_task_class()
-    env = task_class(config, SIMULATION_APP)
     completed = False
     try:
         for start in range(0, len(jobs), ARGS.num_envs):
-            _run_batch(env, config, jobs[start : start + ARGS.num_envs], writer)
-            writer.finalize()
+            # Generated layouts change Mahjong ``category_idx`` values. On CUDA,
+            # SceneManager's soft reset preserves rigid-object wrappers, so it
+            # cannot safely replace the old tile USDs with the next batch's
+            # models. Match the evaluation lifecycle: close this batch's scene
+            # and create a new environment before loading the next layouts.
+            config = build_config(num_envs=ARGS.num_envs, device_id=ARGS.device_id)
+            env = task_class(config, SIMULATION_APP)
+            try:
+                _run_batch(env, config, jobs[start : start + ARGS.num_envs], writer, layout_source)
+                writer.finalize()
+            finally:
+                env.close()
         completed = True
     finally:
         writer.finalize()
         if completed:
             shutil.rmtree(writer.output_dir / ".partial", ignore_errors=True)
-        env.close()
         SIMULATION_APP.close()
     return 0
 
