@@ -1,5 +1,6 @@
 """Environment construction and batched saved-layout reset for make_kong."""
 
+from copy import deepcopy
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
@@ -9,6 +10,7 @@ from data_gen.make_kong.make_kong_expert import (
     forced_target_group_execution_order,
 )
 from env.global_configs import BENCHMARK, ENV_CONFIG_PATH, ROOT_DIR
+from env.observation_manager.obs_manager import ObsManager
 from env.seed_manager.seed_manager import SeedManager
 from task.RoboDojo import task_registry
 from utils.load_file import load_yaml
@@ -82,6 +84,16 @@ def reset_seed_layouts(
 
     seed_manager = SeedManager(config.eval_cfg)
     seed_manager.init_eval()
+    obs_manager = ObsManager(
+        obs_config=deepcopy(config.eval_cfg.get("observation", {})),
+        num_envs=env.num_envs,
+        dt=env.dt,
+        task_name=config.eval_cfg.task_name,
+        description_cfg=config.eval_cfg.get("description", {}),
+        seeds_per_env=env.env_seed_list,
+    )
+    obs_manager.initialize(env)
+    env.obs_manager = obs_manager
     env.success = [True] * env.num_envs
     env.end_flag = [False] * env.num_envs
     env.take_action_cnt = [0] * env.num_envs
@@ -91,15 +103,14 @@ def reset_seed_layouts(
     for env_idx, layout_idx in enumerate(layout_ids):
         env.scene_manager.layout_manager.set_saved_layout(env_idx, seed_manager.get_seed_scene_info(layout_idx))
     env.reset(seed=layout_ids)
+    obs_manager.reset()
     env.scene_manager.apply_saved_poses(env_idx_list=list(range(env.num_envs)))
     invalid = {idx for idx in active_env_indices if not env.scene_manager.layout_manager.layout_valid[idx]}
-    stable_env_indices = [idx for idx in active_env_indices if idx not in invalid]
-    unstable_envs = []
-    if stable_env_indices:
-        _, unstable_envs = env.scene_manager.layout_manager.check_layout_stability(
-            env,
-            env_idx_list=stable_env_indices,
-        )
+    ignored_envs = set(range(env.num_envs)) - set(active_env_indices)
+    for env_idx in ignored_envs | invalid:
+        env.success[env_idx] = False
+        env.end_flag[env_idx] = True
+    _, unstable_envs = env.scene_manager.layout_manager.check_layout_stability(env)
     invalid.update(unstable_envs)
     for env_idx in invalid:
         env.success[env_idx] = False
@@ -108,6 +119,9 @@ def reset_seed_layouts(
         env.render()
     for step_idx in range(200):
         env.sim_step()
+        if step_idx % 5 == 0:
+            env.render()
+            obs_manager.get_obs()
     env.robot_manager.set_origin_endpose()
     env.robot_manager.set_robot_init_state()
     env.reward_manager.init_state()

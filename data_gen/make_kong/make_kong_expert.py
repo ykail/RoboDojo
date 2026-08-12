@@ -13,6 +13,8 @@ from numpy.typing import NDArray
 import transforms3d.quaternions as t3q
 import yaml
 
+from data_gen.make_kong.group3_support_planner import Group3SupportPlanner
+
 LOGGER = logging.getLogger("make_kong_expert")
 
 FloatArray: TypeAlias = NDArray[np.float64]
@@ -1417,7 +1419,13 @@ class MakeKongExpertGenerator:
                 self.reset()
             self._log("WAIT_SUPPORT_DISCARD")
             self.env.query_support_arm_traj(self.env_id)
-            yield from self._execute(self.env.support_arm_action[self.env_id], stage="support_discard")
+            if self._target_group() == 3:
+                yield from self._execute(
+                    Group3SupportPlanner(self.env, self.env_id).build(),
+                    stage="support_discard",
+                )
+            else:
+                yield from self._execute(self.env.support_arm_action[self.env_id], stage="support_discard")
             self.env.support_arm_action[self.env_id] = []
             yield from self._settle(20)
             self.env.check_support_arm_stable(self.env_id)

@@ -17,7 +17,6 @@ PARSER.add_argument("--num-envs", type=int, default=10)
 PARSER.add_argument("--device-id", type=int, default=0)
 PARSER.add_argument("--target-groups", type=str, default="0,1,2,3")
 PARSER.add_argument("--layout-ids", type=str, default="all")
-PARSER.add_argument("--max-episodes", type=int, default=None)
 PARSER.add_argument("--output-dir", type=Path, default=Path("output") / "make_kong_expert")
 PARSER.add_argument("--retry-failed", action="store_true")
 AppLauncher.add_app_launcher_args(PARSER)
@@ -27,6 +26,7 @@ ARGS.enable_cameras = True
 APP_LAUNCHER = AppLauncher(ARGS)
 SIMULATION_APP = APP_LAUNCHER.app
 
+from data_gen.make_kong.batch_control_driver import BatchControlDriver  # noqa: E402
 from data_gen.make_kong.batch_recorder import BatchEpisodeRecorder  # noqa: E402
 from data_gen.make_kong.env_builder import build_config, build_task_class, layout_pool, reset_seed_layouts  # noqa: E402
 from data_gen.make_kong.lerobot_writer import LeRobotWriter  # noqa: E402
@@ -69,8 +69,9 @@ def _run_batch(env, config, jobs, writer: LeRobotWriter) -> None:
         env.render()
     BatchEpisodeRecorder.sample_batch(list(recorders.values()))
     results = {}
+    control_driver = BatchControlDriver(env)
     while workers:
-        controls = []
+        controls = {}
         active = []
         finished = []
         for env_idx, (_, _, _, worker) in workers.items():
@@ -82,14 +83,9 @@ def _run_batch(env, config, jobs, writer: LeRobotWriter) -> None:
                 continue
             active.append(env_idx)
             if control is not None:
-                controls.append((env_idx, control))
-        if controls:
-            control_ids = [env_idx for env_idx, _ in controls]
-            env.robot_manager.control_manager.push(control_ids, [[control] for _, control in controls])
-            env.step(meta_control_list=env.robot_manager.control_manager.pop(control_ids))
+                controls[env_idx] = control
         if active:
-            env.sim_step(render=False)
-            env.reward_manager.step(active)
+            control_driver.advance(active, controls)
             sample_recorders = [recorders[env_idx] for env_idx in active if recorders[env_idx].advance_tick()]
             BatchEpisodeRecorder.sample_batch(sample_recorders)
         for env_idx in finished:
@@ -124,8 +120,6 @@ def main() -> int:
     if ARGS.retry_failed:
         terminal -= writer.failed_jobs()
     jobs = [job for job in jobs if job not in terminal]
-    if ARGS.max_episodes is not None:
-        jobs = jobs[: ARGS.max_episodes]
     task_class = build_task_class()
     env = task_class(config, SIMULATION_APP)
     completed = False
