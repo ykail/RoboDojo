@@ -27,7 +27,12 @@ bbox2d
 boolean
 short_text
 integer
+int_list
+bbox_list
 ```
+
+`int_list` and `bbox_list` are variable-size list answers (empty = `none`,
+serialized with a dedicated `<none>` token and `<sep>` separator).
 
 ---
 
@@ -297,6 +302,10 @@ Recommended conceptual markers:
 <answer_boolean>
 <answer_short_text>
 <answer_integer>
+<answer_int_list>
+<answer_bbox_list>
+<sep>
+<none>
 ```
 
 Use tokenizer special tokens or stable textual markers, but do so consistently.
@@ -352,20 +361,33 @@ bbox2d
 boolean
 short_text
 integer
+int_list
+bbox_list
 ```
 
 ### 8.1 Spatial answers
 
 Read normalized source-of-truth values from the canonical target.
 
-Quantize with configurable location bins.
+Quantize with configurable location bins (standard `[0, 1023]`, 1024 bins,
+unified with the PaliGemma/π0 pretrained location-token vocabulary):
+
+```text
+q = min(num_location_bins - 1, max(0, round(value * (num_location_bins - 1))))
+```
 
 Convert:
 
 ```text
 point storage xy -> model yx
-bbox storage xyxy -> model yxyx
+bbox storage yxyx == model ymin xmin ymax xmax (no reordering)
 ```
+
+For list answers, emit each element with the same ordering rules, sort boxes
+by top-left priority (ascending y_min, then ascending x_min) unless the
+question family or prompt explicitly dictates a spatial constraint (e.g.
+"left-to-right order"), and join elements with `<sep>`.  An empty list
+serializes to the dedicated `<none>` token.
 
 Never duplicate this ordering logic in task-specific code.
 
@@ -573,7 +595,8 @@ class VQAResult(TypedDict):
     boolean: Optional[bool]
     integer: Optional[int]
     point_xy_norm: Optional[list[float]]
-    bbox_xyxy_norm: Optional[list[float]]
+    bbox_yxyx_norm: Optional[list[float]]
+    bbox_list_yxyx_norm: Optional[list[list[float]]]
 
     error: Optional[str]
 ```
@@ -605,6 +628,8 @@ empty short text
 reversed bbox corners
 degenerate bbox
 unexpected answer-type marker
+stray <sep> (dangling separator)
+unterminated list element
 ```
 
 Parsing and metrics must use the same coordinate-order convention.
@@ -657,6 +682,26 @@ exact accuracy
 mean absolute error
 ```
 
+### 16.6 Integer list
+
+Report:
+
+```text
+sequence exact match
+per-position element accuracy
+mean edit distance
+```
+
+### 16.7 Bounding-box list
+
+Report:
+
+```text
+element-count exact match
+mean IoU per matched position
+accuracy at IoU >= 0.5
+```
+
 Report all metrics by question family where possible.
 
 ---
@@ -707,12 +752,17 @@ vqa:
     - boolean
     - short_text
     - integer
+    - int_list
+    - bbox_list
   target_view: ego
   bbox_definition: visible_tight
   num_location_bins: 1024
   max_answer_tokens: 32
   boolean_true_text: "yes"
   boolean_false_text: "no"
+  list_separator_token: "<sep>"
+  none_token: "<none>"
+  bbox_model_order: "ymin_xmin_ymax_xmax"
 
 state_masking:
   mask_vqa_state_values: true
@@ -775,8 +825,10 @@ Do not combine dataset parsing, serialization, attention masking, generation par
 
 - point float-to-token-to-float round trip;
 - bbox float-to-token-to-float round trip;
+- int_list float-to-token round trip, including the empty `<none>` path;
+- bbox_list float-to-token round trip, including the empty `<none>` path and `<sep>` handling;
 - correct `xy -> yx`;
-- correct `xyxy -> yxyx`;
+- correct bbox storage order is `yxyx` and equals the model token order;
 - boundary coordinates at 0 and 1;
 - malformed spatial output rejection;
 - canonical boolean parsing;

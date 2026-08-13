@@ -1,58 +1,222 @@
 # Task-Specific VQA Specification: RoboDojo `make_kong`
 
-The collector writes the original ego `cam_head` RGB image. The face-up
-opponent discard is the visual reference for the matching group among the 12
-robot-side tiles.
+This document is the single source of truth for make_kong VQA.  It
+consolidates the former `docs/vqa/05_make_kong_vqa_layouts.md` (layout
+variants A and B) and `docs/vqa/adr/0001/0002` (decision records) into this
+task spec; those files no longer exist.
+
+The collector (`vqa_gen/make_kong/generate_make_kong_vqa.py`) renders A/B
+variant layouts from `vqa_gen/make_kong/layouts/` and writes the original ego
+`cam_head` RGB image per scene.  Instance segmentation and depth are used only
+to validate annotations and to derive visible-tight boxes.
+
+## Board model
+
+- The robot-side row contains **14 tiles**, indexed 1-14 left-to-right: the
+  four matching groups (tiles 1-12) plus the support pair `mahjong4_0/4_1`
+  (tiles 13-14).
+- The opponent robot arm knocks one discard face-up on the far side; it is the
+  visual reference (`reference tile`).  The three robot-side tiles sharing its
+  face are the `matching group` (target group).
+
+## Face vocabulary
+
+The five canonical suits are fixed; every A/B layout uses all five (four
+matching groups plus the support pair), so the closed vocabulary never changes
+between layouts:
+
+```text
+Wan
+Tong
+Suo
+Honor
+Bonus
+```
+
+## Layout variants (A and B)
+
+`vqa_gen/make_kong/generate_layouts.py` writes `make_kong_a_<id>.json` /
+`make_kong_b_<id>.json` pairs into `vqa_gen/make_kong/layouts/`.
+
+### Why variants are needed
+
+The evaluation layouts (and the original `data_gen/make_kong` pool) hard-code
+two shortcuts that would make the tile face irrelevant for VQA:
+
+1. discard `mahjong5_0` always matches group `mahjong0_*`, and so on — the
+   pushed-down tile's face is predictable from its slot;
+2. every matching group is a contiguous block at a fixed position — the target
+   group is predictable from the discard slot.
+
+Variant A removes shortcut 1, variant B removes shortcut 2.
+
+### Shared invariants (both variants)
+
+- Scene geometry, labels, and poses come from the evaluation template; only
+  `category_idx` changes per Mahjong record.
+- The four matching groups use four pairwise-distinct faces, and the support
+  pair (`mahjong4_0/4_1`, `mahjong9_0`) uses the fifth face.  Every layout
+  therefore uses all five faces exactly once each as a semantic slot, which
+  keeps every discard-to-group matching unambiguous.
+- `other0/1/2` keep pairwise-distinct categories (faces may repeat).
+- All eight semantic-slot categories (4 groups + support + 3 others) are
+  pairwise distinct.
+- The face band map (`MJ01..MJ05` -> `Wan/Tong/Suo/Honor/Bonus`) is defined in
+  `vqa_gen/make_kong/tile_faces.py` and may be verified against the USD
+  textures with `--verify-faces`.
+
+### Variant A: deranged discard pairing
+
+- The 12 kong slots remain contiguous group blocks (nominal labels).
+- The four discard tiles get a **derangement** of the four group faces: no
+  discard keeps the face of its nominal slot group.
+
+### Variant B: scattered group faces
+
+- Reuses variant A's discard pairing (identical discard categories).
+- The twelve kong slots receive a uniform random permutation of the multiset
+  `{group0 x3, group1 x3, group2 x3, group3 x3}` — a group's three tiles may
+  land anywhere in the row, contiguous or not.
+
+### Layout manifest
+
+`manifest.json` records per layout pair: `group_categories` /
+`group_face_names` / `support_*` / `other_categories`; `discard_derangement`
+(discard label -> category); `kong_scatter` (per-slot group index for variant
+B); `generation_runs` (seeds and counts), `face_vocabulary`,
+`total_layout_pairs`.  `load_vqa_layout_pool` re-validates every layout on
+load and requires continuous per-variant IDs from 0.
+
+### Consumer contract
+
+`vqa_gen/make_kong/generate_make_kong_vqa.py` resolves each target group
+entirely from the layout JSON: for a discard label, the matching group is the
+three kong labels sharing its `category_idx`.  No pairing metadata is needed at
+runtime; the manifest remains an audit artifact.
 
 ## Question families
 
-### `matching_tile_indices_to_push`
+For every target group the collector plans the coverage matrix (per variant):
+zero fallen, one/two/three fallen matching tiles, 3+1, 3+2, and pure wrong
+sets of 1-5 tiles.  Each scene emits four records; the zero-fallen scene also
+emits the suit question.
 
-After the opponent tile is knocked down and before any matching robot-side tile
-is knocked down, identify the matching group:
+### `discard_suit`
 
-```text
-After the face-up opponent tile is knocked down, which three tiles on our side should be knocked down? Return their 1-based left-to-right indices as a tuple.
-```
-
-The answer is an ordered short-text triple, for example `(2, 6, 11)`, where
-indices refer to the complete robot-side row from left to right.
-
-### `matching_tile_still_needs_action`
-
-For each fallen-state pattern `000` through `111`, the collector asks all three
-matching tiles:
+Only on the zero-fallen scene, once per layout and target group:
 
 ```text
-Based on the face-up reference tile and the current board state, does the {N}th tile from the left still need to be knocked down? Answer yes or no.
+What is the suit of the tile knocked down by the opponent robot arm? Answer with one of: Wan, Tong, Suo, Honor, Bonus.
 ```
 
-`yes` means this matching tile is still upright and needs an action. `no`
-means it has already fallen. The complete bitmask set includes cases such as
-`111`, `011`, and `101`.
+Answer type `short_text`, one of the five canonical suit names.
 
-### `kong_declaration_neighbor_state_reason`
+### `fallen_tile_count`
 
-The collector also produces control and error scenes for the immediate
-nonmatching tile(s) beside the matching triplet during kong declaration. The
-matching tiles are fallen, while zero, one, or two adjacent nonmatching tiles
-are fallen according to the available left/right neighbours. This phase is
-before drawing the replacement tile from the left stack and placing it at the
-right end, so it is not a complete make_kong task state.
+Every scene:
 
 ```text
-During kong declaration, only tiles matching the face-up tile should be down. Before the left-stack draw, classify the {N}th tile: correct or nonmatching_fallen.
+How many tiles on our side are currently knocked down? Answer with one integer.
 ```
 
-The short-text answer is `correct` when that nonmatching tile remains upright,
-or `nonmatching_fallen` when it was incorrectly knocked down.
-The default scheduling includes the all-upright control (`00`) as well as every
-available one- and two-tile error pattern.
+Answer type `integer` in `[0, 5]`.
+
+### `fallen_tile_indices`
+
+Every scene:
+
+```text
+Which tiles on our side are currently knocked down? Output their 1-based left-to-right indices in ascending order, or 'none' if no tiles are down.
+```
+
+Answer type `int_list`; the empty list is the `none` answer.  Indices refer to
+the full 14-tile row.
+
+### `missing_matching_tile_bboxes`
+
+Every scene:
+
+```text
+Which of the three tiles matching the suit of the tile knocked down by the opponent are still standing? Output one bounding box per tile in left-to-right order, or 'none' if all three are down.
+```
+
+Answer type `bbox_list`; boxes are the visible tight masks of the matching
+tiles that should still be knocked down; the empty list is the `none` answer.
+
+### `wrong_fallen_tile_bboxes`
+
+Every scene:
+
+```text
+Which tiles on our side whose suit does not match the opponent's tile were incorrectly knocked down? Output one bounding box per tile in left-to-right order, or 'none' if none.
+```
+
+Answer type `bbox_list`; boxes are the visible tight masks of fallen
+non-matching row tiles (including the support pair when fallen).
+
+## Scene coverage matrix
+
+Per layout variant and target group, with deterministic seeded random
+selection (three samples per wrong-tile case):
+
+| fallen | case ids | variant A rule | variant B rule |
+| --- | --- | --- | --- |
+| 0 | `f0` | - | - |
+| 1 correct | `c1_p0..p2` | each matching tile | same |
+| 1 wrong | `w1_s0..s2` | single non-matching tile | same |
+| 2 correct | `c2_p01..p12` | each pair | same |
+| 2 wrong | `w2_s0..s2` | contiguous pair | random pair |
+| 3 correct | `c3` | full group | same |
+| 3 wrong | `w3_s0..s2` | contiguous triple | random triple |
+| 3+1 | `c3w1_L/R` (A), `c3w1_s0..s2` (B) | immediate left/right neighbour | random tile |
+| 4 wrong | `w4_s0..s2` | contiguous block | random 4-set |
+| 3+2 | `c3w2_LL/RR/LR` (A), `c3w2_s0..s2` (B) | two left / two right / one each | random pair |
+| 5 wrong | `w5_s0..s2` | contiguous block | random 5-set |
+
+Variant A edge groups degrade gracefully: infeasible cases are skipped and
+recorded in the manifest's `coverage` section (e.g. no left neighbour for the
+leftmost group).
 
 ## Output invariants
 
-- Every accepted row has visible reference and queried tile evidence in the
-  clean ego image.
-- Tuple answers use `short_text`; all per-tile decisions use `boolean`.
-- Segmentation identity files in `audit/` validate annotations only and are not
-  model inputs.
+- Every accepted row requires visible reference-tile evidence and, per family,
+  visible evidence of every answered tile.
+- `fallen_tile_indices` answers use ascending 1-based left-to-right row
+  indices; `int_list` answers are always ascending.
+- `bbox_list` answers are sorted left-to-right (ascending `x_min`) because the
+  prompt explicitly dictates "in left-to-right order", which overrides the
+  contract's default top-left priority; the empty list is the canonical
+  `none` answer.
+- Every record references the same clean RGB file used as model input.
+- Point and box coordinates are normalized in the original 640x480 ego image.
+- `audit_metadata_json` records variant, layout id, group index, discard label,
+  case id, fallen/missing/wrong labels, and the discard suit.
+- Source layouts and the action dataset are read-only.
+
+## Decision records (merged ADRs)
+
+### Layout variants A/B (former ADR 0001)
+
+The evaluation and data-gen make_kong layouts hard-code the discard-to-group
+pairing and the contiguous group blocks, which lets a VQA model answer
+matching questions from slot positions alone.  We generate variant-A layouts
+(deranged discard faces) and variant-B layouts (scattered group faces, reusing
+A's pairing) so the tile face is always the only valid cue, and we require the
+four group faces plus the support face to be pairwise distinct (all five
+available faces) to keep every discard-to-group matching unambiguous.  This
+replaces the original `data_gen/make_kong/generate_layouts.py` for VQA
+purposes, which cannot express either variant.
+
+### `int_list` and `bbox_list` answer types (former ADR 0002)
+
+The make_kong VQA families must answer "which tiles fell" (a variable-length
+index list) and "which tiles are missing / wrongly fallen" (a variable-length
+bounding-box list, possibly empty).  The universal contract previously allowed
+exactly one typed answer of fixed shape, so we extended it with two new answer
+types: `int_list` (ordered integer list) and `bbox_list` (ordered list of
+normalized yxyx boxes), both with the empty list as the canonical `none`
+answer serialized through a dedicated `<none>` token and `<sep>` separators.
+We chose typed list answers over short-text serialization to keep spatial
+tokenization and per-box validation; the extension lives in the
+`vqa_gen/vqa/sidecar.py` copy, leaving `scripts/internal/vqa` unchanged for
+fill_pen_holder.

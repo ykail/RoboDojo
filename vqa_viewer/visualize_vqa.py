@@ -8,8 +8,11 @@ Example:
 Choose a sidecar directory in the browser after the server starts. The viewer
 only reads ``annotations.parquet``, ``rejected.parquet``, manifest/report JSON
 files, and referenced RGB images. It never modifies the dataset or writes
-review labels. Bounding-box and point answers can be drawn temporarily in the
-browser for inspection; those guides are not saved.
+review labels. Each record also shows the canonical VLM input: the assembled
+``<mode_vqa>`` prompt and the serialized answer tokens (1024 location bins,
+y-first boxes, ``<sep>``/``<none>`` markers). Bounding-box (including
+``bbox_list``) and point answers can be drawn temporarily in the browser for
+inspection; those guides are not saved.
 """
 
 import argparse
@@ -27,13 +30,28 @@ import pyarrow.parquet as pq
 
 LOGGER = logging.getLogger("visualize_vqa")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+NUM_LOCATION_BINS = 1024
+NONE_TOKEN = "<none>"
+SEP_TOKEN = "<sep>"
 ANSWER_COLUMNS = (
     "answer_text",
     "answer_bool",
     "answer_int",
     "answer_point_xy_norm",
     "answer_bbox_xyxy_norm",
+    "answer_bbox_yxyx_norm",
+    "answer_int_list",
+    "answer_bbox_list_xyxy_norm",
+    "answer_bbox_list_yxyx_norm",
 )
+# Legacy collectors (scripts/internal/vqa, fill_pen_holder) store xyxy boxes;
+# the vqa_gen contract stores yxyx.  The viewer normalizes everything to yxyx.
+BBOX_CONVENTIONS = {
+    "answer_bbox_xyxy_norm": "xyxy",
+    "answer_bbox_yxyx_norm": "yxyx",
+    "answer_bbox_list_xyxy_norm": "xyxy",
+    "answer_bbox_list_yxyx_norm": "yxyx",
+}
 VIEW_COLUMNS = (
     "sample_id",
     "task_name",
@@ -63,11 +81,22 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _to_yxyx(value: Any, convention: str) -> Any:
+    """Convert one box or a list of boxes from xyxy to yxyx storage order."""
+
+    if convention == "yxyx":
+        return value
+    if value and isinstance(value[0], (list, tuple)):
+        return [[box[1], box[0], box[3], box[2]] for box in value]
+    return [value[1], value[0], value[3], value[2]]
+
+
 def _answer_value(record: dict[str, Any]) -> Any:
     for column in ANSWER_COLUMNS:
         value = record.get(column)
         if value is not None:
-            return value
+            convention = BBOX_CONVENTIONS.get(column)
+            return _to_yxyx(value, convention) if convention else value
     return None
 
 
@@ -78,6 +107,63 @@ def _answer_text(record: dict[str, Any]) -> str:
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False)
     return "" if value is None else str(value)
+
+
+def _loc_token(value: float) -> str:
+    quantized = min(NUM_LOCATION_BINS - 1, max(0, round(float(value) * (NUM_LOCATION_BINS - 1))))
+    return f"<loc_{quantized:03d}>"
+
+
+def _serialize_answer(record: dict[str, Any]) -> str:
+    """Serialize the typed answer exactly as the VLM answer target is emitted.
+
+    Follows the canonical formats in docs/vqa/01 (1024 location bins, y-first
+    box order, top-left priority, ``<sep>`` separators, ``<none>`` for empty
+    lists).
+    """
+
+    answer_type = record.get("answer_type")
+    value = _answer_value(record)
+    if answer_type == "boolean":
+        return f"<answer_boolean>{'yes' if value else 'no'}<eos>"
+    if answer_type == "integer":
+        return f"<answer_integer>{int(value)}<eos>"
+    if answer_type == "short_text":
+        return f"<answer_short_text>{value}<eos>"
+    if answer_type == "point2d" and value is not None:
+        x, y = value
+        return f"<answer_point2d>{_loc_token(y)}{_loc_token(x)}<eos>"
+    if answer_type == "bbox2d" and value is not None:
+        y_min, x_min, y_max, x_max = value
+        return (
+            f"<answer_bbox2d>{_loc_token(y_min)}{_loc_token(x_min)}"
+            f"{_loc_token(y_max)}{_loc_token(x_max)}<eos>"
+        )
+    if answer_type == "int_list":
+        if not value:
+            return f"<answer_int_list>{NONE_TOKEN}<eos>"
+        return f"<answer_int_list>{SEP_TOKEN.join(str(int(item)) for item in value)}<eos>"
+    if answer_type == "bbox_list":
+        if not value:
+            return f"<answer_bbox_list>{NONE_TOKEN}<eos>"
+        boxes = []
+        for box in value:
+            y_min, x_min, y_max, x_max = box
+            boxes.append(f"{_loc_token(y_min)}{_loc_token(x_min)}{_loc_token(y_max)}{_loc_token(x_max)}")
+        return f"<answer_bbox_list>{SEP_TOKEN.join(boxes)}<eos>"
+    return ""
+
+
+def _vlm_prompt(record: dict[str, Any]) -> str:
+    """Assemble the canonical VLM prompt block from the physical question."""
+
+    return (
+        "<mode_vqa>\n"
+        f"Question: {record.get('prompt_text')}\n"
+        f"Expected answer type: {record.get('answer_type')}\n"
+        "State: {reserved masked state span}\n"
+        "Answer:"
+    )
 
 
 def _as_json_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -94,6 +180,8 @@ def _as_json_record(record: dict[str, Any]) -> dict[str, Any]:
         "answer_type": record.get("answer_type"),
         "answer": value,
         "answer_text": _answer_text(record),
+        "vlm_prompt": _vlm_prompt(record),
+        "vlm_answer": _serialize_answer(record),
         "world_state_valid": record.get("world_state_valid"),
         "image_answerable": record.get("image_answerable"),
         "visibility_status": record.get("visibility_status"),
@@ -355,11 +443,11 @@ HTML = r"""<!doctype html>
     const $ = id => document.getElementById(id);
     function option(select, value, text) { const node=document.createElement('option'); node.value=value; node.textContent=text; select.append(node); }
     function values() { return { source:$('source').value, family:$('family').value, answer_type:$('answerType').value, visibility:$('visibility').value, search:($('search').value || $('quickSearch').value).trim(), offset:state.offset, limit:$('pageSize').value }; }
-    function guide(container, row) { const canvas=document.createElement('canvas'); canvas.width=row.image_width||640; canvas.height=row.image_height||480; const ctx=canvas.getContext('2d'); const answer=row.answer; if(row.answer_type==='point2d' && Array.isArray(answer)){ctx.fillStyle='#ffb454';ctx.strokeStyle='#111';ctx.lineWidth=3;ctx.beginPath();ctx.arc(answer[0]*canvas.width,answer[1]*canvas.height,8,0,Math.PI*2);ctx.fill();ctx.stroke();} if(row.answer_type==='bbox2d' && Array.isArray(answer)){ctx.strokeStyle='#48d1b0';ctx.lineWidth=4;ctx.strokeRect(answer[0]*canvas.width,answer[1]*canvas.height,(answer[2]-answer[0])*canvas.width,(answer[3]-answer[1])*canvas.height);} container.append(canvas); }
-    function image(row) { const wrap=document.createElement('div'); wrap.className='image-wrap'; const img=document.createElement('img'); img.src=row.image_url; img.alt=row.sample_id; wrap.append(img); if(['point2d','bbox2d'].includes(row.answer_type)) guide(wrap,row); return wrap; }
-    function card(row) { const card=document.createElement('button'); card.className='card'; card.append(image(row)); const body=document.createElement('div'); body.className='card-body'; body.innerHTML=`<div class="family">${escape(row.question_family||'unknown')}</div><div>${escape(row.prompt_text||'')}</div><div class="answer">${escape(row.answer_text||'—')}</div><div class="muted">${escape(row.sample_id||'')}</div>`; card.append(body); card.onclick=()=>show(row); return card; }
+    function guide(container, row) { const canvas=document.createElement('canvas'); canvas.width=row.image_width||640; canvas.height=row.image_height||480; const ctx=canvas.getContext('2d'); const answer=row.answer; if(row.answer_type==='point2d' && Array.isArray(answer)){ctx.fillStyle='#ffb454';ctx.strokeStyle='#111';ctx.lineWidth=3;ctx.beginPath();ctx.arc(answer[0]*canvas.width,answer[1]*canvas.height,8,0,Math.PI*2);ctx.fill();ctx.stroke();} const drawBox=box=>{if(Array.isArray(box)&&box.length===4)ctx.strokeRect(box[1]*canvas.width,box[0]*canvas.height,(box[3]-box[1])*canvas.width,(box[2]-box[0])*canvas.height);}; if(row.answer_type==='bbox2d' && Array.isArray(answer)){ctx.strokeStyle='#48d1b0';ctx.lineWidth=4;drawBox(answer);} if(row.answer_type==='bbox_list' && Array.isArray(answer)){ctx.strokeStyle='#48d1b0';ctx.lineWidth=4;answer.forEach(drawBox);} container.append(canvas); }
+    function image(row) { const wrap=document.createElement('div'); wrap.className='image-wrap'; const img=document.createElement('img'); img.src=row.image_url; img.alt=row.sample_id; wrap.append(img); if(['point2d','bbox2d','bbox_list'].includes(row.answer_type)) guide(wrap,row); return wrap; }
+    function card(row) { const card=document.createElement('button'); card.className='card'; card.append(image(row)); const body=document.createElement('div'); body.className='card-body'; body.innerHTML=`<div class="family">${escape(row.question_family||'unknown')}</div><div>${escape(row.prompt_text||'')}</div><div class="answer">${escape(row.vlm_answer||'—')}</div><div class="muted">${escape(row.sample_id||'')}</div>`; card.append(body); card.onclick=()=>show(row); return card; }
     function escape(text) { const node=document.createElement('span'); node.textContent=String(text); return node.innerHTML; }
-    function show(row) { $('detail').replaceChildren(); const shell=document.createElement('div'); shell.className='detail'; const visual=image(row); const info=document.createElement('div'); info.className='detail-info'; info.innerHTML=`<h2>${escape(row.question_family||'')}</h2><p class="muted">${escape(row.sample_id||'')}</p><p><b>Question:</b> ${escape(row.prompt_text||'')}</p><p><b>Answer:</b> ${escape(row.answer_text||'—')}</p><p><b>Answerability:</b> ${String(row.image_answerable)} · <b>Visibility:</b> ${escape(row.visibility_status||'')}</p>${row.rejection_reason?`<p><b>Rejection:</b> ${escape(row.rejection_reason)}</p>`:''}<h2>Audit metadata</h2><pre>${escape(JSON.stringify(row.audit_metadata,null,2))}</pre>`; shell.append(visual,info); $('detail').append(shell); $('dialog').showModal(); }
+    function show(row) { $('detail').replaceChildren(); const shell=document.createElement('div'); shell.className='detail'; const visual=image(row); const info=document.createElement('div'); info.className='detail-info'; info.innerHTML=`<h2>${escape(row.question_family||'')}</h2><p class="muted">${escape(row.sample_id||'')}</p><h2>VLM input (question)</h2><pre>${escape(row.vlm_prompt||'')}</pre><p><b>VLM answer:</b></p><pre>${escape(row.vlm_answer||'—')}</pre><p><b>Answerability:</b> ${String(row.image_answerable)} · <b>Visibility:</b> ${escape(row.visibility_status||'')}</p>${row.rejection_reason?`<p><b>Rejection:</b> ${escape(row.rejection_reason)}</p>`:''}<h2>Physical answer</h2><pre>${escape(row.answer_text||'—')}</pre><h2>Audit metadata</h2><pre>${escape(JSON.stringify(row.audit_metadata,null,2))}</pre>`; shell.append(visual,info); $('detail').append(shell); $('dialog').showModal(); }
     async function requestJson(url, options) { const response=await fetch(url,options); const data=await response.json().catch(()=>({})); if(!response.ok) throw new Error(data.message||data.detail||response.statusText); return data; }
     function emptyGrid(message) { $('grid').innerHTML=`<div class="empty">${escape(message)}</div>`; $('pageInfo').textContent=''; $('previous').disabled=true; $('next').disabled=true; }
     async function loadSummary() { const data=await requestJson('/api/summary'); state.summary=data; if(!data.loaded){ $('dataset').textContent='No dataset selected'; $('counts').textContent='Choose a local VQA sidecar directory above.'; $('manifest').textContent='No dataset selected.'; emptyGrid('Choose a VQA sidecar directory to begin review.'); return false; } $('dataset').textContent=data.dataset_dir; $('counts').textContent=`${data.accepted_count} accepted · ${data.rejected_count} rejected`; $('manifest').textContent=JSON.stringify(data.manifest||data.report||{},null,2); [['family',data.question_families],['answerType',data.answer_types],['visibility',data.visibility_statuses]].forEach(([id,items])=>{const select=$(id); select.replaceChildren(); option(select,'','All'); items.forEach(value=>option(select,value,value));}); return true; }
