@@ -485,7 +485,10 @@ class SceneManager:
         env_root = self.env_roots[env_id]
         if types not in ["Table", "Room", "Light", "Ground"]:
             return
-        prim_path = f"{env_root}/{types}"
+        # LayoutManager stores room instances below the plural ``Rooms`` root,
+        # while the scene config and this API use the logical name ``Room``.
+        stage_type = "Rooms" if types == "Room" else types
+        prim_path = f"{env_root}/{stage_type}"
         if is_prim_path_valid(prim_path):
             delete_prim(prim_path)
 
