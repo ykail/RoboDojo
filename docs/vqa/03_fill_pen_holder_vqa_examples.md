@@ -5,7 +5,7 @@ segmentation and depth are used only to validate physical annotations.
 
 ## Real robot-state pool
 
-Run `scripts/internal/extract_fill_pen_holder_robot_states.py` before VQA
+Run `vqa_gen/fill_pen_holder/extract_fill_pen_holder_robot_states.py` before VQA
 generation. It extracts every valid paired left/right `xyz + wxyz + gripper`
 state from `data/fill_pen_holder` and retains source index, episode, frame, and
 timestamp. Every generated scene samples one complete paired state; it is

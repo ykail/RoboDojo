@@ -1,8 +1,8 @@
-"""VQA data generation toolkit (make_kong-focused vqa_gen workspace).
+"""VQA data generation toolkit (vqa_gen workspace).
 
-``vqa_gen.vqa`` mirrors ``scripts.internal.vqa`` but is free to evolve for the
-make_kong VQA pipeline; ``scripts.internal.vqa`` stays untouched for the
-fill_pen_holder collector.
+``vqa_gen.vqa`` is the canonical typed-VQA sidecar module.  It evolved from the
+legacy ``scripts/internal/vqa`` package to serve the make_kong and
+fill_pen_holder collectors after their migration out of ``scripts/``.
 """
 
 from .vqa import (  # noqa: F401

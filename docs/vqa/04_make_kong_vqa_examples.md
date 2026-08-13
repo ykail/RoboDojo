@@ -218,5 +218,5 @@ normalized yxyx boxes), both with the empty list as the canonical `none`
 answer serialized through a dedicated `<none>` token and `<sep>` separators.
 We chose typed list answers over short-text serialization to keep spatial
 tokenization and per-box validation; the extension lives in the
-`vqa_gen/vqa/sidecar.py` copy, leaving `scripts/internal/vqa` unchanged for
-fill_pen_holder.
+`vqa_gen/vqa/sidecar.py` copy, leaving the legacy sidecar in `scripts/internal/vqa`
+for the pre-migration fill_pen_holder output.

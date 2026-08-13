@@ -44,8 +44,8 @@ ANSWER_COLUMNS = (
     "answer_bbox_list_xyxy_norm",
     "answer_bbox_list_yxyx_norm",
 )
-# Legacy collectors (scripts/internal/vqa, fill_pen_holder) store xyxy boxes;
-# the vqa_gen contract stores yxyx.  The viewer normalizes everything to yxyx.
+# Legacy datasets (pre-vqa_gen fill_pen_holder) store xyxy boxes; the vqa_gen
+# contract stores yxyx.  The viewer normalizes everything to yxyx.
 BBOX_CONVENTIONS = {
     "answer_bbox_xyxy_norm": "xyxy",
     "answer_bbox_yxyx_norm": "yxyx",

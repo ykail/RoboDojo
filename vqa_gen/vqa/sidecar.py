@@ -4,9 +4,9 @@ The functions in this module deliberately operate on physical annotation
 records, not model tokens.  They are usable without Isaac Sim and are shared
 by the vqa_gen collectors.
 
-Compared with ``scripts.internal.vqa.sidecar``, this copy adds the variable
-size ``int_list`` and ``bbox_list`` answer types whose empty value encodes the
-canonical ``none`` answer.
+It evolved from the legacy ``scripts.internal.vqa.sidecar``: it adds the
+variable-size ``int_list`` and ``bbox_list`` answer types whose empty value
+encodes the canonical ``none`` answer, and stores bbox2d as ``yxyx``.
 """
 
 from collections import Counter, defaultdict

@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.internal.vqa.robot_state_pool import POOL_COLUMNS, RobotStatePoolError, state_pool_record
+from vqa_gen.vqa.robot_state_pool import POOL_COLUMNS, RobotStatePoolError, state_pool_record
 
 DEFAULT_INPUT = REPO_ROOT / "data" / "fill_pen_holder" / "data" / "chunk-000" / "file-000.parquet"
 DEFAULT_OUTPUT = REPO_ROOT / "data" / "fill_pen_holder" / "meta" / "vqa_robot_state_pool.parquet"
@@ -82,7 +82,7 @@ def main() -> None:
     manifest_path.write_text(
         json.dumps(
             {
-                "extractor": "scripts/internal/extract_fill_pen_holder_robot_states.py",
+                "extractor": "vqa_gen/fill_pen_holder/extract_fill_pen_holder_robot_states.py",
                 "input": str(args.input),
                 "output": str(args.output),
                 "columns": list(POOL_COLUMNS),

@@ -8,7 +8,7 @@ LeRobot action-data mutation is required.
 Batch example (all ``fill_pen_holder`` layouts for seed 0, 30 deterministic
 scene snapshots per layout):
 
-    python scripts/internal/generate_fill_pen_holder_vqa.py \
+    python vqa_gen/fill_pen_holder/generate_fill_pen_holder_vqa.py \
         --headless --enable_cameras --seed 0 --max-layouts 5 \
         --scene-count 30 --scenario layout gripper_content visible_counts \
         --output-dir ./output/RoboDojo_vqa_v2/fill_pen_holder_seed0
@@ -36,8 +36,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.internal.vqa.robot_state_pool import RobotStatePoolError, load_robot_state_pool
-from scripts.internal.vqa.sidecar import (
+from vqa_gen.vqa.robot_state_pool import RobotStatePoolError, load_robot_state_pool
+from vqa_gen.vqa.sidecar import (
     SidecarWriter,
     VisibilityThresholds,
     base_record,
@@ -45,7 +45,7 @@ from scripts.internal.vqa.sidecar import (
     classify_mask_visibility,
     json_dumps,
 )
-from scripts.internal.vqa.task_logic import holder_pose_condition, pen_descriptions_from_features
+from vqa_gen.vqa.task_logic import holder_pose_condition, pen_descriptions_from_features
 
 DEFAULT_LAYOUT_ROOT = PROJECT_ROOT / "Assets" / "Eval_Layout" / "RoboDojo" / "arx_x5"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "RoboDojo_vqa_v2" / "fill_pen_holder"
@@ -945,17 +945,18 @@ def _add_case_records(
         else:
             writer.add(holder)
         box = bbox_from_mask(masks["pen_holder"])
+        yxyx = [box[1], box[0], box[3], box[2]] if box is not None else None
         holder_box = candidate("holder_bbox", "holder_bbox") | {
             "prompt_text": "Locate the visible pen holder in the ego-view image. Return one bounding box.",
             "answer_type": "bbox2d",
-            "answer_bbox_xyxy_norm": box,
+            "answer_bbox_yxyx_norm": yxyx,
             "world_state_valid": True,
             "image_answerable": box is not None and holder_status in {"visible", "partially_visible"},
             "visibility_status": holder_status,
             "visible_fraction": holder_fraction,
             "occlusion_ratio": holder_occlusion,
             "target_view": "ego",
-            "coordinate_space": "original_image_normalized_xyxy",
+            "coordinate_space": "original_image_normalized_yxyx",
             "bbox_definition": "visible_tight",
             "gt_source": "ego_instance_segmentation",
             "quality_score": float(masks["pen_holder"].sum()),
@@ -1070,7 +1071,7 @@ def _manifest(
     """Build manifest data even when Isaac exits before the first capture."""
 
     manifest: dict[str, Any] = {
-        "collector": "scripts/internal/generate_fill_pen_holder_vqa.py",
+        "collector": "vqa_gen/fill_pen_holder/generate_fill_pen_holder_vqa.py",
         "task_name": "fill_pen_holder",
         "source_action_dataset": "RoboDojo_ee_lerobot_v30_video",
         "seed": args.seed,

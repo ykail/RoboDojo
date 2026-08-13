@@ -10,8 +10,8 @@ import unittest
 import numpy as np
 import pyarrow.parquet as pq
 
-from scripts.internal.vqa.robot_state_pool import RobotStatePoolError, split_paired_state, state_pool_record
-from scripts.internal.vqa.sidecar import (
+from vqa_gen.vqa.robot_state_pool import RobotStatePoolError, split_paired_state, state_pool_record
+from vqa_gen.vqa.sidecar import (
     SidecarWriter,
     ValidationError,
     VisibilityThresholds,
@@ -20,7 +20,7 @@ from scripts.internal.vqa.sidecar import (
     classify_mask_visibility,
     validate_record,
 )
-from scripts.internal.vqa.task_logic import (
+from vqa_gen.vqa.task_logic import (
     adjacent_nonmatching_labels,
     fallen_labels_for_pattern,
     holder_pose_condition,
@@ -133,7 +133,9 @@ class VqaSidecarTests(unittest.TestCase):
                     "answer_bool",
                     "answer_int",
                     "answer_point_xy_norm",
-                    "answer_bbox_xyxy_norm",
+                    "answer_bbox_yxyx_norm",
+                    "answer_int_list",
+                    "answer_bbox_list_yxyx_norm",
                     "answer_aliases",
                     "world_state_valid",
                     "image_answerable",
