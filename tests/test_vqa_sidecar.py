@@ -60,7 +60,7 @@ class VqaSidecarTests(unittest.TestCase):
     def test_visible_bbox_uses_pixel_exterior_edges(self) -> None:
         mask = np.zeros((10, 20), dtype=bool)
         mask[2:5, 4:8] = True
-        self.assertEqual(bbox_from_mask(mask), [0.2, 0.2, 0.4, 0.5])
+        self.assertEqual(bbox_from_mask(mask), [0.2, 0.2, 0.5, 0.4])
 
     def test_thin_object_visibility_threshold(self) -> None:
         thresholds = VisibilityThresholds(12, 6, 0.03, 0.5)
@@ -132,7 +132,7 @@ class VqaSidecarTests(unittest.TestCase):
                     "answer_text",
                     "answer_bool",
                     "answer_int",
-                    "answer_point_xy_norm",
+                    "answer_point_yx_norm",
                     "answer_bbox_yxyx_norm",
                     "answer_int_list",
                     "answer_bbox_list_yxyx_norm",

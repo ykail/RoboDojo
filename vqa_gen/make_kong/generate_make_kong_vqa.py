@@ -9,16 +9,16 @@ opponent discard knocked face-up, and emits five question families:
 - ``fallen_tile_count``: how many own-side row tiles are down (0-5);
 - ``fallen_tile_indices``: the 1-based left-to-right indices of every fallen
   row tile, ``none`` when empty;
-- ``missing_matching_tile_bboxes``: visible boxes of matching tiles that
-  should still be knocked down, ``none`` when empty;
+- ``missing_matching_tile_bboxes``: visible boxes of matching tiles that are
+  still standing, ``none`` when empty;
 - ``wrong_fallen_tile_bboxes``: visible boxes of incorrectly fallen
   non-matching tiles, ``none`` when empty.
 
 Example:
     python vqa_gen/make_kong/generate_make_kong_vqa.py \
-        --headless --enable_cameras --device-id 0 --seed 0 \
+        --headless --enable_cameras --device-id 0 --seed 2810 \
         --variant a,b --layout-ids 0 --max-layouts 1 \
-        --output-dir ./output/RoboDojo_vqa_v2/make_kong_ab_seed0 --overwrite
+        --output-dir ./output/RoboDojo_vqa_v3/make_kong_seed2810 --overwrite
 """
 
 import argparse
@@ -79,7 +79,7 @@ parser.add_argument(
 parser.add_argument(
     "--output-dir",
     type=Path,
-    default=Path("data/RoboDojo_vqa_v2/make_kong_ab"),
+    default=Path("output/RoboDojo_vqa_v3/make_kong_seed2810"),
     help="Output directory for the typed VQA sidecar.",
 )
 parser.add_argument("--overwrite", action="store_true", help="Replace --output-dir if it already exists.")
@@ -622,22 +622,17 @@ def _render_scene(
         return row_labels.index(label) + 1
 
     def boxes_for(labels: list[str]) -> list[list[float]]:
-        # bbox_from_mask yields xyxy; storage is yxyx ([y_min, x_min, y_max, x_max]).
         return [
-            [box[1], box[0], box[3], box[2]]
+            box
             for label in labels
             if (box := bbox_from_mask(masks[label])) is not None
         ]
 
     def left_to_right_boxes(labels: list[str]) -> tuple[list[str], list[list[float]]]:
-        # The prompt explicitly asks for "left-to-right order", which overrides
-        # the contract's default top-left priority (docs/vqa/01).
+        # The prompt dictates left-to-right order; the serializer preserves it.
         pairs = [(label, box) for label in labels if (box := bbox_from_mask(masks[label])) is not None]
         pairs.sort(key=lambda item: (item[1][1], item[1][0]))
-        return (
-            [label for label, _ in pairs],
-            [[box[1], box[0], box[3], box[2]] for _, box in pairs],
-        )
+        return [label for label, _ in pairs], [box for _, box in pairs]
 
     def label_statuses(labels: list[str]) -> list[str]:
         return [classify_mask_visibility(masks[label], TILE_VISIBILITY)[0] for label in labels]
@@ -746,7 +741,7 @@ def _render_scene(
                     {**audit_base, "missing_labels": missing_sorted, "missing_bboxes": missing_sorted_boxes}
                 ),
             },
-            answerable=all(box is not None for box in missing_boxes),
+            answerable=len(missing_boxes) == len(missing_labels),
             statuses=label_statuses(missing_labels),
         )
     )
@@ -770,7 +765,7 @@ def _render_scene(
                     {**audit_base, "wrong_labels": wrong_sorted, "wrong_bboxes": wrong_sorted_boxes}
                 ),
             },
-            answerable=all(box is not None for box in wrong_boxes),
+            answerable=len(wrong_boxes) == len(wrong_sorted),
             statuses=label_statuses(wrong_sorted),
         )
     )

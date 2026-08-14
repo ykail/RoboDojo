@@ -11,7 +11,7 @@ scene snapshots per layout):
     python vqa_gen/fill_pen_holder/generate_fill_pen_holder_vqa.py \
         --headless --enable_cameras --seed 0 --max-layouts 5 \
         --scene-count 30 --scenario layout gripper_content visible_counts \
-        --output-dir ./output/RoboDojo_vqa_v2/fill_pen_holder_seed0
+        --output-dir ./output/RoboDojo_vqa_v3/fill_pen_holder_seed0
 
 The output directory must be new. To deliberately replace an existing batch,
 add ``--overwrite`` after reviewing the directory target.
@@ -48,7 +48,7 @@ from vqa_gen.vqa.sidecar import (
 from vqa_gen.vqa.task_logic import holder_pose_condition, pen_descriptions_from_features
 
 DEFAULT_LAYOUT_ROOT = PROJECT_ROOT / "Assets" / "Eval_Layout" / "RoboDojo" / "arx_x5"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "RoboDojo_vqa_v2" / "fill_pen_holder"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "RoboDojo_vqa_v3" / "fill_pen_holder"
 DEFAULT_ROBOT_STATE_POOL = PROJECT_ROOT / "data" / "fill_pen_holder" / "meta" / "vqa_robot_state_pool.parquet"
 IMAGE_WIDTH = 640
 IMAGE_HEIGHT = 480
@@ -703,7 +703,7 @@ def _visible_nib_point(env, mask: np.ndarray, depth: np.ndarray, label: str) -> 
     local_depth = depth[y0:y1, x0:x1]
     matching = local_mask & np.isfinite(local_depth) & (np.abs(local_depth - projected_depth) <= NIB_DEPTH_TOLERANCE_M)
     if int(matching.sum()) >= NIB_MIN_MATCHING_PIXELS:
-        return [float(u / width), float(v / height)], "visible"
+        return [float(v / height), float(u / width)], "visible"
     if not np.any(local_mask):
         return None, "occluded"
     return None, "ambiguous"
@@ -945,11 +945,10 @@ def _add_case_records(
         else:
             writer.add(holder)
         box = bbox_from_mask(masks["pen_holder"])
-        yxyx = [box[1], box[0], box[3], box[2]] if box is not None else None
         holder_box = candidate("holder_bbox", "holder_bbox") | {
             "prompt_text": "Locate the visible pen holder in the ego-view image. Return one bounding box.",
             "answer_type": "bbox2d",
-            "answer_bbox_yxyx_norm": yxyx,
+            "answer_bbox_yxyx_norm": box,
             "world_state_valid": True,
             "image_answerable": box is not None and holder_status in {"visible", "partially_visible"},
             "visibility_status": holder_status,
@@ -971,12 +970,12 @@ def _add_case_records(
             record = candidate("pen_nib_grounding", f"nib_{ordinal}") | {
                 "prompt_text": f"Locate the nib of {description} in the ego-view image. Return one point.",
                 "answer_type": "point2d",
-                "answer_point_xy_norm": point,
+                "answer_point_yx_norm": point,
                 "world_state_valid": True,
                 "image_answerable": point is not None and status == "visible",
                 "visibility_status": status,
                 "target_view": "ego",
-                "coordinate_space": "original_image_normalized_xy",
+                "coordinate_space": "original_image_normalized_yx",
                 "point_definition": "functional_nib_tip",
                 "gt_source": "simulated_3d_functional_point_projection",
                 "audit_metadata_json": audit_metadata(

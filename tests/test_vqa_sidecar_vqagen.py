@@ -33,6 +33,26 @@ def _base(**overrides):
 
 
 class VqaGenSidecarTests(unittest.TestCase):
+    def test_point_uses_yx_storage(self) -> None:
+        record = _base(
+            answer_type="point2d",
+            answer_point_yx_norm=[0.8, 0.3],
+            target_view="ego",
+            point_definition="functional_nib_tip",
+        )
+        point = validate_record(record)["answer_point_yx_norm"]
+        self.assertAlmostEqual(point[0], 0.8)
+        self.assertAlmostEqual(point[1], 0.3)
+        with self.assertRaises(ValidationError):
+            validate_record(
+                _base(
+                    answer_type="point2d",
+                    answer_point_xy_norm=[0.3, 0.8],
+                    target_view="ego",
+                    point_definition="functional_nib_tip",
+                )
+            )
+
     def test_int_list_accepts_empty_and_ordered_values(self) -> None:
         record = _base(answer_type="int_list", answer_int_list=[2, 5, 8])
         self.assertEqual(validate_record(record)["answer_int_list"], [2, 5, 8])

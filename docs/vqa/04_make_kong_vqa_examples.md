@@ -215,7 +215,7 @@ bounding-box list, possibly empty).  The universal contract previously allowed
 exactly one typed answer of fixed shape, so we extended it with two new answer
 types: `int_list` (ordered integer list) and `bbox_list` (ordered list of
 normalized yxyx boxes), both with the empty list as the canonical `none`
-answer serialized through a dedicated `<none>` token and `<sep>` separators.
+answer serialized through the plain word `none` and `;` separators.
 We chose typed list answers over short-text serialization to keep spatial
 tokenization and per-box validation; the extension lives in the
 `vqa_gen/vqa/sidecar.py` copy, leaving the legacy sidecar in `scripts/internal/vqa`

@@ -6,7 +6,8 @@ by the vqa_gen collectors.
 
 It evolved from the legacy ``scripts.internal.vqa.sidecar``: it adds the
 variable-size ``int_list`` and ``bbox_list`` answer types whose empty value
-encodes the canonical ``none`` answer, and stores bbox2d as ``yxyx``.
+encodes the canonical ``none`` answer, and stores points and boxes in model-token
+order (``yx`` and ``yxyx``).
 """
 
 from collections import Counter, defaultdict
@@ -18,13 +19,13 @@ from typing import Any
 
 import numpy as np
 
-ANNOTATION_VERSION = "robodojo_vqa_v1"
-SOURCE_DATASET = "RoboDojo_vqa_synthetic_v1"
+ANNOTATION_VERSION = "robodojo_vqa_v3"
+SOURCE_DATASET = "RoboDojo_vqa_synthetic_v3"
 ANSWER_FIELDS = (
     "answer_text",
     "answer_bool",
     "answer_int",
-    "answer_point_xy_norm",
+    "answer_point_yx_norm",
     "answer_bbox_yxyx_norm",
     "answer_int_list",
     "answer_bbox_list_yxyx_norm",
@@ -67,7 +68,7 @@ def json_dumps(value: Any) -> str:
 
 
 def bbox_from_mask(mask: np.ndarray) -> list[float] | None:
-    """Return the visible tight box in normalized ``[x0, y0, x1, y1]`` order.
+    """Return the visible tight box in normalized ``[y0, x0, y1, x1]`` order.
 
     Pixel boxes are represented by their exterior edges, therefore a one-pixel
     object has non-zero width and a mask touching the final column normalizes
@@ -80,10 +81,10 @@ def bbox_from_mask(mask: np.ndarray) -> list[float] | None:
     height, width = mask.shape
     ys, xs = np.nonzero(mask)
     return [
-        float(xs.min() / width),
         float(ys.min() / height),
-        float((xs.max() + 1) / width),
+        float(xs.min() / width),
         float((ys.max() + 1) / height),
+        float((xs.max() + 1) / width),
     ]
 
 
@@ -158,7 +159,7 @@ def base_record(**overrides: Any) -> dict[str, Any]:
         "answer_text": None,
         "answer_bool": None,
         "answer_int": None,
-        "answer_point_xy_norm": None,
+        "answer_point_yx_norm": None,
         "answer_bbox_yxyx_norm": None,
         "answer_int_list": None,
         "answer_bbox_list_yxyx_norm": None,
@@ -189,7 +190,7 @@ def _exact_answer_field(record: dict[str, Any]) -> str:
     if len(fields) != 1:
         raise ValidationError(f"expected exactly one answer field, found {fields}")
     expected = {
-        "point2d": "answer_point_xy_norm",
+        "point2d": "answer_point_yx_norm",
         "bbox2d": "answer_bbox_yxyx_norm",
         "boolean": "answer_bool",
         "short_text": "answer_text",
@@ -307,7 +308,7 @@ def _parquet_schema():
             pa.field("answer_int", pa.int64()),
             # Variable Arrow lists avoid a PyArrow 25 null fixed-size-list
             # round-trip bug. ``validate_record`` still enforces [2]/[4].
-            pa.field("answer_point_xy_norm", pa.list_(pa.float32())),
+            pa.field("answer_point_yx_norm", pa.list_(pa.float32())),
             pa.field("answer_bbox_yxyx_norm", pa.list_(pa.float32())),
             pa.field("answer_int_list", pa.list_(pa.int64())),
             pa.field("answer_bbox_list_yxyx_norm", pa.list_(pa.list_(pa.float32()))),
