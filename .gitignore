@@ -31,5 +31,6 @@ output
 private
 tmp
 temp
-data_gen/make_kong/layouts/
-vqa_gen/make_kong/layouts
+data_gen/make_kong/**layouts/
+vqa_gen/make_kong/**layouts
+vqa_results

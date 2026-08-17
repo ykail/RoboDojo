@@ -1,6 +1,5 @@
 """Fast structural tests for synthetic VQA sidecar utilities."""
 
-from __future__ import annotations
 
 import json
 from pathlib import Path

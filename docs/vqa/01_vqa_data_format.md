@@ -126,7 +126,7 @@ Physical record:
 ```json
 {
   "question_family": "missing_matching_tile_bboxes",
-  "prompt_text": "Which of the three tiles matching the suit of the tile knocked down by the opponent are still standing? Output one bounding box per tile in left-to-right order, or 'none' if all three are down.",
+  "prompt_text": "Which of the three tiles in the 14-tile row on our side that match the suit of the face-up reference discard on the opponent's side are still standing? Output one bounding box per tile in left-to-right order, or 'none' if all three are down.",
   "answer_type": "bbox_list",
   "answer_bbox_list_yxyx_norm": [
     [0.5021, 0.4406, 0.5604, 0.4797],
@@ -144,7 +144,7 @@ Physical record:
 VLM input (quantized with 1024 bins):
 
 ```text
-Question: Which of the three tiles matching the suit of the tile knocked down by the opponent are still standing? Output one bounding box per tile in left-to-right order, or 'none' if all three are down.
+Question: Which of the three tiles in the 14-tile row on our side that match the suit of the face-up reference discard on the opponent's side are still standing? Output one bounding box per tile in left-to-right order, or 'none' if all three are down.
 Answer:
 <loc0514><loc0451><loc0573><loc0491>;<loc0514><loc0489><loc0573><loc0527>;<loc0514><loc0527><loc0573><loc0567><eos>
 ```

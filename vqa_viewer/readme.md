@@ -23,3 +23,19 @@ visibility filtering, text search, pagination, and detailed audit metadata.
 For point and bounding-box answers, it draws a temporary browser-only guide
 over the displayed image. It never alters the stored PNG or writes labels,
 Parquet files, caches, or review results.
+
+## Evaluation results
+
+After loading the sidecar, load an evaluation result directory that contains
+`predictions.jsonl` and (optionally) `metrics.json`, such as
+`vqa_results/make_kong_v3_vqa_only_9999`. The viewer joins records by
+`sample_id`, shows run and per-sample metrics, raw and parsed predictions, and
+can filter correct, incorrect, invalid, or unevaluated records. For geometric
+answers, green guides are ground truth and pink guides are predictions.
+
+For the current make-kong run, load these directories:
+
+```text
+output/RoboDojo_vqa_v3_test/make_kong_seed2025233210
+vqa_results/make_kong_v3_vqa_only_9999
+```

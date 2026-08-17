@@ -38,29 +38,33 @@ python vqa_gen/make_kong/generate_make_kong_vqa.py \
   --headless --enable_cameras --seed 2810 \
   --variant a,b --layout-ids all \
   --target-groups 0,1,2,3 \
-  --output-dir output/RoboDojo_vqa_v3/make_kong_seed2810 --overwrite
+  --output-dir output/RoboDojo_vqa/make_kong_seed2810 --overwrite
 ```
 
 - `--variant a,b` selects which layout variants to render; `--layout-ids`
   defaults to `all` (every pair in the pool); `--layout-root` overrides the
   pool directory (default: `vqa_gen/make_kong/layouts/`).
-- Each scene writes one clean image plus four records (`fallen_tile_count`,
-  `fallen_tile_indices`, `missing_matching_tile_bboxes`,
-  `wrong_fallen_tile_bboxes`); the zero-fallen scene additionally emits
-  `discard_suit`.
+- Each scene writes one clean image plus `fallen_tile_indices`,
+  `missing_matching_tile_bboxes`, and `wrong_fallen_tile_bboxes`. The
+  collector additionally emits `variants × layout_ids × target_groups`
+  `reference_discard_bbox` records for each 0-5 robot-side fallen-count
+  stratum (six strata total).
+  These selected scenes perturb only the face-up reference discard by a
+  deterministic table-plane offset and yaw; lighting remains fixed in the
+  replayed layout.
 - Output contains `images/`, `audit/`, `annotations.parquet`,
   `rejected.parquet`, `manifest.json`, and `report.json`.  Rejected rows
   keep a stable `rejection_reason`.
 
-## Small smoke test
+## Reference-discard sample count
 
-```bash
-conda activate RoboDojo
-python vqa_gen/make_kong/generate_layouts.py --count 2 --rng-seed 0 --output-dir tmp/vqa_layouts
-python vqa_gen/make_kong/generate_make_kong_vqa.py --headless --enable_cameras --device-id 0 --seed 0 \
-  --variant a --layout-ids 0 --max-layouts 1 --target-groups 0,1 --fps 25 \
-  --layout-root tmp/vqa_layouts --output-dir tmp/make_kong_vqa_smoke --overwrite
-```
+The collector derives the per-stratum count from the selected layout scope:
+`len(variants) × len(layout_ids) × len(target_groups)`. This is the number of
+one-per-group, zero-fallen reference candidates; the same count is selected
+from every 0-5 robot-side fallen-count stratum. For example, 100 layouts of
+variant A with four target groups produce 400 samples per stratum (2,400
+reference-discard records in total); 10 test layouts of variants A/B produce
+80 per stratum (480 total).
 
 ## Tests
 

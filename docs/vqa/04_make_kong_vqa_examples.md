@@ -98,35 +98,34 @@ runtime; the manifest remains an audit artifact.
 
 For every target group the collector plans the coverage matrix (per variant):
 zero fallen, one/two/three fallen matching tiles, 3+1, 3+2, and pure wrong
-sets of 1-5 tiles.  Each scene emits four records; the zero-fallen scene also
-emits the suit question.
+sets of 1-5 tiles. Every scene emits the three row-state questions below. A
+deterministic, fallen-count-balanced subset additionally emits the
+reference-discard localization question.
 
-### `discard_suit`
+### `reference_discard_bbox`
 
-Only on the zero-fallen scene, once per layout and target group:
-
-```text
-What is the suit of the tile knocked down by the opponent robot arm? Answer with one of: Wan, Tong, Suo, Honor, Bonus.
-```
-
-Answer type `short_text`, one of the five canonical suit names.
-
-### `fallen_tile_count`
-
-Every scene:
+The collector selects `variants × layout_ids × target_groups` scenes from
+each 0-5 robot-side fallen-count stratum. This is the one-per-group count of
+zero-fallen reference candidates in the selected layout scope. In selected
+scenes, only the face-up reference discard receives a deterministic `x/y`
+table-plane offset and yaw; the HDR lighting profile remains fixed.
 
 ```text
-How many tiles on our side are currently knocked down? Answer with one integer.
+Locate the face-up reference discard on the opponent's side, knocked down by the opponent robot arm. Output its bounding box.
 ```
 
-Answer type `integer` in `[0, 5]`.
+Answer type `bbox2d`; the answer is the reference discard's visible-tight ego
+mask box. A perturbation is accepted only after settling when its mask is
+visible, has at least 50% of the unperturbed mask pixel count, and has an
+unambiguous segmentation identity. Each row records the derived seed, offset,
+yaw, and attempt in audit metadata.
 
 ### `fallen_tile_indices`
 
 Every scene:
 
 ```text
-Which tiles on our side are currently knocked down? Output their 1-based left-to-right indices in ascending order, or 'none' if no tiles are down.
+Which tiles in the 14-tile row on our side are currently knocked down? Output their 1-based left-to-right indices in ascending order, or 'none' if no tiles are down.
 ```
 
 Answer type `int_list`; the empty list is the `none` answer.  Indices refer to
@@ -137,7 +136,7 @@ the full 14-tile row.
 Every scene:
 
 ```text
-Which of the three tiles matching the suit of the tile knocked down by the opponent are still standing? Output one bounding box per tile in left-to-right order, or 'none' if all three are down.
+Which of the three tiles in the 14-tile row on our side that match the suit of the face-up reference discard on the opponent's side are still standing? Output one bounding box per tile in left-to-right order, or 'none' if all three are down.
 ```
 
 Answer type `bbox_list`; boxes are the visible tight masks of the matching
@@ -148,7 +147,7 @@ tiles that should still be knocked down; the empty list is the `none` answer.
 Every scene:
 
 ```text
-Which tiles on our side whose suit does not match the opponent's tile were incorrectly knocked down? Output one bounding box per tile in left-to-right order, or 'none' if none.
+Which tiles in the 14-tile row on our side do not match the suit of the face-up reference discard on the opponent's side and are knocked down? Output one bounding box per tile in left-to-right order, or 'none' if none.
 ```
 
 Answer type `bbox_list`; boxes are the visible tight masks of fallen
@@ -181,6 +180,10 @@ leftmost group).
 
 - Every accepted row requires visible reference-tile evidence and, per family,
   visible evidence of every answered tile.
+- `reference_discard_bbox` uses one axis-aligned visible-tight box. Boxes for
+  the other list-valued families may overlap even when their instance masks do
+  not: each box is independently derived from its projected mask's min/max
+  extent.
 - `fallen_tile_indices` answers use ascending 1-based left-to-right row
   indices; `int_list` answers are always ascending.
 - `bbox_list` answers are sorted left-to-right (ascending `x_min`) because the

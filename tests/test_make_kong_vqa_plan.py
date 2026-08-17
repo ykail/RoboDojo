@@ -9,6 +9,7 @@ from vqa_gen.make_kong.scene_plan import (
     deranged_discard_assignment,
     plan_cases,
     scatter_kong_group_assignment,
+    select_fallen_count_stratified_scene_ids,
 )
 from vqa_gen.make_kong.tile_faces import FACE_NAMES, categories_for_face, face_of_category
 
@@ -109,6 +110,29 @@ class ScenePlanTests(unittest.TestCase):
         for seed in range(50):
             scatter = scatter_kong_group_assignment(random.Random(seed))
             self.assertEqual(sorted(scatter), [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3])
+
+    def test_reference_bbox_selection_is_balanced_and_stable(self) -> None:
+        scene_fallen_counts = {
+            f"scene_{fallen_count}_{index}": fallen_count
+            for fallen_count in range(6)
+            for index in range(10)
+        }
+        first = select_fallen_count_stratified_scene_ids(scene_fallen_counts, seed=2810, samples_per_stratum=4)
+        second = select_fallen_count_stratified_scene_ids(
+            dict(reversed(list(scene_fallen_counts.items()))), seed=2810, samples_per_stratum=4
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 24)
+        self.assertEqual(
+            [sum(scene_fallen_counts[scene_id] == fallen_count for scene_id in first) for fallen_count in range(6)],
+            [4, 4, 4, 4, 4, 4],
+        )
+
+    def test_reference_bbox_selection_rejects_an_underfilled_stratum(self) -> None:
+        with self.assertRaisesRegex(ValueError, "fallen-count stratum 1"):
+            select_fallen_count_stratified_scene_ids(
+                {"zero_0": 0, "zero_1": 0, "one_0": 1}, seed=0, samples_per_stratum=2
+            )
 
 
 class TileFaceTests(unittest.TestCase):

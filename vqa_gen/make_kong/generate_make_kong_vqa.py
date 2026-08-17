@@ -2,11 +2,10 @@
 
 For each selected variant-A or variant-B layout and target group, the
 collector holds the robots at home, renders clean ``cam_head`` images of the
-opponent discard knocked face-up, and emits five question families:
+opponent discard knocked face-up, and emits four question families:
 
-- ``discard_suit`` (only on the zero-fallen scene): which of the five
-  canonical suits the pushed-down opponent tile shows;
-- ``fallen_tile_count``: how many own-side row tiles are down (0-5);
+- ``reference_discard_bbox``: a visible-tight box for the reference discard
+  in 80 deterministically sampled scenes from each fallen-count stratum;
 - ``fallen_tile_indices``: the 1-based left-to-right indices of every fallen
   row tile, ``none`` when empty;
 - ``missing_matching_tile_bboxes``: visible boxes of matching tiles that are
@@ -18,11 +17,12 @@ Example:
     python vqa_gen/make_kong/generate_make_kong_vqa.py \
         --headless --enable_cameras --device-id 0 --seed 2810 \
         --variant a,b --layout-ids 0 --max-layouts 1 \
-        --output-dir ./output/RoboDojo_vqa_v3/make_kong_seed2810 --overwrite
+        --output-dir ./output/RoboDojo_vqa/make_kong_seed2810 --overwrite
 """
 
 import argparse
 from copy import deepcopy
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -39,8 +39,8 @@ for package_root in (REPO_ROOT / "XPolicyLab", REPO_ROOT):
 from isaaclab.app import AppLauncher
 
 from vqa_gen.make_kong.generate_layouts import DEFAULT_OUTPUT_DIR, VARIANTS, load_vqa_layout_pool
-from vqa_gen.make_kong.scene_plan import FallenCase, plan_cases
-from vqa_gen.make_kong.tile_faces import FACE_NAMES, face_of_category
+from vqa_gen.make_kong.scene_plan import FallenCase, plan_cases, select_fallen_count_stratified_scene_ids
+from vqa_gen.make_kong.tile_faces import FACE_NAMES
 from vqa_gen.vqa.sidecar import (
     SidecarWriter,
     VisibilityThresholds,
@@ -79,7 +79,7 @@ parser.add_argument(
 parser.add_argument(
     "--output-dir",
     type=Path,
-    default=Path("output/RoboDojo_vqa_v3/make_kong_seed2810"),
+    default=Path("output/RoboDojo_vqa/make_kong_seed2810"),
     help="Output directory for the typed VQA sidecar.",
 )
 parser.add_argument("--overwrite", action="store_true", help="Replace --output-dir if it already exists.")
@@ -109,6 +109,10 @@ ROBOT_SIDE_PUSH_DIRECTION = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
 REFERENCE_TILE_PUSH_DIRECTION = np.asarray([0.0, -1.0, 0.0], dtype=np.float32)
 FALLEN_FORWARD_OFFSET_M = 0.045
 FALLEN_Z_OFFSET_M = -0.016
+REFERENCE_DISCARD_X_OFFSET_RANGE_M = (-0.06, 0.06)
+REFERENCE_DISCARD_Y_OFFSET_RANGE_M = (-0.04, 0.04)
+REFERENCE_DISCARD_YAW_RANGE_DEG = (-20.0, 20.0)
+REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS = 10
 KONG_GROUPS = (
     ("mahjong0_0", "mahjong0_1", "mahjong0_2"),
     ("mahjong1_0", "mahjong1_1", "mahjong1_2"),
@@ -162,6 +166,105 @@ def _parse_layout_ids(value: str, pool: dict[tuple[str, int], Any]) -> list[int]
     if not layout_ids:
         raise ValueError("No layout IDs selected.")
     return layout_ids
+
+
+def _scene_id(seed: int, variant: str, layout_id: int, group_index: int, fallen_case: FallenCase) -> str:
+    return (
+        f"make_kong_vqa_seed{seed}_variant{variant}_layout{layout_id:03d}_"
+        f"group{group_index}_case{fallen_case.case_id}"
+    )
+
+
+def _layout_row_labels_left_to_right(layout: dict[str, Any]) -> list[str]:
+    records = {record["label"]: record for record in layout.get("Rigid", {}).get("mahjong", [])}
+    missing = [label for label in _row_labels() if label not in records]
+    if missing:
+        raise RuntimeError(f"layout is missing robot-side row labels: {missing}")
+    return sorted(_row_labels(), key=lambda label: float(records[label]["default_pos"][0]))
+
+
+def _layout_target_labels(row_labels: list[str], layout: dict[str, Any], discard_label: str) -> list[str]:
+    records = {record["label"]: record for record in layout.get("Rigid", {}).get("mahjong", [])}
+    category_idx = records[discard_label]["category_idx"]
+    target_labels = [label for label in row_labels if records[label]["category_idx"] == category_idx]
+    if len(target_labels) != 3:
+        raise RuntimeError(f"discard {discard_label} matches {len(target_labels)} row tiles, expected exactly three")
+    return target_labels
+
+
+def _case_rng(seed: int, layout_id: int, group_index: int, variant_index: int) -> random.Random:
+    return random.Random(seed * 1000003 + layout_id * 65537 + group_index * 1009 + variant_index)
+
+
+def _reference_discard_bbox_samples_per_stratum(
+    variants: list[str], layout_ids: list[int], target_groups: list[int]
+) -> int:
+    """Use one candidate per variant, layout, and reference-discard group."""
+
+    samples_per_stratum = len(variants) * len(layout_ids) * len(target_groups)
+    if samples_per_stratum <= 0:
+        raise ValueError("reference-discard bbox selection requires variants, layouts, and target groups")
+    return samples_per_stratum
+
+
+def _plan_reference_discard_bbox_scenes(
+    pool: dict[tuple[str, int], Any],
+    *,
+    seed: int,
+    variants: list[str],
+    layout_ids: list[int],
+    target_groups: list[int],
+    samples_per_stratum: int,
+) -> frozenset[str]:
+    """Choose the fixed, fallen-count-balanced reference-localization scenes."""
+
+    scene_fallen_counts: dict[str, int] = {}
+    for layout_id in layout_ids:
+        for variant_index, variant in enumerate(variants):
+            layout = pool[(variant, layout_id)][1]
+            row_labels = _layout_row_labels_left_to_right(layout)
+            for group_index in target_groups:
+                target_labels = _layout_target_labels(row_labels, layout, DISCARD_LABELS[group_index])
+                cases, _ = plan_cases(
+                    row_labels,
+                    target_labels,
+                    variant,
+                    _case_rng(seed, layout_id, group_index, variant_index),
+                )
+                for fallen_case in cases:
+                    scene_id = _scene_id(seed, variant, layout_id, group_index, fallen_case)
+                    scene_fallen_counts[scene_id] = len(fallen_case.fallen_labels)
+    selected = select_fallen_count_stratified_scene_ids(
+        scene_fallen_counts,
+        seed=seed,
+        samples_per_stratum=samples_per_stratum,
+    )
+    expected_count = samples_per_stratum * len(set(scene_fallen_counts.values()))
+    if len(selected) != expected_count:
+        raise RuntimeError(f"selected {len(selected)} reference-discard scenes, expected {expected_count}")
+    return selected
+
+
+def _reference_discard_perturbation(seed: int, scene_id: str, attempt: int) -> dict[str, float | int]:
+    if attempt < 0:
+        raise ValueError("attempt must be non-negative")
+    digest = hashlib.sha256(f"{seed}:{scene_id}:{attempt}".encode()).digest()
+    derived_seed = int.from_bytes(digest[:8], "big")
+    rng = random.Random(derived_seed)
+    return {
+        "attempt": attempt,
+        "derived_seed": derived_seed,
+        "x_offset_m": rng.uniform(*REFERENCE_DISCARD_X_OFFSET_RANGE_M),
+        "y_offset_m": rng.uniform(*REFERENCE_DISCARD_Y_OFFSET_RANGE_M),
+        "yaw_deg": rng.uniform(*REFERENCE_DISCARD_YAW_RANGE_DEG),
+    }
+
+
+def _reference_discard_orientation(yaw_deg: float) -> np.ndarray:
+    """Keep the tile face-up while applying its additional vertical-axis yaw."""
+
+    angle_rad = np.deg2rad(180.0 + yaw_deg)
+    return np.asarray([np.cos(angle_rad / 2.0), 0.0, 0.0, np.sin(angle_rad / 2.0)], dtype=np.float32)
 
 
 def _as_numpy(value: Any, *, dtype=None) -> np.ndarray:
@@ -371,6 +474,28 @@ def _capture_ego_annotations(env) -> tuple[np.ndarray, np.ndarray, np.ndarray, d
     return rgb, depth, instance, data["instance_segmentation_fast"][0].get("info", {})
 
 
+def _capture_scene_masks(
+    env,
+    semantic_labels: dict[str, str],
+    semantic_prim_paths: dict[str, str],
+    required_labels: set[str],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, list[int]], dict[str, np.ndarray]]:
+    """Capture RGB and one unambiguous instance mask for every required tile."""
+
+    _reset_ego_render_product(env)
+    rgb, _, instance, info = _capture_ego_annotations(env)
+    semantic_ids = _semantic_id_map(info, semantic_labels, semantic_prim_paths)
+    invalid_mappings = {label: semantic_ids[label] for label in required_labels if len(semantic_ids[label]) != 1}
+    if invalid_mappings:
+        details = ", ".join(f"{label}={ids}" for label, ids in sorted(invalid_mappings.items()))
+        raise AnnotationMappingError(f"semantic-to-instance mapping is not one-to-one: {details}")
+    masks = {
+        label: _mask_for_semantic(instance, info, semantic_labels[label], semantic_prim_paths[label])
+        for label in required_labels
+    }
+    return rgb, instance, info, semantic_ids, masks
+
+
 def _reset_ego_render_product(env) -> None:
     """Discard tiled-camera DLAA history after a static-scene teleport."""
 
@@ -559,19 +684,20 @@ def _render_scene(
     seed: int,
     variant: str,
     layout_id: int,
-    layout: dict[str, Any],
     row_labels: list[str],
     target_labels: list[str],
     discard_label: str,
     group_index: int,
     fallen_case: FallenCase,
+    reference_discard_bbox_scene_ids: frozenset[str],
 ) -> None:
     target_set = set(target_labels)
     _, reference_position, _ = _label_object(env, discard_label)
+    reference_fallen_position = _fallen_tile_position(reference_position, REFERENCE_TILE_PUSH_DIRECTION)
     _set_label_pose(
         env,
         discard_label,
-        _fallen_tile_position(reference_position, REFERENCE_TILE_PUSH_DIRECTION),
+        reference_fallen_position,
         REFERENCE_TILE_FALLEN_QUATERNION,
     )
     for label in fallen_case.fallen_labels:
@@ -585,26 +711,64 @@ def _render_scene(
     _restore_robot_home(env)
     _settle(env)
 
-    scene_id = (
-        f"make_kong_vqa_seed{seed}_variant{variant}_layout{layout_id:03d}_"
-        f"group{group_index}_case{fallen_case.case_id}"
-    )
+    scene_id = _scene_id(seed, variant, layout_id, group_index, fallen_case)
+    reference_bbox_selected = scene_id in reference_discard_bbox_scene_ids
+    reference_pixel_count = None
+    perturbation = None
+    reference_bbox_rejection_reason = None
     try:
         semantic_labels, semantic_prim_paths = _label_tile_instances(env)
-        _reset_ego_render_product(env)
-        rgb, _, instance, info = _capture_ego_annotations(env)
+        required_labels = set(row_labels) | {discard_label}
+        if reference_bbox_selected:
+            _, _, _, _, baseline_masks = _capture_scene_masks(
+                env, semantic_labels, semantic_prim_paths, required_labels
+            )
+            reference_pixel_count = int(baseline_masks[discard_label].sum())
+            if reference_pixel_count <= 0:
+                raise AnnotationMappingError("reference discard has no baseline visible pixels")
+            for attempt in range(REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS):
+                candidate_perturbation = _reference_discard_perturbation(seed, scene_id, attempt)
+                perturbed_position = reference_fallen_position.copy()
+                perturbed_position[0] += candidate_perturbation["x_offset_m"]
+                perturbed_position[1] += candidate_perturbation["y_offset_m"]
+                _set_label_pose(
+                    env,
+                    discard_label,
+                    perturbed_position,
+                    _reference_discard_orientation(candidate_perturbation["yaw_deg"]),
+                )
+                _settle(env)
+                rgb, instance, info, semantic_ids, masks = _capture_scene_masks(
+                    env, semantic_labels, semantic_prim_paths, required_labels
+                )
+                reference_status, reference_fraction, _ = classify_mask_visibility(
+                    masks[discard_label], TILE_VISIBILITY, reference_pixel_count=reference_pixel_count
+                )
+                reference_bbox = bbox_from_mask(masks[discard_label])
+                other_tile_mask = np.zeros_like(masks[discard_label], dtype=bool)
+                for label in required_labels - {discard_label}:
+                    other_tile_mask |= masks[label]
+                if (
+                    reference_status == "visible"
+                    and reference_fraction is not None
+                    and reference_fraction >= 0.5
+                    and reference_bbox is not None
+                    and not np.any(masks[discard_label] & other_tile_mask)
+                ):
+                    perturbation = candidate_perturbation
+                    break
+            if perturbation is None:
+                reference_bbox_rejection_reason = (
+                    "reference-discard perturbation failed "
+                    f"{REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS} acceptance attempts"
+                )
+        else:
+            rgb, instance, info, semantic_ids, masks = _capture_scene_masks(
+                env, semantic_labels, semantic_prim_paths, required_labels
+            )
         semantic_ids = _write_segmentation_audit(
             audit_dir, scene_id, instance, info, semantic_labels, semantic_prim_paths
         )
-        required_labels = set(row_labels) | {discard_label}
-        invalid_mappings = {label: semantic_ids[label] for label in required_labels if len(semantic_ids[label]) != 1}
-        if invalid_mappings:
-            details = ", ".join(f"{label}={ids}" for label, ids in sorted(invalid_mappings.items()))
-            raise AnnotationMappingError(f"semantic-to-instance mapping is not one-to-one: {details}")
-        masks = {
-            label: _mask_for_semantic(instance, info, semantic_labels[label], semantic_prim_paths[label])
-            for label in required_labels
-        }
     except AnnotationMappingError as error:
         writer.reject(
             base_record(
@@ -616,7 +780,10 @@ def _render_scene(
     image_name = f"{scene_id}.png"
     Image.fromarray(rgb).save(image_dir / image_name)
     image_reference = str(Path("images") / image_name)
-    reference_status, reference_fraction, _ = classify_mask_visibility(masks[discard_label], TILE_VISIBILITY)
+    reference_status, reference_fraction, _ = classify_mask_visibility(
+        masks[discard_label], TILE_VISIBILITY, reference_pixel_count=reference_pixel_count
+    )
+    reference_bbox = bbox_from_mask(masks[discard_label])
 
     def row_index(label: str) -> int:
         return row_labels.index(label) + 1
@@ -674,6 +841,8 @@ def _render_scene(
         "target_labels": list(target_labels),
         "reference_visible_fraction": reference_fraction,
         "reference_visibility_status": reference_status,
+        "reference_discard_bbox_selected": reference_bbox_selected,
+        "reference_discard_perturbation": perturbation,
         "semantic_instance_ids": {label: semantic_ids[label][0] for label in sorted(required_labels)},
     }
 
@@ -681,23 +850,38 @@ def _render_scene(
     missing_labels = [label for label in target_labels if label not in fallen_case.fallen_labels]
     wrong_sorted = [label for label in row_labels if label not in target_set and label in fallen_case.fallen_labels]
 
-    writer.add(
-        spatial_metadata(
-            candidate(
-                "fallen_tile_count",
-                "fallen_tile_count",
-                answer_type="integer",
-                prompt="How many tiles on our side are currently knocked down? Answer with one integer.",
+    if reference_bbox_selected:
+        reference_record = candidate(
+            "reference_discard_bbox",
+            "reference_discard_bbox",
+            answer_type="bbox2d",
+            prompt=(
+                "Locate the face-up reference discard on the opponent's side, knocked down by the opponent "
+                "robot arm. Output its bounding box."
+            ),
+        ) | {
+            "gt_source": "simulated_reference_discard_identity_and_pose",
+            "audit_metadata_json": json_dumps(
+                {
+                    **audit_base,
+                    "fallen_count": len(fallen_case.fallen_labels),
+                    "reference_discard_bbox": reference_bbox,
+                }
+            ),
+        }
+        if reference_bbox_rejection_reason is None and reference_bbox is not None:
+            writer.add(
+                spatial_metadata(
+                    reference_record | {"answer_bbox_yxyx_norm": reference_bbox},
+                    answerable=True,
+                    statuses=[],
+                )
             )
-            | {
-                "answer_int": len(fallen_case.fallen_labels),
-                "gt_source": "simulated_fallen_tile_set",
-                "audit_metadata_json": json_dumps({**audit_base, "fallen_count": len(fallen_case.fallen_labels)}),
-            },
-            answerable=True,
-            statuses=label_statuses(fallen_sorted),
-        )
-    )
+        else:
+            writer.reject(
+                reference_record,
+                reference_bbox_rejection_reason or "reference discard has no visible-tight bounding box",
+            )
     writer.add(
         spatial_metadata(
             candidate(
@@ -705,8 +889,8 @@ def _render_scene(
                 "fallen_tile_indices",
                 answer_type="int_list",
                 prompt=(
-                    "Which tiles on our side are currently knocked down? Output their 1-based left-to-right "
-                    "indices in ascending order, or 'none' if no tiles are down."
+                    "Which tiles in the 14-tile row on our side are currently knocked down? Output their "
+                    "1-based left-to-right indices in ascending order, or 'none' if no tiles are down."
                 ),
             )
             | {
@@ -729,9 +913,9 @@ def _render_scene(
                 "missing_matching_tile_bboxes",
                 answer_type="bbox_list",
                 prompt=(
-                    "Which of the three tiles matching the suit of the tile knocked down by the opponent are "
-                    "still standing? Output one bounding box per tile in left-to-right order, or 'none' if all "
-                    "three are down."
+                    "Which of the three tiles in the 14-tile row on our side that match the suit of the "
+                    "face-up reference discard on the opponent's side are still standing? Output one bounding "
+                    "box per tile in left-to-right order, or 'none' if all three are down."
                 ),
             )
             | {
@@ -754,8 +938,9 @@ def _render_scene(
                 "wrong_fallen_tile_bboxes",
                 answer_type="bbox_list",
                 prompt=(
-                    "Which tiles on our side whose suit does not match the opponent's tile were incorrectly "
-                    "knocked down? Output one bounding box per tile in left-to-right order, or 'none' if none."
+                    "Which tiles in the 14-tile row on our side do not match the suit of the face-up reference "
+                    "discard on the opponent's side and are knocked down? Output one bounding box per tile in "
+                    "left-to-right order, or 'none' if none."
                 ),
             )
             | {
@@ -769,30 +954,6 @@ def _render_scene(
             statuses=label_statuses(wrong_sorted),
         )
     )
-    if fallen_case.case_id == "f0":
-        mahjong_records = layout.get("Rigid", {}).get("mahjong", [])
-        category_idx = next(record["category_idx"] for record in mahjong_records if record["label"] == discard_label)
-        suit = face_of_category(category_idx)
-        writer.add(
-            spatial_metadata(
-                candidate(
-                    "discard_suit",
-                    "discard_suit",
-                    answer_type="short_text",
-                    prompt=(
-                        "What is the suit of the tile knocked down by the opponent robot arm? "
-                        f"Answer with one of: {', '.join(FACE_NAMES)}."
-                    ),
-                )
-                | {
-                    "answer_text": suit,
-                    "gt_source": "simulated_discard_tile_face",
-                    "audit_metadata_json": json_dumps({**audit_base, "discard_suit": suit}),
-                },
-                answerable=True,
-                statuses=[],
-            )
-        )
 
 
 def main() -> None:
@@ -815,6 +976,17 @@ def main() -> None:
         LOGGER.info("planner flags=%s", planner_flags)
         pool = load_vqa_layout_pool(ARGS.layout_root, variants=variants)
         layout_ids = _parse_layout_ids(ARGS.layout_ids, pool)
+        reference_discard_bbox_samples_per_stratum = _reference_discard_bbox_samples_per_stratum(
+            variants, layout_ids, target_groups
+        )
+        reference_discard_bbox_scene_ids = _plan_reference_discard_bbox_scenes(
+            pool,
+            seed=ARGS.seed,
+            variants=variants,
+            layout_ids=layout_ids,
+            target_groups=target_groups,
+            samples_per_stratum=reference_discard_bbox_samples_per_stratum,
+        )
         LOGGER.info(
             "seed=%s variants=%s layouts=%s groups=%s output=%s",
             ARGS.seed,
@@ -836,9 +1008,7 @@ def main() -> None:
                     for group_index in target_groups:
                         discard_label = DISCARD_LABELS[group_index]
                         target_labels = _target_labels_for_discard(env, scene_layout, discard_label)
-                        rng = random.Random(
-                            ARGS.seed * 1000003 + layout_id * 65537 + group_index * 1009 + variants.index(variant)
-                        )
+                        rng = _case_rng(ARGS.seed, layout_id, group_index, variants.index(variant))
                         cases, skipped = plan_cases(row_labels, target_labels, variant, rng)
                         coverage.setdefault(f"variant_{variant}_layout{layout_id}", {})[f"group{group_index}"] = {
                             "discard_label": discard_label,
@@ -863,12 +1033,12 @@ def main() -> None:
                                 seed=ARGS.seed,
                                 variant=variant,
                                 layout_id=layout_id,
-                                layout=scene_layout,
                                 row_labels=row_labels,
                                 target_labels=target_labels,
                                 discard_label=discard_label,
                                 group_index=group_index,
                                 fallen_case=fallen_case,
+                                reference_discard_bbox_scene_ids=reference_discard_bbox_scene_ids,
                             )
                 finally:
                     env.close()
@@ -892,6 +1062,17 @@ def main() -> None:
                 "row_tiles": len(_row_labels()),
                 "fallen_forward_offset_m": FALLEN_FORWARD_OFFSET_M,
                 "fallen_z_offset_m": FALLEN_Z_OFFSET_M,
+                "reference_discard_bbox": {
+                    "samples_per_fallen_count": reference_discard_bbox_samples_per_stratum,
+                    "samples_per_fallen_count_formula": "variants * layout_ids * target_groups",
+                    "selected_scene_count": len(reference_discard_bbox_scene_ids),
+                    "selected_scene_ids": sorted(reference_discard_bbox_scene_ids),
+                    "x_offset_range_m": list(REFERENCE_DISCARD_X_OFFSET_RANGE_M),
+                    "y_offset_range_m": list(REFERENCE_DISCARD_Y_OFFSET_RANGE_M),
+                    "yaw_range_deg": list(REFERENCE_DISCARD_YAW_RANGE_DEG),
+                    "max_perturb_attempts": REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS,
+                    "lighting_profile": "fixed_layout_background",
+                },
                 "render": {
                     "antialiasing_mode": "DLAA",
                     "stabilization_frames": RENDER_STABILIZATION_FRAMES,

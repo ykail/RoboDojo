@@ -10,13 +10,45 @@ layout generators stay deterministic per seed.
 """
 
 from dataclasses import dataclass
+import hashlib
 import random
-from typing import Sequence
+from typing import Mapping, Sequence
 
 CONSECUTIVE_WRONG_SAMPLES = 3
 RANDOM_WRONG_SAMPLES = 3
 VARIANT_A = "a"
 VARIANT_B = "b"
+
+
+def select_fallen_count_stratified_scene_ids(
+    scene_fallen_counts: Mapping[str, int], *, seed: int, samples_per_stratum: int
+) -> frozenset[str]:
+    """Select an equal deterministic number of scene IDs for every fallen count.
+
+    A stable digest rank, rather than traversal order, keeps the challenge set
+    unchanged if layouts are processed in a different order or in batches.
+    """
+
+    if samples_per_stratum <= 0:
+        raise ValueError("samples_per_stratum must be positive")
+    by_count: dict[int, list[str]] = {}
+    for scene_id, fallen_count in scene_fallen_counts.items():
+        if fallen_count < 0:
+            raise ValueError(f"fallen count for {scene_id!r} must be non-negative")
+        by_count.setdefault(fallen_count, []).append(scene_id)
+    selected: set[str] = set()
+    for fallen_count, scene_ids in sorted(by_count.items()):
+        if len(scene_ids) < samples_per_stratum:
+            raise ValueError(
+                f"fallen-count stratum {fallen_count} has {len(scene_ids)} scenes, "
+                f"but needs {samples_per_stratum}"
+            )
+        ranked = sorted(
+            scene_ids,
+            key=lambda scene_id: hashlib.sha256(f"{seed}:{fallen_count}:{scene_id}".encode()).digest(),
+        )
+        selected.update(ranked[:samples_per_stratum])
+    return frozenset(selected)
 
 
 @dataclass(frozen=True)

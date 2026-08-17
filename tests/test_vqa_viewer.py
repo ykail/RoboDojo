@@ -1,5 +1,6 @@
 """Tests for the read-only VQA sidecar viewer."""
 
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,9 +11,10 @@ import pyarrow.parquet as pq
 from vqa_viewer.visualize_vqa import (
     DatasetNotLoadedError,
     DatasetStore,
+    EvaluationRun,
     VqaDataset,
     _answer_text,
-    _answer_value,
+    _evaluation_outcome,
     _serialize_answer,
     _vlm_prompt,
 )
@@ -150,6 +152,77 @@ class VqaViewerTests(unittest.TestCase):
             summary = store.load(str(root))
             self.assertTrue(summary["loaded"])
             self.assertEqual(summary["accepted_count"], 1)
+
+    def test_evaluation_run_joins_predictions_and_filters_by_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset_root = root / "dataset"
+            evaluation_root = root / "evaluation"
+            (dataset_root / "images").mkdir(parents=True)
+            evaluation_root.mkdir()
+            (dataset_root / "images" / "sample.png").write_bytes(b"not-a-real-image")
+            pq.write_table(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            "sample_id": "correct_0",
+                            "ego_image_reference": "images/sample.png",
+                            "answer_type": "integer",
+                            "answer_int": 3,
+                        },
+                        {
+                            "sample_id": "incorrect_0",
+                            "ego_image_reference": "images/sample.png",
+                            "answer_type": "integer",
+                            "answer_int": 4,
+                        },
+                    ]
+                ),
+                dataset_root / "annotations.parquet",
+            )
+            predictions = [
+                {
+                    "sample_id": "correct_0",
+                    "metrics": {"exact_match": 1.0, "valid": 1.0},
+                    "vqa_result": {"answer_type": "integer", "integer": 3, "raw_text": "3", "valid": True},
+                },
+                {
+                    "sample_id": "incorrect_0",
+                    "metrics": {"exact_match": 0.0, "valid": 1.0},
+                    "vqa_result": {"answer_type": "integer", "integer": 2, "raw_text": "2", "valid": True},
+                },
+            ]
+            (evaluation_root / "predictions.jsonl").write_text(
+                "".join(json.dumps(prediction) + "\n" for prediction in predictions), encoding="utf-8"
+            )
+            (evaluation_root / "metrics.json").write_text(
+                json.dumps({"overall": {"exact_match": 0.5}}), encoding="utf-8"
+            )
+
+            evaluation = EvaluationRun(evaluation_root)
+            self.assertEqual(evaluation.summary()["outcomes"], {"correct": 1, "incorrect": 1})
+            store = DatasetStore()
+            store.load(str(dataset_root))
+            summary = store.load_evaluation(str(evaluation_root))
+            self.assertEqual(summary["evaluation"]["matched_dataset_count"], 2)
+            result = store.query({"outcome": "incorrect", "limit": "12"})
+            self.assertEqual(result["total"], 1)
+            row = result["rows"][0]
+            self.assertEqual(row["sample_id"], "incorrect_0")
+            self.assertEqual(row["evaluation"]["answer"], 2)
+            self.assertEqual(row["evaluation"]["outcome"], "incorrect")
+
+    def test_bbox_evaluation_outcome_requires_count_and_iou_match(self) -> None:
+        valid_bbox = {
+            "metrics": {"valid": 1.0, "count_exact_match": 1.0, "iou_at_0.5": 1.0},
+            "vqa_result": {"valid": True},
+        }
+        wrong_bbox = {
+            "metrics": {"valid": 1.0, "count_exact_match": 1.0, "iou_at_0.5": 0.0},
+            "vqa_result": {"valid": True},
+        }
+        self.assertEqual(_evaluation_outcome(valid_bbox), "correct")
+        self.assertEqual(_evaluation_outcome(wrong_bbox), "incorrect")
 
 
 if __name__ == "__main__":
