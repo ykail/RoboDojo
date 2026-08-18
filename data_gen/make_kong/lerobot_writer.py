@@ -168,15 +168,20 @@ class LeRobotWriter:
         layout_source: str,
         target_group: int,
         states: np.ndarray,
+        actions: np.ndarray,
         videos: dict[str, Path],
     ) -> None:
         states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float32)
         if states.ndim != 2 or states.shape[1] != 14:
             raise ValueError(f"Expected [frames, 14] joint states, got {states.shape}.")
+        if actions.ndim != 2 or actions.shape[1] != 14:
+            raise ValueError(f"Expected [steps, 14] target actions, got {actions.shape}.")
+        if len(states) != len(actions) + 1:
+            raise ValueError(f"Expected one more state than action, got {len(states)} states and {len(actions)} actions.")
         episode_index = len(self.episodes)
         start_index = sum(int(episode["length"]) for episode in self.episodes)
-        actions = states.copy()
-        actions[:-1] = states[1:]
+        actions = np.concatenate((actions, actions[-1:]), axis=0)
         data_dir = self.output_dir / "data" / "chunk-000"
         data_dir.mkdir(parents=True, exist_ok=True)
         table = pa.Table.from_arrays(
@@ -233,7 +238,8 @@ class LeRobotWriter:
         total_episodes = len(self.episodes)
         total_frames = sum(int(episode["length"]) for episode in self.episodes)
         info = {
-            "codebase_version": "v3.0",
+            "codebase_version": "v3.1",
+            "action_semantics": "25Hz evaluation target joint state; final row repeats the final target",
             "robot_type": "unified_robot",
             "total_episodes": total_episodes,
             "total_frames": total_frames,

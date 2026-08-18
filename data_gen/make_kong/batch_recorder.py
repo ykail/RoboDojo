@@ -109,6 +109,7 @@ class BatchEpisodeRecorder:
         self.output_names = list(self.camera_output_names.values())
         self.writers: dict[str, DemoVideoWriter] = {}
         self.states: list[np.ndarray] = []
+        self.actions: list[np.ndarray] = []
         self.sim_steps = 0
 
     def _joint_state_vector(self) -> np.ndarray:
@@ -157,6 +158,40 @@ class BatchEpisodeRecorder:
             writer.append(frame)
         self.states.append(self._joint_state_vector())
 
+    def action_vector(self, target_control: dict) -> np.ndarray:
+        """Return the normalized 14-D target actually sent for this observation step."""
+
+        values = []
+        for arm_name in ("left_arm", "right_arm"):
+            robot = self.env.robot_manager.get_robot_by_arm_name(arm_name)
+            arm_key = self.env.robot_manager.process_name(robot.arm_name)
+            joints = target_control.get(arm_key, {}).get("position")
+            if joints is None:
+                joints = self.env.robot_manager.get_joint(robot, env_idx_list=[self.env_idx])[self.env_idx]
+            joints = np.asarray(joints, dtype=np.float32)
+            if joints.shape != (6,):
+                raise RuntimeError(f"Expected six target joints for {arm_name}, got {joints.shape}.")
+
+            gripper_key = self.env.robot_manager.process_name(robot.gripper_name)
+            gripper_position = target_control.get(gripper_key, {}).get("position")
+            if gripper_position is None:
+                gripper_position = self.env.robot_manager.get_end_effector_real_val(robot, env_idx_list=[self.env_idx])[self.env_idx]
+            opening = float(np.asarray(gripper_position, dtype=np.float32)[0])
+            lower, upper = robot.gripper_scale
+            if robot.gripper_move["sign"] == 1:
+                opening = (opening - lower) / (upper - lower)
+            else:
+                opening = (upper - opening) / (upper - lower)
+            values.extend(joints.tolist())
+            values.append(float(np.clip(opening, 0.0, 1.0)))
+        return np.asarray(values, dtype=np.float32).reshape(14)
+
+    def append_action(self, action: np.ndarray) -> None:
+        action = np.asarray(action, dtype=np.float32)
+        if action.shape != (14,):
+            raise ValueError(f"Expected a 14-D action, got {action.shape}.")
+        self.actions.append(action)
+
     @classmethod
     def sample_batch(cls, recorders: list["BatchEpisodeRecorder"]) -> None:
         """Render once and retrieve all active environments in one camera readback."""
@@ -181,6 +216,10 @@ class BatchEpisodeRecorder:
     def close(self) -> dict[str, Path]:
         if not self.states:
             raise RuntimeError(f"Environment {self.env_idx} produced no recording samples.")
+        if len(self.states) != len(self.actions) + 1:
+            raise RuntimeError(
+                f"Environment {self.env_idx} has {len(self.states)} states but {len(self.actions)} transition actions."
+            )
         for writer in self.writers.values():
             writer.close()
             self._validate_video(Path(writer.out_path), writer.n_frames)

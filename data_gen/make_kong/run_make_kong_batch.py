@@ -24,6 +24,11 @@ PARSER.add_argument(
 )
 PARSER.add_argument("--output-dir", type=Path, default=Path("output") / "make_kong_expert")
 PARSER.add_argument("--retry-failed", action="store_true")
+PARSER.add_argument(
+    "--save-failed-videos",
+    action="store_true",
+    help="Keep finalized camera videos for failed episodes under <output-dir>/failed_videos.",
+)
 AppLauncher.add_app_launcher_args(PARSER)
 ARGS = PARSER.parse_args()
 ARGS.enable_cameras = True
@@ -101,9 +106,14 @@ def _run_batch(
             if control is not None:
                 controls[env_idx] = control
         if active:
-            control_driver.advance(active, controls)
-            sample_recorders = [recorders[env_idx] for env_idx in active if recorders[env_idx].advance_tick()]
-            BatchEpisodeRecorder.sample_batch(sample_recorders)
+            plans = control_driver.prepare(active, controls)
+            actions = {
+                env_idx: recorders[env_idx].action_vector(plans[env_idx].target_control) for env_idx in active
+            }
+            control_driver.advance(active, plans)
+            for env_idx, action in actions.items():
+                recorders[env_idx].append_action(action)
+            BatchEpisodeRecorder.sample_batch([recorders[env_idx] for env_idx in active])
         for env_idx in finished:
             workers.pop(env_idx)
     for env_idx, (saved_layout, group) in enumerate(jobs):
@@ -119,10 +129,17 @@ def _run_batch(
                 layout_source=layout_source,
                 target_group=group,
                 states=np.asarray(recorder.states, dtype=np.float32),
+                actions=np.asarray(recorder.actions, dtype=np.float32),
                 videos=videos,
             )
         else:
-            recorder.abort()
+            if ARGS.save_failed_videos:
+                failed_video_dir = writer.output_dir / "failed_videos" / f"layout_{layout:03d}_group_{group}"
+                failed_video_dir.mkdir(parents=True, exist_ok=True)
+                for source in recorder.close().values():
+                    source.replace(failed_video_dir / source.name)
+            else:
+                recorder.abort()
             writer.record_failure(layout, layout_source, group, result.failure_reason or "unknown expert failure")
 
 

@@ -22,6 +22,18 @@ ControlInfo: TypeAlias = dict[str, dict[str, Any]]
 TaskMetadata: TypeAlias = dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ExpertControlChunk:
+    """One policy-rate command represented by its source physics-rate controls.
+
+    The expert plans at the simulator rate, while policies act at the
+    observation rate.  The batch driver converts each chunk to the same
+    interpolated command sequence used by :class:`EvalEnv`.
+    """
+
+    raw_controls: tuple[ControlInfo, ...]
+
+
 class ArmProtocol(Protocol):
     """Robot attributes consumed by the single-arm expert."""
 
@@ -293,6 +305,9 @@ class MakeKongExpertGenerator:
             for robot in (self.left, self.right)
         }
         self.sim_dt = float(env.robot_manager.dt)
+        self.action_interval = int(round(float(env.obs_manager.collect_interval)))
+        if self.action_interval < 1:
+            raise ValueError("make_kong generation requires a positive observation control interval.")
         self.control_steps = 0
         self.closed_target_grippers: set[str] = set()
         self.replacement_config: ReplacementConfig | None = None
@@ -1285,6 +1300,15 @@ class MakeKongExpertGenerator:
             np.array([-0.038, -0.099, 0.127]),
             np.array([-0.049, -0.125, 0.153]),
         )
+        if reference.target_group == 2:
+            # Keep the calibrated approach and orientation; shift only this
+            # group's contact waypoints 10 mm toward the tile's lateral center.
+            offsets = (
+                offsets[0],
+                offsets[1] + np.array([0.01, 0.0, 0.0]),
+                offsets[2] + np.array([0.01, 0.0, 0.0]),
+                offsets[3],
+            )
         if reference.target_group == 1:
             # Episode 51 holds the press before retracting; pose offsets stay calibrated to this simulator.
             return offsets, (0.30, 0.36, 0.28), "hold"
@@ -1390,7 +1414,7 @@ class MakeKongExpertGenerator:
             self._restore_tile_collision_scene(robot)
 
     def _execute(self, control_info: list[ControlInfo], *, stage: str, repeat: int = 1):
-        """Yield one environment-local control for each simulator tick."""
+        """Yield expert controls at the policy rate while preserving raw plan timing."""
 
         if not control_info:
             raise RuntimeError(f"{stage}: empty control sequence.")
@@ -1400,12 +1424,14 @@ class MakeKongExpertGenerator:
         if len(control_info) + self.control_steps > self.max_control_steps:
             raise RuntimeError(f"{stage}: control-step budget exceeded.")
 
-        for control in control_info:
-            yield control
-            self.control_steps += 1
+        for start in range(0, len(control_info), self.action_interval):
+            controls = control_info[start : start + self.action_interval]
+            yield ExpertControlChunk(tuple(deepcopy(control) for control in controls))
+            self.control_steps += len(controls)
 
     def _settle(self, steps: int | None = None):
-        for _ in range(self.settle_steps if steps is None else steps):
+        raw_steps = self.settle_steps if steps is None else steps
+        for _ in range(0, raw_steps, self.action_interval):
             yield None
 
     def verify_task_success(self) -> tuple[bool, float]:

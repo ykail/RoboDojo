@@ -41,13 +41,15 @@ def _patch_websockets_proxy_compat():
     websockets.connect = connect_without_proxy
 
 
-def create_eval_env(config, app, resume_state=None, **kwargs):
+def create_eval_env(config, app, resume_state=None, task_class_override=None, **kwargs):
     task_name = config.eval_cfg.get("task_name", None)
     if task_name is None:
         raise ValueError("Task name must be specified in eval_cfg!")
 
     task_registry = importlib.import_module(f"task.{BENCHMARK}.task_registry")
     task_name, task_class = task_registry.load_task_class(task_name)
+    if task_class_override is not None:
+        task_class = task_class_override
     config.eval_cfg["task_name"] = task_name
 
     class EvalEnv(task_class):
@@ -61,6 +63,7 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.policy_name = self.eval_cfg.get("policy_name", None)
             self.additional_info = self.eval_cfg.get("additional_info", "")
             self.eval_seed = self.eval_cfg.get("seed", 0)
+            self.offline_replay = bool(self.eval_cfg.get("offline_replay", False))
             self.physx_monitor_enabled = bool(self.eval_cfg.get("physx_monitor_enabled", False))
             if self.physx_monitor_enabled:
                 from src.eval_client.physx_warning_monitor import (
@@ -87,6 +90,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
                 str(self.eval_seed) + "_" + self.additional_info,
                 run_id,
             )
+            replay_output_dir = self.eval_cfg.get("replay_output_dir")
+            if replay_output_dir:
+                self.save_dir = str(replay_output_dir)
 
             if resume_state is not None:
                 resumed_save_dir = resume_state.get("save_dir")
@@ -177,24 +183,27 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
             self.deploy_cfg = config.deploy_cfg
             self.port = self.deploy_cfg.get("port", None)
-            if self.port is None:
-                raise ValueError("Port must be specified in deploy_cfg for the policy server!")
             self.host = self.deploy_cfg.get("host", "localhost")
-            policy_server_url = self.deploy_cfg.get("policy_server_url") or f"ws://{self.host}:{self.port}"
-            if self.deploy_cfg.get("protocol") == "openpi":
-                self.model_client = OpenPiModelClient(url=policy_server_url)
+            if self.offline_replay:
+                self.model_client = None
             else:
-                _patch_websockets_proxy_compat()
-                evaluation_id = self.deploy_cfg.get("evaluation_id", self.run_id)
-                trial_id = self.deploy_cfg.get("trial_id", f"{self.task_name}-{self.run_id}")
-                action_case_id = self.deploy_cfg.get("action_case_id", f"{self.task_name}_case")
-                self.model_client = WsModelClient(
-                    url=policy_server_url,
-                    evaluation_id=evaluation_id,
-                    trial_id=trial_id,
-                    action_case_id=action_case_id,
-                    repeat_index=self.deploy_cfg.get("repeat_index"),
-                )
+                if self.port is None:
+                    raise ValueError("Port must be specified in deploy_cfg for the policy server!")
+                policy_server_url = self.deploy_cfg.get("policy_server_url") or f"ws://{self.host}:{self.port}"
+                if self.deploy_cfg.get("protocol") == "openpi":
+                    self.model_client = OpenPiModelClient(url=policy_server_url)
+                else:
+                    _patch_websockets_proxy_compat()
+                    evaluation_id = self.deploy_cfg.get("evaluation_id", self.run_id)
+                    trial_id = self.deploy_cfg.get("trial_id", f"{self.task_name}-{self.run_id}")
+                    action_case_id = self.deploy_cfg.get("action_case_id", f"{self.task_name}_case")
+                    self.model_client = WsModelClient(
+                        url=policy_server_url,
+                        evaluation_id=evaluation_id,
+                        trial_id=trial_id,
+                        action_case_id=action_case_id,
+                        repeat_index=self.deploy_cfg.get("repeat_index"),
+                    )
             self.robot_action_dim_info = get_robot_action_dim_info(env_cfg=self.eval_cfg)
 
         def close(self):
@@ -243,7 +252,37 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
             self.robot_manager.set_robot_init_state()
             self.reward_manager.init_state()
 
-            self.model_client.call(func_name="reset")
+            if self.model_client is not None:
+                self.model_client.call(func_name="reset")
+
+        def reset_from_saved_layouts(self, saved_layouts, seed=None, options=None):
+            """Reset offline replay environments from explicitly supplied layouts."""
+
+            if len(saved_layouts) != self.num_envs:
+                raise ValueError(f"Expected {self.num_envs} saved layouts, got {len(saved_layouts)}.")
+            if seed is None:
+                seed = list(range(self.num_envs))
+            seed = list(seed)
+            if len(seed) != self.num_envs:
+                raise ValueError(f"Expected {self.num_envs} replay seeds, got {len(seed)}.")
+
+            self.env_seeds = [int(value) for value in seed]
+            self.success = [True] * self.num_envs
+            self.end_flag = [False] * self.num_envs
+            self.take_action_cnt = [0] * self.num_envs
+            self._abort_video_writers()
+            self.episode_nums = self.num_envs
+            self.unstable_envs = set()
+            self.current_env_seed_map = {idx: value for idx, value in enumerate(self.env_seeds)}
+            for env_idx, saved_layout in enumerate(saved_layouts):
+                self.scene_manager.layout_manager.set_saved_layout(env_idx, saved_layout)
+
+            super().reset(seed=self.env_seeds, options=options)
+            self.obs_manager.reset()
+            self.setup_scene()
+            self.robot_manager.set_origin_endpose()
+            self.robot_manager.set_robot_init_state()
+            self.reward_manager.init_state()
 
         def setup_scene(self):
             self.scene_manager.apply_saved_poses(env_idx_list=list(range(self.num_envs)))
