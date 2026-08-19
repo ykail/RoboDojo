@@ -212,17 +212,78 @@ class VqaViewerTests(unittest.TestCase):
             self.assertEqual(row["evaluation"]["answer"], 2)
             self.assertEqual(row["evaluation"]["outcome"], "incorrect")
 
-    def test_bbox_evaluation_outcome_requires_count_and_iou_match(self) -> None:
-        valid_bbox = {
-            "metrics": {"valid": 1.0, "count_exact_match": 1.0, "iou_at_0.5": 1.0},
-            "vqa_result": {"valid": True},
-        }
-        wrong_bbox = {
-            "metrics": {"valid": 1.0, "count_exact_match": 1.0, "iou_at_0.5": 0.0},
-            "vqa_result": {"valid": True},
-        }
-        self.assertEqual(_evaluation_outcome(valid_bbox), "correct")
-        self.assertEqual(_evaluation_outcome(wrong_bbox), "incorrect")
+    def test_geometric_evaluation_outcomes_follow_the_vqa_contract(self) -> None:
+        cases = [
+            (
+                "bbox2d at IoU 0.75",
+                {
+                    "metrics": {"valid": 1.0, "iou_at_0.75": 1.0},
+                    "vqa_result": {"answer_type": "bbox2d", "valid": True},
+                },
+                "correct",
+            ),
+            (
+                "bbox2d below IoU 0.75",
+                {
+                    "metrics": {"valid": 1.0, "iou_at_0.75": 0.0},
+                    "vqa_result": {"answer_type": "bbox2d", "valid": True},
+                },
+                "incorrect",
+            ),
+            (
+                "nonempty bbox list at IoU 0.75",
+                {
+                    "metrics": {
+                        "valid": 1.0,
+                        "num_match": 1.0,
+                        "empty_gt": 0.0,
+                        "empty_list_correct": 0.0,
+                        "iou_at_0.75": 1.0,
+                    },
+                    "vqa_result": {"answer_type": "bbox_list", "valid": True},
+                },
+                "correct",
+            ),
+            (
+                "nonempty bbox list below IoU 0.75",
+                {
+                    "metrics": {
+                        "valid": 1.0,
+                        "num_match": 1.0,
+                        "empty_gt": 0.0,
+                        "empty_list_correct": 0.0,
+                        "iou_at_0.75": 0.0,
+                    },
+                    "vqa_result": {"answer_type": "bbox_list", "valid": True},
+                },
+                "incorrect",
+            ),
+            (
+                "matching empty bbox lists",
+                {
+                    "metrics": {
+                        "valid": 1.0,
+                        "num_match": 1.0,
+                        "empty_gt": 1.0,
+                        "empty_list_correct": 1.0,
+                        "iou_box_count": 0.0,
+                    },
+                    "vqa_result": {"answer_type": "bbox_list", "valid": True},
+                },
+                "correct",
+            ),
+            (
+                "point without a binary threshold",
+                {
+                    "metrics": {"valid": 1.0, "normalized_l2": 0.03},
+                    "vqa_result": {"answer_type": "point2d", "valid": True},
+                },
+                "evaluated",
+            ),
+        ]
+        for name, prediction, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(_evaluation_outcome(prediction), expected)
 
 
 if __name__ == "__main__":

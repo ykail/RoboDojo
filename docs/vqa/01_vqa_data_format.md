@@ -148,3 +148,66 @@ Question: Which of the three tiles in the 14-tile row on our side that match the
 Answer:
 <loc0514><loc0451><loc0573><loc0491>;<loc0514><loc0489><loc0573><loc0527>;<loc0514><loc0527><loc0573><loc0567><eos>
 ```
+
+## 4. Evaluation output format
+
+Run evaluation through `cmds/eval_vqa.sh`. It writes an appendable
+`predictions.jsonl` and a summarized `metrics.json` in the chosen output
+directory. Saved predictions can be scored again offline without contacting a
+policy server; the offline scorer rebuilds both files from each record's saved
+`target` and `vqa_result`.
+
+### Per-sample records (`predictions.jsonl`)
+
+Every JSONL record contains the sample identity and prompt, the typed GT in
+`target`, the parsed policy response in `vqa_result`, and the resulting
+`metrics`. `metrics.valid` is a format-validity flag only: `1.0` means the
+response parsed according to its declared `answer_type`; it does not mean the
+answer is semantically correct.
+
+Common type-specific fields are:
+
+| answer_type | Per-sample metric fields |
+| --- | --- |
+| `boolean`, `short_text`, `integer` | `exact_match`; `integer` also has `absolute_error` |
+| `point2d` | `normalized_l2` |
+| `bbox2d` | `iou`, `iou_at_0.5`, `iou_at_0.75` |
+| `int_list` | `num_match`, `exact_match`, `edit_distance` |
+| `bbox_list` | `num_match`, `empty_gt`, `empty_list_correct`, `iou_box_count`, and, when at least one box is evaluated, `iou_values`, `mean_iou`, `median_iou`, `iou_at_0.5`, `iou_at_0.75` |
+
+`int_list.exact_match` requires identical length, order, and integer values.
+For `bbox_list`, corresponding boxes are compared positionally in the
+prompt-defined order. If the list lengths differ, each unpaired predicted or
+GT box contributes an IoU of zero. Therefore a list count mismatch is visible
+both in `num_match=0` and in the spatial scores.
+
+When both the GT and prediction are empty (`none`), `num_match=1` and
+`empty_list_correct=1`. No IoU is emitted for that sample because there is no
+box to compare. If only one side is empty, the list does not match and the
+unpaired boxes contribute zero IoU.
+
+### Aggregate report (`metrics.json`)
+
+`metrics.json` contains `overall`, `by_answer_type`, and
+`by_question_family`, plus run metadata such as `dataset_root` and
+`server_url`. `overall` intentionally contains only the universal fields
+`sample_count`, `valid_count`, and `valid_rate`; it does not combine
+incompatible metrics such as text exact match and spatial IoU.
+
+Each answer-type or homogeneous question-family summary contains those same
+universal fields and its relevant aggregate metrics:
+
+| answer_type | Aggregate metric fields |
+| --- | --- |
+| `boolean`, `short_text` | `exact_match` |
+| `integer` | `exact_match`, `mean_absolute_error`, `median_absolute_error` |
+| `point2d` | `mean_normalized_l2`, `median_normalized_l2` |
+| `bbox2d` | `iou_valid_count`, `mean_iou`, `median_iou`, `iou_at_0.5_count/rate`, `iou_at_0.75_count/rate` |
+| `int_list` | `num_match_count/rate`, `exact_match`, `edit_distance_valid_count`, `mean_edit_distance`, `median_edit_distance` |
+| `bbox_list` | `num_match_count/rate`, `empty_gt_count`, `empty_list_correct_count/rate`, `iou_box_count`, `mean_iou`, `median_iou`, `iou_at_0.5`, `iou_at_0.75` |
+
+`bbox_list.iou_box_count` is the number of individual box comparisons in the
+spatial aggregate, including zero-IoU unmatched boxes but excluding samples
+where both lists are empty. `iou_at_0.5` and `iou_at_0.75` are proportions over
+this box count, while `mean_iou` and `median_iou` are computed over the same
+individual IoU values.

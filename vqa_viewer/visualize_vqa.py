@@ -85,8 +85,10 @@ def _evaluation_answer(result: dict[str, Any]) -> Any:
 def _evaluation_outcome(prediction: dict[str, Any] | None) -> str:
     """Classify an evaluation row for viewer filtering.
 
-    Bounding-box predictions are considered correct only when their matched-box
-    IoU-at-0.5 score is one and their predicted count matches the target.
+    Discrete answers require exact match. Bounding boxes require IoU@0.75.
+    A ``bbox_list`` whose GT and prediction are both empty is correct without
+    an IoU value, as prescribed by the VQA data-format contract. Point answers
+    intentionally remain ``evaluated`` because they have no binary threshold.
     """
 
     if prediction is None:
@@ -98,12 +100,35 @@ def _evaluation_outcome(prediction: dict[str, Any] | None) -> str:
     for key in ("exact_match", "sequence_exact_match"):
         if key in metrics:
             return "correct" if metrics[key] == 1.0 else "incorrect"
-    if "count_exact_match" in metrics or "iou_at_0.5" in metrics:
-        return (
-            "correct"
-            if metrics.get("count_exact_match") == 1.0 and metrics.get("iou_at_0.5") == 1.0
-            else "incorrect"
-        )
+
+    answer_type = result.get("answer_type")
+    is_bbox_list = (
+        answer_type == "bbox_list" or "num_match" in metrics or "count_exact_match" in metrics
+    )
+    if is_bbox_list:
+        if metrics.get("empty_list_correct") == 1.0:
+            return (
+                "correct"
+                if metrics.get("num_match") == 1.0 and metrics.get("empty_list_correct") == 1.0
+                else "incorrect"
+            )
+        if "num_match" in metrics and "iou_at_0.75" in metrics:
+            return (
+                "correct"
+                if metrics.get("num_match") == 1.0 and metrics.get("iou_at_0.75") == 1.0
+                else "incorrect"
+            )
+        return "evaluated"
+
+    if answer_type == "point2d" or "normalized_l2" in metrics:
+        return "evaluated"
+    if answer_type == "bbox2d" or "iou" in metrics or "iou_at_0.75" in metrics:
+        if "iou_at_0.75" in metrics:
+            return "correct" if metrics["iou_at_0.75"] == 1.0 else "incorrect"
+        if "iou" in metrics:
+            return "correct" if metrics["iou"] >= 0.75 else "incorrect"
+        return "evaluated"
+
     return "evaluated"
 
 
