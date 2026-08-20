@@ -10,7 +10,7 @@ variant-A and variant-B tile layouts:
   pool (default output of the generator);
 - `scene_plan.py`, `tile_faces.py` — pure logic used by both scripts.
 
-Layout A keeps the matching groups contiguous but deranges the discard faces;
+Layout A keeps the matching groups contiguous but randomly assigns the discard faces;
 layout B reuses A's discard pairing and scatters the group faces across the
 twelve kong slots.  See `docs/vqa/04_make_kong_vqa_examples.md`.
 
@@ -44,7 +44,7 @@ python vqa_gen/make_kong/generate_make_kong_vqa.py \
 - `--variant a,b` selects which layout variants to render; `--layout-ids`
   defaults to `all` (every pair in the pool); `--layout-root` overrides the
   pool directory (default: `vqa_gen/make_kong/layouts/`).
-- Each scene writes one clean image plus `fallen_tile_indices`,
+- Each scene writes one clean image plus `fallen_tile_bboxes`,
   `missing_matching_tile_bboxes`, and `wrong_fallen_tile_bboxes`. The
   collector additionally emits `variants × layout_ids × target_groups`
   `reference_discard_bbox` records for each 0-5 robot-side fallen-count
@@ -66,9 +66,19 @@ variant A with four target groups produce 400 samples per stratum (2,400
 reference-discard records in total); 10 test layouts of variants A/B produce
 80 per stratum (480 total).
 
-## Tests
+## Merge newly rendered layouts
+
+The collector never appends to an existing output directory. Render newly
+added layouts to a separate directory, then combine it with a prior collection
+in a new output directory:
 
 ```bash
-conda activate RoboDojo
-python -m unittest tests.test_make_kong_vqa_plan tests.test_make_kong_vqa_layouts tests.test_vqa_sidecar_vqagen
+python vqa_gen/make_kong/merge_vqa_collections.py \
+  --base-dir output/RoboDojo_vqa_v4.2/make_kong_seed2810 \
+  --extension-dir tmp/make_kong_vqa_seed2810_layouts100_199 \
+  --output-dir output/RoboDojo_vqa_v4.3/make_kong_seed2810
 ```
+
+The merge checks both Parquet schemas, all accepted and rejected `sample_id`
+values, and image/audit filename collisions before publishing the new output.
+It does not modify either input collection.

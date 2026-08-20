@@ -81,7 +81,7 @@ class MakeKongVqaLayoutGeneratorTests(unittest.TestCase):
                 for layout_id in range(2):
                     _records_by_label(json.loads((output_root / f"make_kong_{variant}_{layout_id}.json").read_text()))
 
-    def test_a_layouts_use_deranged_discard_pairing(self) -> None:
+    def test_a_layouts_use_a_permutation_of_matching_group_faces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._generate(root, 3, 5)
@@ -89,12 +89,6 @@ class MakeKongVqaLayoutGeneratorTests(unittest.TestCase):
             discard_labels = [f"mahjong{5 + index}_0" for index in range(4)]
             for layout_id in range(3):
                 records = _records_by_label(json.loads((output_root / f"make_kong_a_{layout_id}.json").read_text()))
-                for index, discard in enumerate(discard_labels):
-                    self.assertNotEqual(
-                        records[discard]["category_idx"],
-                        records[f"mahjong{index}_0"]["category_idx"],
-                        f"discard {discard} kept its nominal group",
-                    )
                 discard_categories = {discard: records[discard]["category_idx"] for discard in discard_labels}
                 group_categories = {records[f"mahjong{index}_0"]["category_idx"] for index in range(4)}
                 self.assertEqual(set(discard_categories.values()), group_categories)

@@ -64,20 +64,17 @@ class FallenCase:
         return self.correct_fallen + self.wrong_fallen
 
 
-def deranged_discard_assignment(rng: random.Random) -> tuple[int, int, int, int]:
-    """Return a derangement of the four discard slots.
+def random_discard_assignment(rng: random.Random) -> tuple[int, int, int, int]:
+    """Uniformly assign the four matching groups to the four discard slots.
 
-    ``result[i]`` is the matching-group index for discard slot ``i``; no
-    discard keeps its nominal group (``result[i] != i``), which removes the
-    fixed slot-to-group shortcut from the VQA scenes.
+    ``result[i]`` is the matching-group index for discard slot ``i``. Every
+    permutation, including assignments that retain a nominal slot-group pair,
+    is possible so no slot has a privileged matching group across layouts.
     """
 
-    for _ in range(1000):
-        permutation = list(range(4))
-        rng.shuffle(permutation)
-        if all(permutation[index] != index for index in range(4)):
-            return tuple(permutation)
-    return (1, 2, 3, 0)
+    permutation = list(range(4))
+    rng.shuffle(permutation)
+    return tuple(permutation)
 
 
 def scatter_kong_group_assignment(rng: random.Random) -> tuple[int, ...]:

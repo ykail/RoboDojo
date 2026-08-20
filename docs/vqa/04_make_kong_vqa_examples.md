@@ -65,11 +65,12 @@ Variant A removes shortcut 1, variant B removes shortcut 2.
   `vqa_gen/make_kong/tile_faces.py` and may be verified against the USD
   textures with `--verify-faces`.
 
-### Variant A: deranged discard pairing
+### Variant A: random discard pairing
 
 - The 12 kong slots remain contiguous group blocks (nominal labels).
-- The four discard tiles get a **derangement** of the four group faces: no
-  discard keeps the face of its nominal slot group.
+- The four discard tiles get a uniform random permutation of the four group
+  faces, including nominal slot-group pairs. Across layouts, every discard
+  slot can therefore match every robot-side group with equal probability.
 
 ### Variant B: scattered group faces
 
@@ -81,7 +82,7 @@ Variant A removes shortcut 1, variant B removes shortcut 2.
 ### Layout manifest
 
 `manifest.json` records per layout pair: `group_categories` /
-`group_face_names` / `support_*` / `other_categories`; `discard_derangement`
+`group_face_names` / `support_*` / `other_categories`; `discard_assignment`
 (discard label -> category); `kong_scatter` (per-slot group index for variant
 B); `generation_runs` (seeds and counts), `face_vocabulary`,
 `total_layout_pairs`.  `load_vqa_layout_pool` re-validates every layout on
@@ -120,16 +121,16 @@ visible, has at least 50% of the unperturbed mask pixel count, and has an
 unambiguous segmentation identity. Each row records the derived seed, offset,
 yaw, and attempt in audit metadata.
 
-### `fallen_tile_indices`
+### `fallen_tile_bboxes`
 
 Every scene:
 
 ```text
-Which tiles in the 14-tile row on our side are currently knocked down? Output their 1-based left-to-right indices in ascending order, or 'none' if no tiles are down.
+Which tiles in the 14-tile row on our side are currently knocked down? Output one bounding box per tile in left-to-right order, or 'none' if no tiles are down.
 ```
 
-Answer type `int_list`; the empty list is the `none` answer.  Indices refer to
-the full 14-tile row.
+Answer type `bbox_list`; boxes are the visible tight masks of every fallen
+tile in the full 14-tile row. The empty list is the `none` answer.
 
 ### `missing_matching_tile_bboxes`
 
@@ -184,8 +185,6 @@ leftmost group).
   the other list-valued families may overlap even when their instance masks do
   not: each box is independently derived from its projected mask's min/max
   extent.
-- `fallen_tile_indices` answers use ascending 1-based left-to-right row
-  indices; `int_list` answers are always ascending.
 - `bbox_list` answers are sorted left-to-right (ascending `x_min`) because the
   prompt explicitly dictates "in left-to-right order", which overrides the
   contract's default top-left priority; the empty list is the canonical
@@ -210,16 +209,14 @@ available faces) to keep every discard-to-group matching unambiguous.  This
 replaces the original `data_gen/make_kong/generate_layouts.py` for VQA
 purposes, which cannot express either variant.
 
-### `int_list` and `bbox_list` answer types (former ADR 0002)
+### `bbox_list` answer type (former ADR 0002)
 
-The make_kong VQA families must answer "which tiles fell" (a variable-length
-index list) and "which tiles are missing / wrongly fallen" (a variable-length
-bounding-box list, possibly empty).  The universal contract previously allowed
-exactly one typed answer of fixed shape, so we extended it with two new answer
-types: `int_list` (ordered integer list) and `bbox_list` (ordered list of
-normalized yxyx boxes), both with the empty list as the canonical `none`
-answer serialized through the plain word `none` and `;` separators.
-We chose typed list answers over short-text serialization to keep spatial
+The make_kong VQA families answer "which tiles fell", "which tiles are
+missing", and "which tiles fell incorrectly" as variable-length bounding-box
+lists, possibly empty. The universal contract supports `bbox_list` as an
+ordered list of normalized yxyx boxes with the empty list as the canonical
+`none` answer, serialized through the plain word `none` and `;` separators.
+We chose typed bbox lists over short-text serialization to keep spatial
 tokenization and per-box validation; the extension lives in the
-`vqa_gen/vqa/sidecar.py` copy, leaving the legacy sidecar in `scripts/internal/vqa`
-for the pre-migration fill_pen_holder output.
+`vqa_gen/vqa/sidecar.py` copy, leaving the legacy sidecar in
+`scripts/internal/vqa` for the pre-migration fill_pen_holder output.

@@ -6,8 +6,8 @@ import unittest
 from vqa_gen.make_kong.scene_plan import (
     VARIANT_A,
     VARIANT_B,
-    deranged_discard_assignment,
     plan_cases,
+    random_discard_assignment,
     scatter_kong_group_assignment,
     select_fallen_count_stratified_scene_ids,
 )
@@ -100,11 +100,13 @@ class ScenePlanTests(unittest.TestCase):
             [case.fallen_labels for case in first[0]], [case.fallen_labels for case in second[0]]
         )
 
-    def test_derangement_never_keeps_a_discard_on_its_nominal_group(self) -> None:
-        for seed in range(50):
-            assignment = deranged_discard_assignment(random.Random(seed))
+    def test_discard_assignment_uniformly_allows_every_slot_group_pair(self) -> None:
+        pairs = set()
+        for seed in range(200):
+            assignment = random_discard_assignment(random.Random(seed))
             self.assertEqual(sorted(assignment), [0, 1, 2, 3])
-            self.assertTrue(all(assignment[index] != index for index in range(4)), assignment)
+            pairs.update(enumerate(assignment))
+        self.assertEqual(pairs, {(slot, group) for slot in range(4) for group in range(4)})
 
     def test_scatter_keeps_three_copies_of_every_group(self) -> None:
         for seed in range(50):

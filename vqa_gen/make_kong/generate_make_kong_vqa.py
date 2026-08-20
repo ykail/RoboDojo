@@ -6,8 +6,8 @@ opponent discard knocked face-up, and emits four question families:
 
 - ``reference_discard_bbox``: a visible-tight box for the reference discard
   in 80 deterministically sampled scenes from each fallen-count stratum;
-- ``fallen_tile_indices``: the 1-based left-to-right indices of every fallen
-  row tile, ``none`` when empty;
+- ``fallen_tile_bboxes``: visible-tight boxes for every fallen row tile in
+  left-to-right order, ``none`` when empty;
 - ``missing_matching_tile_bboxes``: visible boxes of matching tiles that are
   still standing, ``none`` when empty;
 - ``wrong_fallen_tile_bboxes``: visible boxes of incorrectly fallen
@@ -41,6 +41,7 @@ from isaaclab.app import AppLauncher
 from vqa_gen.make_kong.generate_layouts import DEFAULT_OUTPUT_DIR, VARIANTS, load_vqa_layout_pool
 from vqa_gen.make_kong.scene_plan import FallenCase, plan_cases, select_fallen_count_stratified_scene_ids
 from vqa_gen.make_kong.tile_faces import FACE_NAMES
+from vqa_gen.make_kong.vqa_config import LEFT_TARGET_GRIPPER_OPENING, gripper_joint_positions
 from vqa_gen.vqa.sidecar import (
     SidecarWriter,
     VisibilityThresholds,
@@ -82,6 +83,12 @@ parser.add_argument(
     default=Path("output/RoboDojo_vqa/make_kong_seed2810"),
     help="Output directory for the typed VQA sidecar.",
 )
+parser.add_argument(
+    "--scene-ids-file",
+    type=Path,
+    default=None,
+    help="Optional newline-delimited scene IDs to render exclusively, for targeted recovery runs.",
+)
 parser.add_argument("--overwrite", action="store_true", help="Replace --output-dir if it already exists.")
 AppLauncher.add_app_launcher_args(parser)
 ARGS = parser.parse_args()
@@ -110,9 +117,11 @@ REFERENCE_TILE_PUSH_DIRECTION = np.asarray([0.0, -1.0, 0.0], dtype=np.float32)
 FALLEN_FORWARD_OFFSET_M = 0.045
 FALLEN_Z_OFFSET_M = -0.016
 REFERENCE_DISCARD_X_OFFSET_RANGE_M = (-0.06, 0.06)
-REFERENCE_DISCARD_Y_OFFSET_RANGE_M = (-0.04, 0.04)
+REFERENCE_DISCARD_FORWARD_OFFSET_RANGE_M = (0.03, 0.05)
 REFERENCE_DISCARD_YAW_RANGE_DEG = (-20.0, 20.0)
-REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS = 10
+REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS = 3
+REFERENCE_DISCARD_OTHER_TILE_POSITION_TOLERANCE_M = 0.03
+REFERENCE_DISCARD_OTHER_TILE_ORIENTATION_TOLERANCE_DEG = 30.0
 KONG_GROUPS = (
     ("mahjong0_0", "mahjong0_1", "mahjong0_2"),
     ("mahjong1_0", "mahjong1_1", "mahjong1_2"),
@@ -166,6 +175,15 @@ def _parse_layout_ids(value: str, pool: dict[tuple[str, int], Any]) -> list[int]
     if not layout_ids:
         raise ValueError("No layout IDs selected.")
     return layout_ids
+
+
+def _load_scene_ids(path: Path) -> frozenset[str]:
+    """Load a non-empty, newline-delimited set of exact scene IDs."""
+
+    scene_ids = frozenset(line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    if not scene_ids:
+        raise ValueError(f"--scene-ids-file contains no scene IDs: {path}")
+    return scene_ids
 
 
 def _scene_id(seed: int, variant: str, layout_id: int, group_index: int, fallen_case: FallenCase) -> str:
@@ -255,7 +273,7 @@ def _reference_discard_perturbation(seed: int, scene_id: str, attempt: int) -> d
         "attempt": attempt,
         "derived_seed": derived_seed,
         "x_offset_m": rng.uniform(*REFERENCE_DISCARD_X_OFFSET_RANGE_M),
-        "y_offset_m": rng.uniform(*REFERENCE_DISCARD_Y_OFFSET_RANGE_M),
+        "forward_offset_m": rng.uniform(*REFERENCE_DISCARD_FORWARD_OFFSET_RANGE_M),
         "yaw_deg": rng.uniform(*REFERENCE_DISCARD_YAW_RANGE_DEG),
     }
 
@@ -397,10 +415,36 @@ def _restore_robot_home(env) -> None:
             continue
         default_joint_pos = key.data.default_joint_pos.clone()
         zero_joint_vel = torch.zeros_like(key.data.default_joint_vel)
+        if robot.arm_name == "left_arm":
+            gripper_joint_pos = torch.as_tensor(
+                gripper_joint_positions(
+                    LEFT_TARGET_GRIPPER_OPENING,
+                    gripper_scale=robot.gripper_scale,
+                    gripper_sign=robot.gripper_move["sign"],
+                    gripper_mimic=robot.gripper_move["mimic"],
+                ),
+                dtype=default_joint_pos.dtype,
+                device=default_joint_pos.device,
+            )
+            default_joint_pos[0, robot.gripper_joint_indices] = gripper_joint_pos
         key.write_joint_state_to_sim(default_joint_pos, zero_joint_vel)
         key.set_joint_position_target(default_joint_pos)
     env.sim_step(render=False)
     env.robot_manager.set_robot_init_pose()
+    for robot, key in zip(env.robot_manager.robot_list, env.robot_manager.robot_key, strict=True):
+        if robot.type != "target" or robot.arm_name != "left_arm":
+            continue
+        gripper_joint_pos = torch.as_tensor(
+            gripper_joint_positions(
+                LEFT_TARGET_GRIPPER_OPENING,
+                gripper_scale=robot.gripper_scale,
+                gripper_sign=robot.gripper_move["sign"],
+                gripper_mimic=robot.gripper_move["mimic"],
+            ),
+            dtype=key.data.default_joint_pos.dtype,
+            device=key.data.default_joint_pos.device,
+        )
+        key.set_joint_position_target(gripper_joint_pos.unsqueeze(0), joint_ids=robot.gripper_joint_indices)
     env.robot_manager.set_robot_init_state()
 
 
@@ -436,16 +480,46 @@ def _tile_labels() -> tuple[str, ...]:
 
 
 def _snapshot_tile_poses(env) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    return {
-        label: (position.copy(), orientation.copy())
-        for label in _tile_labels()
-        for _, position, orientation in [_label_object(env, label)]
-    }
+    poses = {}
+    for label in _tile_labels():
+        obj, _, _ = _label_object(env, label)
+        position, orientation = obj.get_local_pose()
+        poses[label] = (
+            _as_numpy(position, dtype=np.float32).reshape(-1).copy(),
+            _as_numpy(orientation, dtype=np.float32).reshape(-1).copy(),
+        )
+    return poses
 
 
 def _restore_tile_poses(env, poses: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
     for label, (position, orientation) in poses.items():
         _set_label_pose(env, label, position, orientation)
+
+
+def _unperturbed_tiles_are_stable(
+    env,
+    baseline_poses: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    perturbed_label: str,
+) -> bool:
+    """Reject a reference perturbation that displaced any other tile."""
+
+    orientation_tolerance = np.cos(
+        np.deg2rad(REFERENCE_DISCARD_OTHER_TILE_ORIENTATION_TOLERANCE_DEG) / 2.0
+    )
+    for label, (baseline_position, baseline_orientation) in baseline_poses.items():
+        if label == perturbed_label:
+            continue
+        obj, _, _ = _label_object(env, label)
+        position, orientation = obj.get_local_pose()
+        position = _as_numpy(position, dtype=np.float32).reshape(-1)
+        orientation = _as_numpy(orientation, dtype=np.float32).reshape(-1)
+        if np.linalg.norm(position - baseline_position) > REFERENCE_DISCARD_OTHER_TILE_POSITION_TOLERANCE_M:
+            return False
+        orientation_similarity = abs(float(np.dot(orientation, baseline_orientation)))
+        if orientation_similarity < orientation_tolerance:
+            return False
+    return True
 
 
 def _settle(env, *, sim_steps: int = 20) -> None:
@@ -710,6 +784,7 @@ def _render_scene(
         )
     _restore_robot_home(env)
     _settle(env)
+    settled_tile_poses = _snapshot_tile_poses(env)
 
     scene_id = _scene_id(seed, variant, layout_id, group_index, fallen_case)
     reference_bbox_selected = scene_id in reference_discard_bbox_scene_ids
@@ -718,7 +793,7 @@ def _render_scene(
     reference_bbox_rejection_reason = None
     try:
         semantic_labels, semantic_prim_paths = _label_tile_instances(env)
-        required_labels = set(row_labels) | {discard_label}
+        required_labels = set(semantic_labels)
         if reference_bbox_selected:
             _, _, _, _, baseline_masks = _capture_scene_masks(
                 env, semantic_labels, semantic_prim_paths, required_labels
@@ -727,10 +802,15 @@ def _render_scene(
             if reference_pixel_count <= 0:
                 raise AnnotationMappingError("reference discard has no baseline visible pixels")
             for attempt in range(REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS):
+                _restore_tile_poses(env, settled_tile_poses)
+                _restore_robot_home(env)
+                _settle(env)
                 candidate_perturbation = _reference_discard_perturbation(seed, scene_id, attempt)
-                perturbed_position = reference_fallen_position.copy()
+                perturbed_position = reference_position.copy()
                 perturbed_position[0] += candidate_perturbation["x_offset_m"]
-                perturbed_position[1] += candidate_perturbation["y_offset_m"]
+                perturbed_position += (
+                    REFERENCE_TILE_PUSH_DIRECTION * candidate_perturbation["forward_offset_m"]
+                )
                 _set_label_pose(
                     env,
                     discard_label,
@@ -749,6 +829,10 @@ def _render_scene(
                 for label in required_labels - {discard_label}:
                     other_tile_mask |= masks[label]
                 if (
+                    _unperturbed_tiles_are_stable(
+                        env, settled_tile_poses, perturbed_label=discard_label
+                    )
+                    and
                     reference_status == "visible"
                     and reference_fraction is not None
                     and reference_fraction >= 0.5
@@ -758,6 +842,12 @@ def _render_scene(
                     perturbation = candidate_perturbation
                     break
             if perturbation is None:
+                _restore_tile_poses(env, settled_tile_poses)
+                _restore_robot_home(env)
+                _settle(env)
+                rgb, instance, info, semantic_ids, masks = _capture_scene_masks(
+                    env, semantic_labels, semantic_prim_paths, required_labels
+                )
                 reference_bbox_rejection_reason = (
                     "reference-discard perturbation failed "
                     f"{REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS} acceptance attempts"
@@ -784,9 +874,6 @@ def _render_scene(
         masks[discard_label], TILE_VISIBILITY, reference_pixel_count=reference_pixel_count
     )
     reference_bbox = bbox_from_mask(masks[discard_label])
-
-    def row_index(label: str) -> int:
-        return row_labels.index(label) + 1
 
     def boxes_for(labels: list[str]) -> list[list[float]]:
         return [
@@ -846,7 +933,8 @@ def _render_scene(
         "semantic_instance_ids": {label: semantic_ids[label][0] for label in sorted(required_labels)},
     }
 
-    fallen_sorted = sorted(fallen_case.fallen_labels, key=row_index)
+    fallen_boxes = boxes_for(list(fallen_case.fallen_labels))
+    fallen_sorted, fallen_sorted_boxes = left_to_right_boxes(list(fallen_case.fallen_labels))
     missing_labels = [label for label in target_labels if label not in fallen_case.fallen_labels]
     wrong_sorted = [label for label in row_labels if label not in target_set and label in fallen_case.fallen_labels]
 
@@ -885,22 +973,22 @@ def _render_scene(
     writer.add(
         spatial_metadata(
             candidate(
-                "fallen_tile_indices",
-                "fallen_tile_indices",
-                answer_type="int_list",
+                "fallen_tile_bboxes",
+                "fallen_tile_bboxes",
+                answer_type="bbox_list",
                 prompt=(
-                    "Which tiles in the 14-tile row on our side are currently knocked down? Output their "
-                    "1-based left-to-right indices in ascending order, or 'none' if no tiles are down."
+                    "Which tiles in the 14-tile row on our side are currently knocked down? Output one bounding "
+                    "box per tile in left-to-right order, or 'none' if no tiles are down."
                 ),
             )
             | {
-                "answer_int_list": [row_index(label) for label in fallen_sorted],
-                "gt_source": "simulated_fallen_tile_set",
+                "answer_bbox_list_yxyx_norm": fallen_sorted_boxes,
+                "gt_source": "simulated_fallen_tile_identity_and_pose",
                 "audit_metadata_json": json_dumps(
-                    {**audit_base, "fallen_indices": [row_index(label) for label in fallen_sorted]}
+                    {**audit_base, "fallen_labels": fallen_sorted, "fallen_bboxes": fallen_sorted_boxes}
                 ),
             },
-            answerable=True,
+            answerable=len(fallen_boxes) == len(fallen_case.fallen_labels),
             statuses=label_statuses(fallen_sorted),
         )
     )
@@ -976,26 +1064,33 @@ def main() -> None:
         LOGGER.info("planner flags=%s", planner_flags)
         pool = load_vqa_layout_pool(ARGS.layout_root, variants=variants)
         layout_ids = _parse_layout_ids(ARGS.layout_ids, pool)
-        reference_discard_bbox_samples_per_stratum = _reference_discard_bbox_samples_per_stratum(
-            variants, layout_ids, target_groups
-        )
-        reference_discard_bbox_scene_ids = _plan_reference_discard_bbox_scenes(
-            pool,
-            seed=ARGS.seed,
-            variants=variants,
-            layout_ids=layout_ids,
-            target_groups=target_groups,
-            samples_per_stratum=reference_discard_bbox_samples_per_stratum,
-        )
+        requested_scene_ids = _load_scene_ids(ARGS.scene_ids_file) if ARGS.scene_ids_file is not None else None
+        if requested_scene_ids is None:
+            reference_discard_bbox_samples_per_stratum = _reference_discard_bbox_samples_per_stratum(
+                variants, layout_ids, target_groups
+            )
+            reference_discard_bbox_scene_ids = _plan_reference_discard_bbox_scenes(
+                pool,
+                seed=ARGS.seed,
+                variants=variants,
+                layout_ids=layout_ids,
+                target_groups=target_groups,
+                samples_per_stratum=reference_discard_bbox_samples_per_stratum,
+            )
+        else:
+            reference_discard_bbox_samples_per_stratum = None
+            reference_discard_bbox_scene_ids = requested_scene_ids
         LOGGER.info(
-            "seed=%s variants=%s layouts=%s groups=%s output=%s",
+            "seed=%s variants=%s layouts=%s groups=%s requested_scenes=%s output=%s",
             ARGS.seed,
             variants,
             layout_ids,
             target_groups,
+            len(requested_scene_ids) if requested_scene_ids is not None else "all",
             ARGS.output_dir,
         )
         coverage: dict[str, dict[str, Any]] = {}
+        rendered_scene_ids: set[str] = set()
         for layout_id in layout_ids:
             for variant in variants:
                 scene_layout = pool[(variant, layout_id)][1]
@@ -1017,6 +1112,9 @@ def main() -> None:
                             "target_labels": target_labels,
                         }
                         for fallen_case in cases:
+                            scene_id = _scene_id(ARGS.seed, variant, layout_id, group_index, fallen_case)
+                            if requested_scene_ids is not None and scene_id not in requested_scene_ids:
+                                continue
                             _restore_tile_poses(env, base_poses)
                             LOGGER.info(
                                 "capturing variant=%s layout=%s group=%s case=%s",
@@ -1040,9 +1138,19 @@ def main() -> None:
                                 fallen_case=fallen_case,
                                 reference_discard_bbox_scene_ids=reference_discard_bbox_scene_ids,
                             )
+                            rendered_scene_ids.add(scene_id)
                 finally:
                     env.close()
                     env = None
+
+        if requested_scene_ids is not None:
+            missing_scene_ids = requested_scene_ids - rendered_scene_ids
+            if missing_scene_ids:
+                example_ids = sorted(missing_scene_ids)[:5]
+                raise RuntimeError(
+                    f"--scene-ids-file contains {len(missing_scene_ids)} scene IDs outside the selected pool; "
+                    f"examples={example_ids}"
+                )
 
         report = writer.write(
             {
@@ -1063,12 +1171,15 @@ def main() -> None:
                 "fallen_forward_offset_m": FALLEN_FORWARD_OFFSET_M,
                 "fallen_z_offset_m": FALLEN_Z_OFFSET_M,
                 "reference_discard_bbox": {
+                    "selection_mode": "explicit_scene_ids" if requested_scene_ids is not None else "fallen_count_stratified",
                     "samples_per_fallen_count": reference_discard_bbox_samples_per_stratum,
-                    "samples_per_fallen_count_formula": "variants * layout_ids * target_groups",
+                    "samples_per_fallen_count_formula": (
+                        None if requested_scene_ids is not None else "variants * layout_ids * target_groups"
+                    ),
                     "selected_scene_count": len(reference_discard_bbox_scene_ids),
                     "selected_scene_ids": sorted(reference_discard_bbox_scene_ids),
                     "x_offset_range_m": list(REFERENCE_DISCARD_X_OFFSET_RANGE_M),
-                    "y_offset_range_m": list(REFERENCE_DISCARD_Y_OFFSET_RANGE_M),
+                    "forward_offset_range_m": list(REFERENCE_DISCARD_FORWARD_OFFSET_RANGE_M),
                     "yaw_range_deg": list(REFERENCE_DISCARD_YAW_RANGE_DEG),
                     "max_perturb_attempts": REFERENCE_DISCARD_MAX_PERTURB_ATTEMPTS,
                     "lighting_profile": "fixed_layout_background",

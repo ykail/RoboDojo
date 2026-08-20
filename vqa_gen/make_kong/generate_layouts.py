@@ -1,8 +1,8 @@
 """Generate variant-A and variant-B tile-type-only layouts for make_kong VQA.
 
 Layout A keeps the four matching groups as contiguous robot-side blocks but
-assigns the four discard faces by derangement, so the opponent's pushed-down
-tile no longer matches its nominal slot group.  Layout B reuses A's discard
+randomly assigns the four discard faces, so every discard slot can match every
+robot-side group. Layout B reuses A's discard
 pairing but scatters the four group faces across the twelve robot-side slots,
 so a matching group is not a contiguous block.  Both variants preserve the
 scene geometry of the evaluation template; only Mahjong tile types change.
@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vqa_gen.make_kong.scene_plan import deranged_discard_assignment, scatter_kong_group_assignment
+from vqa_gen.make_kong.scene_plan import random_discard_assignment, scatter_kong_group_assignment
 from vqa_gen.make_kong.tile_faces import (
     FACE_NAMES,
     MAX_CATEGORY,
@@ -167,7 +167,7 @@ def _replace_tile_record(template_record: dict[str, Any], donor_record: dict[str
 
 
 def _sample_layout_spec(rng: random.Random) -> dict[str, Any]:
-    """Sample one signature plus its derangement and scatter from ``rng``."""
+    """Sample one signature plus its discard assignment and scatter from ``rng``."""
 
     faces = list(FACE_NAMES)
     rng.shuffle(faces)
@@ -178,7 +178,7 @@ def _sample_layout_spec(rng: random.Random) -> dict[str, Any]:
     chosen = set(group_categories) | {support_category}
     remaining = [category for category in range(MAX_CATEGORY + 1) if category not in chosen]
     other_categories = rng.sample(remaining, len(OTHER_LABELS))
-    derangement = deranged_discard_assignment(rng)
+    discard_assignment = random_discard_assignment(rng)
     scatter = scatter_kong_group_assignment(rng)
     categories: dict[str, int] = {}
     for group_index, labels in enumerate(KONG_GROUPS):
@@ -187,7 +187,7 @@ def _sample_layout_spec(rng: random.Random) -> dict[str, Any]:
     for label in SUPPORT_GROUP:
         categories[label] = support_category
     for index, label in enumerate(DISCARD_LABELS):
-        categories[label] = group_categories[derangement[index]]
+        categories[label] = group_categories[discard_assignment[index]]
     for label, category in zip(OTHER_LABELS, other_categories):
         categories[label] = category
     return {
@@ -196,7 +196,7 @@ def _sample_layout_spec(rng: random.Random) -> dict[str, Any]:
         "support_category": support_category,
         "support_face_name": support_face,
         "other_categories": other_categories,
-        "derangement": derangement,
+        "discard_assignment": discard_assignment,
         "scatter": scatter,
         "categories": categories,
     }
@@ -236,11 +236,11 @@ def _slot_categories(spec: dict[str, Any] | dict[str, dict[str, Any]]) -> list[i
     """
 
     if "group_categories" in spec:
-        derangement = spec["derangement"]
+        discard_assignment = spec["discard_assignment"]
         return [
             *spec["group_categories"],
             spec["support_category"],
-            *[spec["group_categories"][derangement[index]] for index in range(4)],
+            *[spec["group_categories"][discard_assignment[index]] for index in range(4)],
             *spec["other_categories"],
         ]
     by_label = spec
@@ -263,8 +263,8 @@ def _validate_spec(spec: dict[str, Any], source_name: str) -> None:
         raise LayoutGenerationError(f"{source_name} matching groups must use four distinct faces")
     if spec["support_face_name"] in spec["group_face_names"]:
         raise LayoutGenerationError(f"{source_name} support face must differ from every matching group face")
-    if any(index == target for index, target in enumerate(spec["derangement"])):
-        raise LayoutGenerationError(f"{source_name} discard assignment is not a derangement")
+    if sorted(spec["discard_assignment"]) != [0, 1, 2, 3]:
+        raise LayoutGenerationError(f"{source_name} discard assignment must be a permutation of the four groups")
     if sorted(spec["scatter"]) != [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]:
         raise LayoutGenerationError(f"{source_name} kong scatter must contain three copies of every group")
 
@@ -375,7 +375,7 @@ def generate_vqa_layouts(
                 "support_category": spec["support_category"],
                 "support_face_name": spec["support_face_name"],
                 "other_categories": spec["other_categories"],
-                "discard_derangement": {
+                "discard_assignment": {
                     label: spec["categories"][label] for label in DISCARD_LABELS
                 },
                 "kong_scatter": list(spec["scatter"]),

@@ -117,10 +117,12 @@ class VqaGenSidecarTests(unittest.TestCase):
             writer.prepare_images_dir()
             writer.add(
                 _base(
-                    sample_id="indices",
-                    question_family="fallen_tile_indices",
-                    answer_type="int_list",
-                    answer_int_list=[2, 5, 8],
+                    sample_id="fallen_boxes",
+                    question_family="fallen_tile_bboxes",
+                    answer_type="bbox_list",
+                    answer_bbox_list_yxyx_norm=[[0.25, 0.5, 0.75, 0.875]],
+                    target_view="ego",
+                    bbox_definition="visible_tight",
                 )
             )
             writer.add(
@@ -138,7 +140,8 @@ class VqaGenSidecarTests(unittest.TestCase):
             self.assertIn("answer_int_list", set(table.column_names))
             self.assertIn("answer_bbox_list_yxyx_norm", set(table.column_names))
             rows = {row["sample_id"]: row for row in table.to_pylist()}
-            self.assertEqual(rows["indices"]["answer_int_list"], [2, 5, 8])
+            self.assertIsNone(rows["fallen_boxes"]["answer_int_list"])
+            self.assertEqual(rows["fallen_boxes"]["answer_bbox_list_yxyx_norm"], [[0.25, 0.5, 0.75, 0.875]])
             self.assertEqual(rows["boxes"]["answer_bbox_list_yxyx_norm"], [[0.25, 0.5, 0.75, 0.875]])
 
 
