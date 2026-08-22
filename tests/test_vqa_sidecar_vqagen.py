@@ -135,6 +135,20 @@ class VqaGenSidecarTests(unittest.TestCase):
                     bbox_definition="visible_tight",
                 )
             )
+            writer.add(
+                _base(
+                    sample_id="target_kong_boxes",
+                    question_family="target_kong_tile_bboxes",
+                    answer_type="bbox_list",
+                    answer_bbox_list_yxyx_norm=[
+                        [0.25, 0.125, 0.75, 0.25],
+                        [0.25, 0.375, 0.75, 0.5],
+                        [0.25, 0.625, 0.75, 0.75],
+                    ],
+                    target_view="ego",
+                    bbox_definition="visible_tight",
+                )
+            )
             writer.write({"collector": "test"})
             table = pq.read_table(Path(directory) / "sidecar" / "annotations.parquet")
             self.assertIn("answer_int_list", set(table.column_names))
@@ -143,6 +157,7 @@ class VqaGenSidecarTests(unittest.TestCase):
             self.assertIsNone(rows["fallen_boxes"]["answer_int_list"])
             self.assertEqual(rows["fallen_boxes"]["answer_bbox_list_yxyx_norm"], [[0.25, 0.5, 0.75, 0.875]])
             self.assertEqual(rows["boxes"]["answer_bbox_list_yxyx_norm"], [[0.25, 0.5, 0.75, 0.875]])
+            self.assertEqual(len(rows["target_kong_boxes"]["answer_bbox_list_yxyx_norm"]), 3)
 
 
 if __name__ == "__main__":

@@ -45,8 +45,10 @@ python vqa_gen/make_kong/generate_make_kong_vqa.py \
   defaults to `all` (every pair in the pool); `--layout-root` overrides the
   pool directory (default: `vqa_gen/make_kong/layouts/`).
 - Each scene writes one clean image plus `fallen_tile_bboxes`,
-  `missing_matching_tile_bboxes`, and `wrong_fallen_tile_bboxes`. The
-  collector additionally emits `variants × layout_ids × target_groups`
+  `missing_matching_tile_bboxes`, `target_kong_tile_bboxes`, and
+  `wrong_fallen_tile_bboxes`. `target_kong_tile_bboxes` always answers the
+  three matching row tiles, whether standing or fallen. The collector
+  additionally emits `variants × layout_ids × target_groups`
   `reference_discard_bbox` records for each 0-5 robot-side fallen-count
   stratum (six strata total).
   These selected scenes perturb only the face-up reference discard by a

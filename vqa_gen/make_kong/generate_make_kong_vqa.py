@@ -2,7 +2,7 @@
 
 For each selected variant-A or variant-B layout and target group, the
 collector holds the robots at home, renders clean ``cam_head`` images of the
-opponent discard knocked face-up, and emits four question families:
+opponent discard knocked face-up, and emits five question families:
 
 - ``reference_discard_bbox``: a visible-tight box for the reference discard
   in 80 deterministically sampled scenes from each fallen-count stratum;
@@ -10,6 +10,8 @@ opponent discard knocked face-up, and emits four question families:
   left-to-right order, ``none`` when empty;
 - ``missing_matching_tile_bboxes``: visible boxes of matching tiles that are
   still standing, ``none`` when empty;
+- ``target_kong_tile_bboxes``: visible boxes of all three matching row tiles,
+  regardless of whether they are standing or fallen;
 - ``wrong_fallen_tile_bboxes``: visible boxes of incorrectly fallen
   non-matching tiles, ``none`` when empty.
 
@@ -1015,6 +1017,34 @@ def _render_scene(
             },
             answerable=len(missing_boxes) == len(missing_labels),
             statuses=label_statuses(missing_labels),
+        )
+    )
+    target_boxes = boxes_for(target_labels)
+    target_sorted, target_sorted_boxes = left_to_right_boxes(target_labels)
+    writer.add(
+        spatial_metadata(
+            candidate(
+                "target_kong_tile_bboxes",
+                "target_kong_tile_bboxes",
+                answer_type="bbox_list",
+                prompt=(
+                    "Which three tiles in the 14-tile row on our side that match the suit of the face-up "
+                    "reference discard on the opponent's side? Output their bounding boxes in left-to-right order."
+                ),
+            )
+            | {
+                "answer_bbox_list_yxyx_norm": target_sorted_boxes,
+                "gt_source": "simulated_target_kong_tile_identity_and_pose",
+                "audit_metadata_json": json_dumps(
+                    {
+                        **audit_base,
+                        "target_kong_labels": target_sorted,
+                        "target_kong_bboxes": target_sorted_boxes,
+                    }
+                ),
+            },
+            answerable=len(target_boxes) == len(target_labels),
+            statuses=label_statuses(target_labels),
         )
     )
     wrong_boxes = boxes_for(wrong_sorted)

@@ -11,24 +11,23 @@
 
 Use the existing `RoboDojo` Conda environment and its RTX 3090 GPU: `conda activate RoboDojo`. Use it for Python, Isaac Sim, and generation scripts; do not substitute another environment. Consult `CLAUDE.md` for task patterns, validation loops, and project pitfalls.
 
-This work targets data generation, not policy training or benchmark evaluation. Run focused structural checks after changes:
+When a task requires Python changes, edit only the specific Python files needed for that task. Do not modify unrelated Python files, apply repository-wide replacements, or run repository-wide formatters, linters, or pre-commit hooks. Run only focused checks relevant to the files or behavior changed:
 
 ```bash
-pre-commit run --all-files --show-diff-on-failure  # Ruff, formatting, YAML/TOML, debug checks
 python scripts/internal/task_inventory.py --format json --check
 bash scripts/robodojo.sh doctor --skip-isaac --skip-conda --skip-policy
 ```
 
 ## Isaac Sim Validation
 
-Whenever you complete code modifications, automatically raise a explicit request to run the GPU Isaac Sim validation program specifying the exact command. Wait for the user to confirm/click "Yes" before proceeding with execution. Validation guidelines:
+When you complete relevant code modifications, considering raise a explicit request to run the GPU Isaac Sim validation program specifying the exact command. Wait for the user to confirm/click "Yes" before proceeding with execution. Validation guidelines:
 - Always request to run a small explicit subset first (for example, `--max-episodes 1`).
 - Inspect the output and request confirmation before scaling up on the RTX 3090.
 - Keep generated artifacts under `./tmp`; do not add large generated data to Git unless requested.
 
 ## Style, Naming & Tasks
 
-Use four-space Python indentation, lowercase `snake_case` modules and directories, and `PascalCase` manager/helper classes. Ruff enforces a 120-character line length and import sorting; run `ruff check .` and `ruff format .` when working without pre-commit. Avoid `print`, `breakpoint`, and commented-out debug code.
+Use four-space Python indentation, lowercase `snake_case` modules and directories, and `PascalCase` manager/helper classes. Follow the existing 120-character line length and import-order conventions. Do not run `ruff check .`, `ruff format .`, or equivalent repository-wide commands unless the user explicitly requests them. Avoid `print`, `breakpoint`, and commented-out debug code.
 
 A task’s module, YAML filename, and exported environment class must share its task name: `tasks/stack_bowls.py` and `config/stack_bowls.yml`. Preserve the few asset-driven casing exceptions (for example, `push_T`). Task classes must inherit `TaskEnv`; keep YAML labels identical to those referenced in task logic and make `run_reward()` call a meaningful reward/success check.
 
@@ -37,7 +36,3 @@ Do not add the following sentence at the beginning of every newly generated pyth
 ```python
 from __future__ import annotations
 ```
-
-## Data-Generation Safety
-
-Treat source episodes and dataset outputs as valuable artifacts. Use explicit paths, preserve source data, and avoid overwriting results without approval. Record the command, seed, task, and episode-selection criteria beside new outputs. Keep changes scoped to generation utilities and task/config support; `XPolicyLab/` policy code is out of scope.

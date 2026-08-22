@@ -16,8 +16,9 @@ to validate annotations and to derive visible-tight boxes.
   four matching groups (tiles 1-12) plus the support pair `mahjong4_0/4_1`
   (tiles 13-14).
 - The opponent robot arm knocks one discard face-up on the far side; it is the
-  visual reference (`reference tile`).  The three robot-side tiles sharing its
-  face are the `matching group` (target group).
+  visual reference (`reference tile`). The three robot-side tiles sharing its
+  face are the `matching group` (Target Kong Tiles) and are required to be
+  knocked down regardless of their current state.
 
 ## Face vocabulary
 
@@ -99,7 +100,7 @@ runtime; the manifest remains an audit artifact.
 
 For every target group the collector plans the coverage matrix (per variant):
 zero fallen, one/two/three fallen matching tiles, 3+1, 3+2, and pure wrong
-sets of 1-5 tiles. Every scene emits the three row-state questions below. A
+sets of 1-5 tiles. Every scene emits the four row questions below. A
 deterministic, fallen-count-balanced subset additionally emits the
 reference-discard localization question.
 
@@ -142,6 +143,20 @@ Which of the three tiles in the 14-tile row on our side that match the suit of t
 
 Answer type `bbox_list`; boxes are the visible tight masks of the matching
 tiles that should still be knocked down; the empty list is the `none` answer.
+
+### `target_kong_tile_bboxes`
+
+Every scene:
+
+```text
+Which three tiles in the 14-tile row on our side that match the suit of the face-up reference discard on the opponent's side? Output their bounding boxes in left-to-right order.
+```
+
+Answer type `bbox_list`; boxes are the visible-tight masks of all three Target
+Kong Tiles, whether they are standing or fallen. Accepted records always
+contain exactly three boxes in left-to-right order; if any target tile lacks
+visible evidence, the record is rejected rather than returning a partial list
+or `none`.
 
 ### `wrong_fallen_tile_bboxes`
 
@@ -188,11 +203,12 @@ leftmost group).
 - `bbox_list` answers are sorted left-to-right (ascending `x_min`) because the
   prompt explicitly dictates "in left-to-right order", which overrides the
   contract's default top-left priority; the empty list is the canonical
-  `none` answer.
+  `none` answer. `target_kong_tile_bboxes` is the exception: it always has
+  exactly three boxes and never uses `none`.
 - Every record references the same clean RGB file used as model input.
 - Point and box coordinates are normalized in the original 640x480 ego image.
 - `audit_metadata_json` records variant, layout id, group index, discard label,
-  case id, fallen/missing/wrong labels, and the discard suit.
+  case id, fallen/missing/wrong/target labels, and the discard suit.
 - Source layouts and the action dataset are read-only.
 
 ## Decision records (merged ADRs)
