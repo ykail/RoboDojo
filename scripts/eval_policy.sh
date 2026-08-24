@@ -4,6 +4,15 @@ set -euo pipefail
 # Ensure project root is on PYTHONPATH so first-party imports like `env`, `task`, and `utils` work.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/XPolicyLab:${PYTHONPATH:-}"
+# Reproducibility must be configured before Python imports CUDA/PyTorch.
+# Keep CPU math single-threaded and disable TF32's architecture-dependent
+# rounding; the simulator itself remains responsible for fixed-step physics.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export NVIDIA_TF32_OVERRIDE="${NVIDIA_TF32_OVERRIDE:-0}"
+export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE="${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE:-0}"
 echo "[INFO] PYTHONPATH=${PYTHONPATH}"
 
 # Usage:
@@ -107,6 +116,11 @@ if [[ -n "${device_id}" ]]; then
   echo "[INFO] device_id = ${device_id} → CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 fi
 
+if [[ -n "${seed}" ]]; then
+  # PYTHONHASHSEED is read only during interpreter startup.
+  export PYTHONHASHSEED="${seed}"
+fi
+
 if [[ -n "${eval_batch}" ]]; then
   echo "[INFO] eval_batch     = ${eval_batch}"
 fi
@@ -129,6 +143,10 @@ KIT_ARGS=""
 for ext in "${KIT_ENABLE_EXTS[@]}"; do
   KIT_ARGS+=" --enable ${ext}"
 done
+# Keep RTX execution on one synchronous device path.  These must reach Kit at
+# launch time: setting them after Hydra initializes leaves the first camera
+# product on the default multi-GPU/async scheduling path.
+KIT_ARGS+=" --/renderer/multiGpu/enabled=False --/app/asyncRendering=False"
 
 # Generated once per eval invocation. Carries the same identity through
 # os.execv inside main.py and bash-level retries below. Append $$ to

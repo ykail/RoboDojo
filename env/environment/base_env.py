@@ -23,7 +23,7 @@ DEFAULT_PHYSX_CONFIG = {
     "max_velocity_iteration_count": 255,
     "enable_ccd": False,
     "enable_stabilization": False,
-    "enable_enhanced_determinism": False,
+    "enable_enhanced_determinism": True,
     "bounce_threshold_velocity": 0.5,
     "friction_offset_threshold": 0.04,
     "friction_correlation_distance": 0.025,

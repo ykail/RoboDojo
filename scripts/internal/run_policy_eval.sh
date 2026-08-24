@@ -10,6 +10,16 @@ fi
 policy_dir="$(cd "$1" && pwd)"
 shift
 
+# Export deterministic runtime settings before either the policy server or
+# simulator client imports PyTorch/CUDA.  Both processes must see the same
+# math and hash configuration for a byte-for-byte repeatable evaluation.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export NVIDIA_TF32_OVERRIDE="${NVIDIA_TF32_OVERRIDE:-0}"
+export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE="${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE:-0}"
+
 bench_name=$1
 task_name=$2
 ckpt_name=$3
@@ -37,6 +47,8 @@ else
   echo "[run_policy_eval] unexpected trailing argument count: $#" >&2
   exit 2
 fi
+
+export PYTHONHASHSEED="${seed}"
 
 if [[ $# -ne 0 ]]; then
   echo "[run_policy_eval] unexpected extra arguments: $*" >&2
