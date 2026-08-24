@@ -805,9 +805,9 @@ def create_eval_env(config, app, resume_state=None, **kwargs):
 
                 # seed_list was filtered by completed/abandoned ids on resume,
                 # so seed_list.index(seed) no longer yields the original
-                # layout id. Since init_eval populates seed_list as
-                # range(N_layouts), seed == layout_id by construction; use
-                # env_seeds[env_idx] directly.
+                # layout id. SeedManager preserves the numeric suffix from
+                # the layout filename, including when only a tail subset is
+                # selected; use env_seeds[env_idx] directly.
                 self.eval_result["details"][index] = {
                     "layout_id": int(self.env_seeds[env_idx]),
                     "success": bool(self.success[env_idx]),

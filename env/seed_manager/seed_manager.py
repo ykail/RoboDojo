@@ -37,12 +37,31 @@ class SeedManager:
             key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
         )
 
-        matching_files = [str(p) for p in matching_files]
+        # Keep the numeric suffix from each filename as the layout ID.  This
+        # matters when an evaluation selects a subset (for example, the last
+        # 50 layouts): renumbering the subset would load the wrong files.
         self.seed_info = {}
-        for idx, file_path in enumerate(matching_files):
-            self.seed_info[idx] = {"scene_layout": file_path}
+        all_layout_ids = []
+        for file_path in matching_files:
+            layout_id = int(file_path.stem.rsplit("_", 1)[-1])
+            self.seed_info[layout_id] = {"scene_layout": str(file_path)}
+            all_layout_ids.append(layout_id)
 
-        all_layout_ids = list(range(len(matching_files)))
+        layout_range = os.environ.get("EVAL_LAYOUT_RANGE", "").strip()
+        if layout_range:
+            try:
+                range_parts = layout_range.replace(":", "-").split("-")
+                if len(range_parts) != 2:
+                    raise ValueError
+                range_start, range_end = (int(part.strip()) for part in range_parts)
+            except ValueError as exc:
+                raise ValueError(
+                    "EVAL_LAYOUT_RANGE must use an inclusive range such as '100-149'"
+                ) from exc
+            if range_start > range_end:
+                raise ValueError("EVAL_LAYOUT_RANGE start must not exceed end")
+            all_layout_ids = [layout_id for layout_id in all_layout_ids if range_start <= layout_id <= range_end]
+            print(f"[SeedManager] selecting layout range {range_start}-{range_end}: {all_layout_ids}")
         excluded = set(int(s) for s in (completed_layout_ids or [])) | set(int(s) for s in (abandoned_layout_ids or []))
         if excluded:
             self.seed_list: List[int] = [s for s in all_layout_ids if s not in excluded]
