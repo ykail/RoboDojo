@@ -7,6 +7,7 @@ from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.scene import InteractiveSceneCfg
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
+from pxr import Usd, UsdGeom
 import torch
 import transforms3d as t3d
 
@@ -517,6 +518,35 @@ class RobotManager:
     def initialize(self, sim: IsaacRLEnv):
         self.sim = sim
         self.scene = sim.scene
+        self._hide_collision_visuals()
+
+    def _hide_collision_visuals(self):
+        """Hide robot collision meshes without disabling their physics schemas.
+
+        Some robot USDs contain coincident visual and collision meshes. If the
+        collision hierarchy is renderable, the two surfaces z-fight and their
+        different materials flicker between frames. This runs on the source
+        environment before IsaacLab clones it, so the visibility override is
+        inherited by every environment.
+        """
+        stage = self.scene.stage
+        source_env_path = self.scene.env_prim_paths[0]
+        robot_prim_paths = {
+            f"{source_env_path}/{robot.SceneCfg.prim_path.rsplit('/', maxsplit=1)[-1]}"
+            for idx, robot in enumerate(self.robot_list)
+            if self.use_scene_cfg[idx]
+        }
+
+        for robot_prim_path in robot_prim_paths:
+            robot_prim = stage.GetPrimAtPath(robot_prim_path)
+            if not robot_prim.IsValid():
+                raise RuntimeError(f"Robot prim does not exist: {robot_prim_path}")
+
+            for prim in Usd.PrimRange(robot_prim):
+                if prim.GetName() == "collisions":
+                    imageable = UsdGeom.Imageable(prim)
+                    if imageable:
+                        imageable.MakeInvisible()
 
     def close(self):
         self.control_manager.reset()
