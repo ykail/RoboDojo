@@ -16,6 +16,7 @@ TARGET_EPISODES="50"
 LEROBOT_PYTHON="${ROBODOJO_LEROBOT_PYTHON:-/home/hoo/RoboDojo/third_party/kai0/.venv/bin/python}"
 PREFLIGHT_PYTHON="${ROBODOJO_PREFLIGHT_PYTHON:-/opt/anaconda3/envs/RoboDojo/bin/python}"
 ISAAC_PYTHON="${ROBODOJO_ISAAC_PYTHON:-/opt/anaconda3/envs/RoboDojo/bin/python}"
+ASSETS_PATH="${ROBODOJO_ASSETS_PATH:-/home/hoo/RoboDojo-piperx-dagger-v2/.cache/robodojo_assets_repo/Assets}"
 PIPERX_CODE_ROOT="${PIPERX_BRIDGE_ROOT:-/home/hoo/piper_x/lerobot_sealab-piperx-online-dagger-v2}"
 PREFLIGHT_ONLY=0
 REQUIRED_KAI0_COMMIT=""
@@ -41,6 +42,7 @@ Optional:
   --lerobot-python PATH LeRobot writer environment
   --isaac-python PATH   Isaac Sim/RoboDojo Python
                         (default: /opt/anaconda3/envs/RoboDojo/bin/python)
+  --assets-path PATH    Existing RoboDojo Assets root
   --expected-kai0-commit COMMIT
                         Optionally require this exact policy-server commit
   --expected-checkpoint-digest sha256:HEX
@@ -80,6 +82,8 @@ while [[ $# -gt 0 ]]; do
         --lerobot-python=*) LEROBOT_PYTHON="${1#*=}"; shift ;;
         --isaac-python) need_value "$1" "${2:-}"; ISAAC_PYTHON="$2"; shift 2 ;;
         --isaac-python=*) ISAAC_PYTHON="${1#*=}"; shift ;;
+        --assets-path) need_value "$1" "${2:-}"; ASSETS_PATH="$2"; shift 2 ;;
+        --assets-path=*) ASSETS_PATH="${1#*=}"; shift ;;
         --expected-kai0-commit) need_value "$1" "${2:-}"; REQUIRED_KAI0_COMMIT="$2"; shift 2 ;;
         --expected-kai0-commit=*) REQUIRED_KAI0_COMMIT="${1#*=}"; shift ;;
         --expected-checkpoint-digest) need_value "$1" "${2:-}"; REQUIRED_CHECKPOINT_DIGEST="$2"; shift 2 ;;
@@ -107,6 +111,12 @@ done
 [[ -x "${ISAAC_PYTHON}" ]] || die "Isaac Sim Python is not executable: ${ISAAC_PYTHON}"
 [[ -x "${LEROBOT_PYTHON}" ]] || die "LeRobot writer Python is not executable: ${LEROBOT_PYTHON}"
 [[ -d "${PIPERX_CODE_ROOT}" ]] || die "PiPER-X code root is missing: ${PIPERX_CODE_ROOT}"
+[[ -f "${ASSETS_PATH}/Robots/x5/robot_config.yml" ]] \
+    || die "RoboDojo X5 assets are missing: ${ASSETS_PATH}"
+for asset_subdir in Object Material Eval_Layout; do
+    [[ -d "${ASSETS_PATH}/${asset_subdir}" ]] \
+        || die "RoboDojo asset subdirectory is missing: ${ASSETS_PATH}/${asset_subdir}"
+done
 if ! "${ISAAC_PYTHON}" -c 'import isaacsim' >/dev/null 2>&1; then
     die "Isaac Sim Python cannot import isaacsim: ${ISAAC_PYTHON}"
 fi
@@ -171,6 +181,7 @@ echo "[Hoo PiPER-X Isaac] checkpoint_id=${CHECKPOINT_ID}"
 echo "[Hoo PiPER-X Isaac] pinned Kai0=${EXPECTED_KAI0_COMMIT} clean=true"
 echo "[Hoo PiPER-X Isaac] pinned digest=${EXPECTED_CHECKPOINT_DIGEST}"
 echo "[Hoo PiPER-X Isaac] isaac_python=${ISAAC_PYTHON}"
+echo "[Hoo PiPER-X Isaac] assets=${ASSETS_PATH}"
 echo "[Hoo PiPER-X Isaac] dataset=${DATASET_ROOT%/}/${DATASET_ID} target=${TARGET_EPISODES}"
 
 if (( PREFLIGHT_ONLY )); then
@@ -183,6 +194,7 @@ export ROBODOJO_LEROBOT_ROOT="${DATASET_ROOT}"
 export ROBODOJO_LEROBOT_REPO_ID="${DATASET_ID}"
 export ROBODOJO_LEROBOT_PYTHON="${LEROBOT_PYTHON}"
 export ROBODOJO_EVAL_PYTHON="${ISAAC_PYTHON}"
+export ROBODOJO_ASSETS_PATH="${ASSETS_PATH}"
 export ROBODOJO_CHECKPOINT_ID="${CHECKPOINT_ID}"
 export ROBODOJO_EXPECTED_KAI0_COMMIT="${EXPECTED_KAI0_COMMIT}"
 export ROBODOJO_EXPECTED_CHECKPOINT_DIGEST="${EXPECTED_CHECKPOINT_DIGEST}"
