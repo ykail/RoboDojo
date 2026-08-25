@@ -309,6 +309,7 @@ class PiperXOnlineDaggerIntegrationTest(unittest.TestCase):
         self.assertIn("--expected-code-revision", wrapper)
         self.assertIn("--expected-checkpoint-digest", wrapper)
         self.assertIn("ROBODOJO_EVAL_PYTHON", wrapper)
+        self.assertIn("ROBODOJO_PREFLIGHT_PYTHON", wrapper)
         self.assertIn("ROBODOJO_ASSETS_PATH", wrapper)
         self.assertIn("Robots/x5/robot_config.yml", wrapper)
         self.assertIn("/opt/anaconda3/envs/RoboDojo/bin/python", wrapper)
