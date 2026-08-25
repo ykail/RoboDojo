@@ -35,6 +35,24 @@ policy_request_timeout_s="600"
 policy_close_timeout_s="10"
 extra_args=()
 
+# The interactive launchers are often invoked from a fresh desktop terminal.
+# Do not silently fall back to a different Conda environment just because its
+# `python` happens to be first on PATH.  Launchers that require a particular
+# simulator runtime can pin it with ROBODOJO_EVAL_PYTHON; all existing callers
+# retain the previous PATH-based behavior by default.
+eval_python="${ROBODOJO_EVAL_PYTHON:-python}"
+if [[ "${eval_python}" == */* ]]; then
+  [[ -x "${eval_python}" ]] || {
+    echo "[ERROR] RoboDojo evaluation Python is not executable: ${eval_python}" >&2
+    exit 1
+  }
+else
+  eval_python="$(command -v "${eval_python}")" || {
+    echo "[ERROR] RoboDojo evaluation Python is not on PATH: ${eval_python}" >&2
+    exit 1
+  }
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --root_dir|--bench_name|--dataset_name|--task_name|--env_cfg_type|--device_id|--policy_name|--port|--eval_batch|--additional_info|--seed|--host|--protocol|--policy_server_url|--policy_runtime|--action_type|--policy_seed|--policy_connect_timeout_s|--policy_request_timeout_s|--policy_close_timeout_s)
@@ -113,6 +131,7 @@ else
   echo "[INFO] policy transport = ${protocol}"
 fi
 echo "[INFO] policy runtime = ${policy_runtime}"
+echo "[INFO] evaluation Python = ${eval_python}"
 if [[ -n "${policy_server_url}" ]]; then
   echo "[INFO] policy_server_url = ${policy_server_url}"
 fi
@@ -171,7 +190,7 @@ MAX_BASH_RETRIES="${ROBODOJO_MAX_BASH_RETRIES:-10}"
 attempt=0
 while : ; do
   set +e
-  python -u src/eval_client/main.py \
+  "${eval_python}" -u src/eval_client/main.py \
     --task_name "$task_name" \
     --env_cfg_type "$env_cfg_type" \
     --num_envs "$num_envs" \

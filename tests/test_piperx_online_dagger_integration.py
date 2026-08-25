@@ -308,6 +308,12 @@ class PiperXOnlineDaggerIntegrationTest(unittest.TestCase):
         wrapper = launchers[1].read_text(encoding="utf-8")
         self.assertIn("--expected-code-revision", wrapper)
         self.assertIn("--expected-checkpoint-digest", wrapper)
+        self.assertIn("ROBODOJO_EVAL_PYTHON", wrapper)
+        self.assertIn("/opt/anaconda3/envs/RoboDojo/bin/python", wrapper)
+
+        evaluator = (ROOT / "scripts/eval_policy.sh").read_text(encoding="utf-8")
+        self.assertIn('eval_python="${ROBODOJO_EVAL_PYTHON:-python}"', evaluator)
+        self.assertIn('"${eval_python}" -u src/eval_client/main.py', evaluator)
 
         yikai = launchers[3].read_text(encoding="utf-8")
         self.assertIn("ecc1a7451c3156b1e5f7533851dbb0222896206f", yikai)
